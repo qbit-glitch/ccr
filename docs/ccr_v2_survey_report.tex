@@ -1,0 +1,531 @@
+% NeurIPS 2026 Style Report
+% CCR v2: A Survey and Roadmap for Persistent Agent Memory, Self-Evolving Strategies, and Sandboxed Execution
+\documentclass[11pt]{article}
+
+% NeurIPS-like formatting without the style file
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{times}
+
+% NeurIPS-like title formatting
+\renewcommand{\abstractname}{\large Abstract}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+\title{CCR v2: A Survey and Roadmap for Persistent Agent Memory,\\Self-Evolving Strategies, and Sandboxed Execution\\in LLM-Based Coding Agents}
+
+\author{
+  CCR Research Team \\
+  \texttt{github.com/ccr-project}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large language model (LLM) based coding agents face three fundamental challenges: (1) maintaining coherent memory across sessions, (2) evolving task strategies from experience, and (3) safely executing code for iterative reasoning. We present a comprehensive survey of 50+ recent papers (2025--2026), frameworks, and production systems across these three domains, conducted to inform the next version of CCR (Claude Context Reducer)---an MCP server that unifies Git-style versioned memory (GCC), self-evolving playbooks (ACE), and sandboxed REPL execution (RLM) for Claude Code. Our analysis identifies 14 high-impact improvements organized into three priority tiers, backed by evidence from ICLR 2026, ACL 2025, NeurIPS 2025, and industry systems. We find that (a) graph-based memory with admission control outperforms flat stores by up to 45.5\% on reasoning benchmarks, (b) hierarchical skill libraries with structured failure distillation achieve 10--20$\times$ compression over raw trajectories, (c) kernel-level sandboxing (Landlock/Seatbelt) provides zero-overhead isolation superior to application-level blocklists, and (d) CCR's unified architecture remains unique in the ecosystem---no competing system combines versioned memory, self-evolving strategies, and sandboxed execution in a single zero-LLM-call MCP server. We propose a concrete roadmap for CCR v2 that integrates these findings while preserving the system's zero-infrastructure, zero-API-key design philosophy.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+%==============================================================================
+
+LLM-based coding agents---systems such as Claude Code~\cite{anthropic_ce}, Cursor, Devin~\cite{devin}, and OpenHands~\cite{openhands}---have rapidly advanced from single-turn code completion to autonomous multi-step software engineering. However, three persistent limitations constrain their effectiveness in long-horizon, multi-session workflows:
+
+\textbf{Memory amnesia.} Most coding agents begin each session with no knowledge of prior work. Claude Code's native Auto Memory (MEMORY.md) and Cursor's community-built Memory Banks offer flat markdown persistence, but lack version control, branching for experimental isolation, or structured retrieval beyond keyword search.
+
+\textbf{Strategy stasis.} Agents repeatedly encounter the same failure modes across sessions without learning from them. While reinforcement learning from human feedback (RLHF) adapts model weights, it cannot capture project-specific heuristics, coding conventions, or debugging insights that vary across codebases.
+
+\textbf{Unsafe execution.} Code execution for iterative reasoning---validated by the RLM paradigm~\cite{rlm}---requires sandboxing that balances security with zero-overhead performance. Current approaches range from heavyweight microVMs (E2B, Firecracker) to fragile application-level blocklists.
+
+CCR (Claude Context Reducer) addresses all three challenges through a unified MCP server exposing 17 tools built on three research papers: GCC (Git Context Controller)~\cite{gcc} for versioned memory, ACE (Agentic Context Engineering)~\cite{ace} for self-evolving playbooks, and RLM (Recursive Language Models)~\cite{rlm} for sandboxed REPL execution. CCR requires zero LLM calls, zero infrastructure, and zero API keys---operating entirely through Claude Code's native tool-calling interface on a Claude Max subscription.
+
+This report surveys the state of the art across all three domains as of March 2026, identifies gaps in CCR's current implementation relative to recent advances, and proposes a prioritized roadmap for CCR v2. Our contributions are:
+
+\begin{enumerate}[leftmargin=*]
+    \item A structured survey of 50+ papers, frameworks, and production systems across agent memory, context engineering, and sandboxed execution (Sections~\ref{sec:memory}--\ref{sec:sandbox}).
+    \item A competitive analysis of the agent memory ecosystem including Claude Code native features, IDE agents, and the MCP marketplace (Section~\ref{sec:landscape}).
+    \item A three-tier improvement roadmap with impact/effort ratings backed by empirical evidence (Section~\ref{sec:roadmap}).
+\end{enumerate}
+
+%==============================================================================
+\section{Related Work: Agent Memory Systems}
+\label{sec:memory}
+%==============================================================================
+
+The study of persistent memory for LLM agents has matured from scattered proposals to a recognized research area, with a dedicated ICLR 2026 workshop (MemAgents)~\cite{memagents_workshop} and comprehensive surveys~\cite{memory_survey, graph_memory_survey}.
+
+\subsection{Taxonomies and Theoretical Foundations}
+
+The most comprehensive taxonomy is proposed by~\cite{memory_survey}, who organize agent memory along three dimensions: \textbf{Forms} (token-level, parametric, latent), \textbf{Functions} (factual, experiential, working), and \textbf{Dynamics} (formation, evolution, retrieval). Experiential memory is further divided into case-based (specific episodes), strategy-based (general approaches), and skill-based (reusable procedures). CCR's GCC commits correspond to case-based memory, while ACE playbook bullets correspond to strategy-based memory. The survey identifies skill-based memory as underexplored---CCR's CODE SNIPPETS section partially addresses this but lacks structured preconditions, expected outcomes, and failure modes.
+
+The Continuum Memory Architecture (CMA)~\cite{cma} formalizes five architectural requirements for cross-session state: \textbf{persistent storage}, \textbf{selective retention}, \textbf{associative routing}, \textbf{temporal chaining}, and \textbf{consolidation into higher-order abstractions}. Evaluating CCR against these requirements reveals two gaps: no admission control (selective retention) and limited graph-based retrieval (associative routing).
+
+\subsection{Graph-Based Memory Architectures}
+
+\textbf{MAGMA}~\cite{magma} decouples memory into four orthogonal graphs---semantic, temporal, causal, and entity---with policy-guided traversal at retrieval time. A dual-stream write mechanism separates fast ingestion from asynchronous consolidation. Results show up to 45.5\% higher reasoning accuracy, 95\% token reduction, and 40\% faster query latency versus flat retrieval. This directly informs a potential upgrade to GCC's commit structure: maintaining parallel graph indexes over commits would enable queries like ``what caused this bug?'' (causal graph) or ``what have we done to this file?'' (entity graph).
+
+\textbf{SYNAPSE}~\cite{synapse} applies spreading activation from the ACT-R cognitive architecture~\cite{actr} to agent memory. Relevance emerges dynamically through activation propagation rather than pre-computed static links, with lateral inhibition suppressing weakly related memories and temporal decay aging out stale information. This solves the ``Contextual Tunneling'' problem where vector similarity retrieval fixates on surface-level matches, missing deeper causal connections.
+
+\textbf{A-MEM}~\cite{amem} applies the Zettelkasten method to agent memory, where each note carries structured attributes (keywords, tags, contextual descriptions) and explicit bidirectional links. Critically, new experiences \textit{retroactively refine} existing notes' attributes, making memory a living graph rather than an append-only log. GCC commits are currently write-once; A-MEM suggests that new commits should trigger metadata updates to related earlier commits.
+
+\textbf{Graphiti/Zep}~\cite{graphiti} introduces a bi-temporal data model tracking both event occurrence time and ingestion time, enabling point-in-time queries (``what did the agent know at time T?''). With P95 latency of 300ms and zero LLM calls at retrieval time, this approach aligns with CCR's zero-LLM-call philosophy.
+
+\textbf{PlugMem}~\cite{plugmem} (Microsoft Research, ICML 2026 under review) structures episodic memories into a compact knowledge-centric graph where propositional and prescriptive knowledge are the units of access. Information-theoretic analysis confirms highest information density across task types. This suggests extracting atomic knowledge from GCC commits into a separate lightweight index.
+
+\subsection{Memory Consolidation and Forgetting}
+
+\textbf{A-MAC}~\cite{amac} treats memory admission as a structured decision problem with five scoring factors: future utility, factual confidence, semantic novelty, temporal recency, and content type prior. Ablation reveals content type prior as the single most influential factor. F1 of 0.583 on LoCoMo with 31\% latency reduction. This directly motivates adding a novelty gate to \texttt{gcc\_commit}.
+
+\textbf{TiMem}~\cite{timem} organizes memory in a Temporal Memory Tree (TMT) with 5 hierarchical levels, from raw conversation to progressively abstracted representations. Semantic-guided consolidation promotes important details upward. Achieves 52.2\% reduction in recalled memory length while maintaining 75.3\% accuracy on LoCoMo. This informs an upgrade to GCC's single rolling summary.
+
+\textbf{HiMem}~\cite{himem} introduces \textit{conflict-aware memory reconsolidation}: when retrieval surfaces old memories that contradict current state, the system detects and revises stored knowledge. This addresses a real problem in long-running projects where stale information misleads future sessions.
+
+Temporal decay mechanisms inspired by cognitive architectures~\cite{actr_forgetting} provide principled forgetting without deletion. Under exponential decay ($\text{score}_{\text{eff}} = \text{score}_{\text{raw}} \cdot 0.95^{\text{days}}$), a strategy unused for 30 days retains $\sim$21\% of its original weight, naturally deprioritizing stale entries.
+
+\subsection{Benchmarks}
+
+The agent memory evaluation landscape has consolidated around several benchmarks: \textbf{MemoryAgentBench}~\cite{memoryagentbench} (ICLR 2026) evaluates retrieval accuracy, test-time learning, long-range understanding, and selective forgetting; \textbf{MemBench}~\cite{membench} (ACL 2025 Findings) evaluates effectiveness, efficiency, and capacity across factual and reflective memory; \textbf{LoCoMo}~\cite{locomo} (Snap Research) has become the de facto standard for long-term conversational memory, used by MAGMA, TiMem, SYNAPSE, A-MAC, and Zep; and \textbf{AMA-Bench}~\cite{amabench} focuses specifically on long-horizon agentic memory.
+
+%==============================================================================
+\section{Context Engineering and Self-Evolving Strategies}
+\label{sec:context}
+%==============================================================================
+
+\subsection{Beyond ACE: Meta Context Engineering}
+
+The most significant advance beyond ACE is \textbf{MCE} (Meta Context Engineering via Agentic Skill Evolution)~\cite{mce}. While ACE evolves playbook \textit{content} (add, update, merge, remove bullets within a fixed schema), MCE evolves the context engineering \textit{process itself}---the instructions and code that govern how context is constructed.
+
+MCE operates at two levels: a \textbf{meta-level agent} that maintains a library of CE ``skills'' (executable instructions + code) and performs \textit{agentic crossover}---deliberative search over the history of skills, their executions, and evaluations---and a \textbf{base-level agent} that executes evolved skills to construct context as programmatic artifacts. Results show 5.6--53.8\% relative improvement over state-of-the-art agentic CE methods (mean 16.9\%), with superior transferability across task families.
+
+The implication for CCR is profound: the playbook format (sections with slugged bullets and counters) could itself be treated as an evolvable artifact, with a meta-level process periodically evaluating whether the current structure serves well.
+
+\subsection{Hierarchical Skill Libraries}
+
+\textbf{SkillRL}~\cite{skillrl} introduces a hierarchical SkillBank with three key mechanisms:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Distillation}: Successful trajectories are compressed into strategic patterns (10--20$\times$ compression). Failed trajectories are distilled into structured \textit{failure lessons} with four components: failure point, flawed reasoning, correct counterfactual, and general prevention principle.
+    \item \textbf{Hierarchy}: General skills (universal strategies) versus task-specific skills (procedural guides with nuanced preconditions).
+    \item \textbf{Recursive evolution}: Validation checkpoints detect when accumulated failures expose knowledge gaps, triggering targeted skill refinement.
+\end{enumerate}
+
+This directly informs CCR's ACE system. Currently, a harmful increment (\texttt{harmful=3}) conveys no information about \textit{why} a strategy failed or \textit{what should have been done instead}. SkillRL's structured failure lessons would make harmful entries actionable.
+
+\textbf{EXIF}~\cite{exif} introduces \textit{exploration-first} skill discovery using dual agents: an explorer that proactively generates skill datasets by interacting with environments, and a learner that trains on discovered skills. When both roles are filled by the same model, the system becomes self-evolving. This contrasts with CCR's current reactive approach where insights are accumulated only when they arise during normal work.
+
+\subsection{Context Compression}
+
+\textbf{ACON}~\cite{acon} (ICLR 2025) learns compression guidelines from paired trajectory analysis---comparing where full context succeeds versus compressed context fails. An LLM analyzes failure causes and iteratively updates compression guidelines in natural language. Results: 26--54\% peak token reduction, with distilled compressors retaining 95\% accuracy.
+
+Anthropic's own context engineering principles~\cite{anthropic_ce} emphasize that ``every token competes for attention'' and recommend the smallest possible set of high-signal tokens. The multi-agent summarization pattern---subagents explore extensively but return condensed 1--2K token summaries---aligns with CCR's RLM design.
+
+\textbf{CER} (Contextual Experience Replay)~\cite{cer} (ACL 2025) demonstrates training-free self-improvement through a dynamic memory buffer of synthesized experiences, achieving 51\% relative improvement over GPT-4o. CER's training-free approach validates CCR's zero-LLM-call philosophy while suggesting that \texttt{gcc\_commit} could include a \texttt{patterns\_learned} field capturing transferable decision patterns.
+
+\subsection{Retrieval-Augmented Generation for Code}
+
+\textbf{A-RAG}~\cite{arag} presents hierarchical retrieval with three tools (keyword search, semantic search, chunk read) where models dynamically choose retrieval strategies. This outperforms fixed pipelines because different queries benefit from different strategies. CCR's \texttt{index\_search} currently supports only keyword/symbol search; adding semantic search would enable conceptually related code discovery.
+
+%==============================================================================
+\section{Sandboxed Execution and REPL-Based Reasoning}
+\label{sec:sandbox}
+%==============================================================================
+
+\subsection{The RLM Paradigm and Its Validation}
+
+The RLM (Recursive Language Models) paradigm~\cite{rlm} treats long prompts as an external environment, giving the LLM a Python REPL with context loaded as a string variable. Key results include handling inputs up to 2 orders of magnitude beyond context windows, 29\% gain on BrowseComp-Plus with GPT-5, and 58\% F1 on OOLONG-Pairs.
+
+Critically, the \textit{REPL-only ablation} (no recursive sub-model calls) still improves performance on several tasks, validating CCR's architecture where Claude Code---the model itself---drives the iteration loop. Post-paper advances include \textbf{RLM-Qwen3-8B}~\cite{rlm_qwen3} (the first natively recursive model, +28.3\% over vanilla Qwen3-8B) and Prime Intellect's \textbf{RLMEnv}~\cite{rlmenv} (confirming consistent gains across four benchmarks).
+
+\subsection{The Sandbox Security Hierarchy}
+
+The sandboxing landscape has stratified into a clear hierarchy, which we present in Table~\ref{tab:sandbox}.
+
+\begin{table}[h]
+\centering
+\caption{Sandbox isolation tiers for LLM agent code execution, ordered from strongest to weakest isolation. CCR currently operates at the weakest tier (Tier 6).}
+\label{tab:sandbox}
+\small
+\begin{tabular}{@{}llccp{3.2cm}@{}}
+\toprule
+\textbf{Tier} & \textbf{Technology} & \textbf{Boot} & \textbf{Overhead} & \textbf{Representative} \\
+\midrule
+1 & Firecracker microVM & 125ms & 3--5 MB & E2B, AWS Lambda \\
+2 & Kata Containers & 200ms & $\sim$10 MB & Northflank \\
+3 & gVisor & 50ms & $\sim$15 MB & Modal, GKE \\
+4 & Wasm (Wasmtime) & $<$13ms & $<$5 MB & Wassette~\cite{wassette} \\
+5 & Kernel filters & $<$1ms & Zero & nono~\cite{nono} \\
+6 & Process blocklists & $<$1ms & Zero & \textbf{CCR (current)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Nono}~\cite{nono} uses Landlock (Linux) and Seatbelt (macOS) for kernel-level restriction with deny-by-default semantics. It auto-blocks SSH keys, cloud credentials, and shell history, provides atomic rollback with cryptographic audit chains (Sigstore attestation, in-toto/SLSA compliance), and critically, ``once restrictions are applied, there is no API to escape them---not even for nono itself.'' This is directly applicable to CCR on macOS (M4 Pro) with zero performance overhead.
+
+\textbf{Wassette}~\cite{wassette} (Microsoft) runs WebAssembly Components via MCP with a deny-by-default capability system. No filesystem, network, or environment access unless explicitly granted. Sub-13ms startup. The capability model is formally similar to browser sandboxes, providing strong isolation without virtualization overhead.
+
+\textbf{CaMeL}~\cite{camel} (Google DeepMind) addresses a complementary threat---prompt injection via data flow control. A Privileged LLM orchestrates tasks while a Quarantined LLM (stripped of tool-calling) processes untrusted data. Every value carries provenance tags, and policies prevent tainted data from flowing into irreversible actions. CaMeL solves 77\% of tasks with provable security versus 84\% undefended (only 7\% capability cost).
+
+The \textbf{OWASP Top 10 for Agentic Applications} (2026)~\cite{owasp_agentic} identifies Agent Goal Hijacking (ASI01) and Tool Misuse (ASI02) as the top risks, emphasizing the Least Agency principle: autonomy should be earned, not default.
+
+\subsection{MCP Server Patterns}
+
+The MCP specification has evolved significantly through 2025--2026, adding streamable HTTP transport, OAuth 2.1 authorization, \textbf{tool annotations} (readOnlyHint, destructiveHint, idempotentHint), \textbf{output schemas}, and \textbf{elicitation} (servers requesting structured input mid-execution).
+
+The \textbf{Cloudflare Code Mode}~\cite{cloudflare_code_mode} pattern is particularly relevant: instead of exposing every API operation as a separate MCP tool (consuming $>$1M tokens for large APIs), expose just \texttt{search()} and \texttt{execute()}. The agent discovers capabilities via search and writes code against a typed SDK. Result: 81\% fewer tokens versus direct tool calling. This aligns with CCR's REPL philosophy---give the agent a programmable interface rather than enumerated tools.
+
+Anthropic's \textbf{Programmatic Tool Calling}~\cite{anthropic_code_exec} achieves 98.7\% token reduction (150K to 2K tokens) by shifting from sequential tool calling to code-based orchestration. Their \textbf{Tool Search Tool} enables searching thousands of tools without loading all definitions upfront (85\% token reduction).
+
+%==============================================================================
+\section{Competitive Landscape Analysis}
+\label{sec:landscape}
+%==============================================================================
+
+We analyze the competitive positioning of CCR against six categories of systems. Table~\ref{tab:competitive} summarizes capabilities.
+
+\begin{table}[h]
+\centering
+\caption{Capability comparison across agent memory and context systems (March 2026). CCR is the only system combining all six capabilities.}
+\label{tab:competitive}
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+\textbf{Capability} & \textbf{Claude} & \textbf{IDE} & \textbf{Devin/} & \textbf{Lang-} & \textbf{MCP} & \textbf{CCR} \\
+ & \textbf{Native} & \textbf{Agents} & \textbf{OH} & \textbf{Graph} & \textbf{Servers} & \\
+\midrule
+Cross-session memory & Flat & Via MCP & Events & Store & Various & \textbf{Git} \\
+Version control & -- & -- & -- & -- & -- & \checkmark \\
+Self-evolving strategies & -- & -- & -- & -- & -- & \checkmark \\
+Sandboxed REPL & -- & -- & Env & -- & -- & \checkmark \\
+Zero LLM calls & \checkmark & N/A & -- & -- & Mostly -- & \checkmark \\
+Zero infrastructure & \checkmark & Varies & -- & -- & Varies & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Claude Code Native Memory.} Ships with CLAUDE.md (user-written instructions) and Auto Memory (agent-written MEMORY.md). Strengths: zero setup, auditable, survives compaction. Weaknesses: no version history, no branching, no structured metadata, no self-evolving strategies, 200-line auto-load limit.
+
+\textbf{IDE Agents (Cursor, Windsurf, Cline, Roo Code).} Windsurf offers the best native memory (Memories \& Rules), while Roo Code Memory Bank provides structured categories (decisionLog, systemPatterns). None offer version control over memory or self-evolving strategies. All rely on MCP marketplace for extensibility.
+
+\textbf{Autonomous Agents (Devin, OpenHands, SWE-Agent, Aider).} OpenHands' \textit{context condensation}~\cite{openhands_condensation}---summarizing older events while preserving recent ones---achieves $\sim$50\% cost reduction without accuracy loss and linear (vs. quadratic) scaling. Devin Wiki auto-indexes repositories. Neither system has self-evolving strategies or versioned memory.
+
+\textbf{Agent Frameworks (LangGraph, CrewAI, AutoGen, Semantic Kernel).} LangGraph offers the most mature memory with namespaced document stores, TTL support, and multiple backends (Postgres, Redis, MongoDB). CrewAI provides structured memory types (entity, crew). All require infrastructure and are designed for custom applications, not coding agents.
+
+\textbf{MCP Memory Servers.} The marketplace has reached 8,500+ servers. Notable entries: \texttt{claude-mem} (ChromaDB + AI compression, requires API keys), \texttt{memsearch} (Milvus + hybrid search, requires embedding API), \texttt{engram} (SQLite + FTS5, agent-agnostic), \texttt{mcp-memory-service} (knowledge graphs, sqlite-vec). None combine versioned memory, self-evolving strategies, and sandboxed execution.
+
+\textbf{Convergence signal.} Letta/MemGPT's February 2026 update introduced ``Context Repositories''---git-based versioning for memory---independently validating GCC's core design choice. GCC v2~\cite{gcc} (revised March 2026) reports 13\%+ improvement on SWE-Bench Verified with 80\%+ success rate, outperforming 26 open and commercial systems.
+
+\textbf{CCR's unique moats:} (1) Only system implementing all three papers (GCC + ACE + RLM) as a unified MCP server; (2) Zero LLM calls---works with Claude Max, no API keys; (3) Git-style memory with branch/merge is fundamentally more powerful than flat storage; (4) Self-evolving playbooks with helpful/harmful counters have zero competitors; (5) 17 tools in one MCP server versus competitors' 3--5; (6) Pure file-based, zero infrastructure.
+
+%==============================================================================
+\section{CCR v2 Roadmap}
+\label{sec:roadmap}
+%==============================================================================
+
+Based on the survey, we propose 14 improvements organized into three priority tiers by impact-to-effort ratio.
+
+\subsection{Tier 1: High Impact, Low--Medium Effort}
+
+\textbf{1. Structured Failure Lessons (ACE).} \textit{Source: SkillRL}~\cite{skillrl}. Replace bare \texttt{harmful=N} counter increments with structured records containing four fields: failure point, flawed reasoning, correct counterfactual, and general prevention principle. This makes harmful entries actionable rather than merely flagged. Expected impact: 10--20$\times$ information density per harmful entry.
+
+\textbf{2. Memory Admission Control (GCC).} \textit{Source: A-MAC}~\cite{amac}. Before writing a new commit, compute semantic overlap with the last $k$ commits (file intersection + keyword similarity). If overlap exceeds a threshold $\tau$ (e.g., 0.8), auto-merge into the previous commit. This prevents the ``50 commits that all say continued working on X'' pattern. Expected impact: 30--50\% reduction in redundant commits.
+
+\textbf{3. Temporal Decay for Playbook Counters (ACE).} \textit{Source: SYNAPSE}~\cite{synapse}, \textit{ACT-R}~\cite{actr}. Apply exponential decay to helpful/harmful counters:
+\begin{equation}
+    \text{score}_{\text{eff}} = \text{score}_{\text{raw}} \cdot \lambda^{d}
+\end{equation}
+where $\lambda = 0.95$ and $d$ is days since last update. A strategy unused for 30 days retains $\lambda^{30} \approx 0.21$ of its score. This implements principled forgetting without deletion.
+
+\textbf{4. Two-Tier Playbook (ACE).} \textit{Source: SkillRL}~\cite{skillrl}, \textit{Memory Survey}~\cite{memory_survey}. Split the playbook into:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Global}: \texttt{\textasciitilde/.ccr/global\_playbook.txt}---universal heuristics that transfer across projects (e.g., ``validate assumptions at each step'').
+    \item \textbf{Project}: \texttt{.ccr/playbook.txt}---project-specific strategies (e.g., ``ChatMessage is a struct, not an enum in ironclaw'').
+\end{itemize}
+Both are injected via the session start hook. Global strategies persist when switching projects, enabling cross-project transfer learning.
+
+\textbf{5. Kernel Sandboxing (RLM).} \textit{Source: nono}~\cite{nono}, \textit{OWASP}~\cite{owasp_agentic}. Add macOS Seatbelt enforcement around the Python REPL subprocess with deny-by-default filesystem and network access. Auto-block \texttt{\textasciitilde/.ssh}, \texttt{\textasciitilde/.aws}, \texttt{\textasciitilde/.config/gcloud}, and shell history. Zero performance overhead; single wrapper function around existing subprocess launch.
+
+\textbf{6. MCP Tool Annotations.} \textit{Source: MCP Spec 2025-11-25}~\cite{mcp_spec}. Add \texttt{readOnlyHint}, \texttt{destructiveHint}, and \texttt{idempotentHint} metadata to all 17 tools. Zero code change to logic---pure metadata. Enables Claude Code to make smarter safety decisions about tool execution ordering and confirmation requirements.
+
+\subsection{Tier 2: High Impact, Medium Effort}
+
+\textbf{7. Multi-Level Hierarchical Summaries (GCC).} \textit{Source: TiMem}~\cite{timem}. Upgrade the single rolling summary to three tiers: session summaries (every 5--10 commits), phase summaries (on branch merges or milestones), and project overview (monthly). \texttt{gcc\_context(level=1)} returns phase summaries; higher levels add progressively more detail. Expected token reduction: $\sim$52\% for routine context loads.
+
+\textbf{8. Retroactive Commit Linking (GCC).} \textit{Source: A-MEM}~\cite{amem}, \textit{MAGMA}~\cite{magma}. When \texttt{gcc\_commit} creates a new entry, scan recent commits for semantic overlap (shared files, referenced concepts) and store cross-links as metadata. Link types: entity (same files), causal (``why'' references a prior problem), and supersession (replaces an earlier approach). Enables graph-based traversal in \texttt{gcc\_context}.
+
+\textbf{9. Evolving Compression Guidelines (GCC/ACE).} \textit{Source: ACON}~\cite{acon}. Maintain \texttt{.ccr/compression\_guidelines.txt} capturing what information must survive compaction. When information loss causes problems (agent cannot find previously committed data), the guidelines are updated. Over time, compaction learns what to preserve for each project.
+
+\textbf{10. Patterns Field in Commits (GCC).} \textit{Source: CER}~\cite{cer}. Add \texttt{patterns\_learned} to \texttt{gcc\_commit} alongside existing fields. Captures transferable decision patterns (e.g., ``tokio async tests require special Mutex handling'') that are candidates for automatic promotion to ACE playbook bullets.
+
+\subsection{Tier 3: Transformative, Higher Effort}
+
+\textbf{11. Meta-Level Playbook Evolution (ACE).} \textit{Source: MCE}~\cite{mce}. Treat the playbook format itself---section structure, counter thresholds, delta operations---as an evolvable artifact. A meta-level process periodically evaluates whether the current structure serves well and proposes structural changes. Expected impact: 5.6--53.8\% improvement based on MCE results.
+
+\textbf{12. Wasm Sandbox Migration (RLM).} \textit{Source: Wassette}~\cite{wassette}, \textit{agent-sandbox}. Replace the Python REPL's process-level blocklist with a WebAssembly capability-based sandbox. Sub-13ms startup, deny-by-default for filesystem/network/env, browser-engine-level isolation. Significant architectural change but future-proofs security.
+
+\textbf{13. Semantic Search in Index.} \textit{Source: A-RAG}~\cite{arag}. Add embedding-based retrieval alongside keyword/symbol search. Expose as \texttt{index\_search(query, mode="keyword"|"semantic"|"hybrid")}. Enables finding conceptually related code, not just exact matches.
+
+\textbf{14. Knowledge Atom Extraction (GCC).} \textit{Source: PlugMem}~\cite{plugmem}. Extract atomic facts from commits (``MCP server has 17 tools'', ``tests: 600 passing'') into a separate lightweight index. \texttt{gcc\_context} returns atoms instead of full commit text for broad queries, dramatically reducing tokens.
+
+%==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================================
+
+\subsection{Architectural Validation}
+
+The survey provides strong external validation for CCR's core design choices:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Git-style memory is converging as standard.} Letta/MemGPT independently introduced ``Context Repositories'' (git-based versioning) in February 2026, and GCC v2 reports state-of-the-art results on SWE-Bench Verified.
+    \item \textbf{Zero-LLM-call architecture is viable.} CER~\cite{cer} demonstrates training-free self-improvement, and the Codified Context paper~\cite{codified_context} validates hot/cold memory patterns across 283 development sessions without requiring LLM calls for memory management.
+    \item \textbf{REPL-as-environment is validated.} The RLM REPL-only ablation~\cite{rlm} confirms that even without recursive sub-model calls, the REPL paradigm delivers substantial gains.
+    \item \textbf{Self-evolving strategies are unique.} No competing system---commercial, open-source, or academic---implements self-evolving playbooks with helpful/harmful counters. ACE remains CCR's strongest differentiator.
+\end{enumerate}
+
+\subsection{Key Risks}
+
+\textbf{Claude Code native memory evolution.} If Anthropic adds versioning, search, or strategy evolution to Auto Memory, CCR's advantage narrows. Mitigation: stay structurally superior (branches, merges, playbooks, REPL) rather than competing on basic persistence.
+
+\textbf{MCP marketplace fragmentation.} Users may prefer assembling 3--4 focused tools rather than one comprehensive server. Mitigation: emphasize that GCC + ACE + RLM integration is the value---they work better together than as separate tools.
+
+\textbf{Embedding dependency for semantic search.} Adding semantic search (Tier 3, item 13) would require either a local embedding model or an API key, potentially breaking the zero-infrastructure principle. Mitigation: use lightweight local models (e.g., all-MiniLM-L6-v2 via ONNX) or defer to keyword search when embeddings are unavailable.
+
+\subsection{Limitations of This Survey}
+
+Our analysis is limited to publicly available papers, documentation, and open-source code as of March 10, 2026. Commercial systems (Devin, Cursor) may have unpublished capabilities. Benchmark comparisons across papers are not directly comparable due to differing evaluation protocols. The proposed roadmap has not been empirically validated; impact estimates are extrapolated from source papers' results on different tasks.
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%==============================================================================
+
+We surveyed 50+ papers, frameworks, and production systems across three domains---persistent agent memory, self-evolving strategies, and sandboxed execution---to inform the next version of CCR. Our analysis reveals that:
+
+\begin{enumerate}[leftmargin=*]
+    \item Graph-based memory with admission control (MAGMA, A-MAC) outperforms flat stores by up to 45.5\% on reasoning benchmarks, motivating commit linking and novelty gating for GCC.
+    \item Hierarchical skill libraries with structured failure distillation (SkillRL) achieve 10--20$\times$ compression while making failures actionable, directly informing ACE's playbook evolution.
+    \item Temporal decay (SYNAPSE, ACT-R) and multi-level summarization (TiMem, 52\% token reduction) provide principled mechanisms for managing growing memory.
+    \item Kernel-level sandboxing (nono/Seatbelt) provides zero-overhead isolation categorically stronger than CCR's current application-level blocklist.
+    \item CCR's unified architecture remains unique---no competing system combines versioned memory, self-evolving playbooks, and sandboxed REPL in a single zero-LLM-call MCP server.
+\end{enumerate}
+
+We propose a 14-item roadmap organized into three tiers. Tier 1 (6 items) offers the highest return on investment and can be implemented without architectural changes. Tier 2 (4 items) requires moderate refactoring but delivers significant capability improvements. Tier 3 (4 items) represents transformative changes that would position CCR at the frontier of the agent memory research agenda.
+
+The convergence of independent research toward git-style memory (Letta), self-evolving strategies (MCE, SkillRL), and REPL-based reasoning (RLM-Qwen3) validates CCR's foundational bet that coding agents need structured, versioned, evolving memory---not just flat text files.
+
+%==============================================================================
+% References
+%==============================================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{gcc}
+Git Context Controller (GCC).
+\textit{arXiv:2508.00031}, 2025 (revised March 2026).
+
+\bibitem{ace}
+Agentic Context Engineering (ACE).
+\textit{arXiv:2510.04618}, 2025.
+
+\bibitem{rlm}
+A.~Zhang, T.~Kraska, O.~Khattab.
+Recursive Language Models.
+\textit{arXiv:2512.24601}, December 2025.
+
+\bibitem{mce}
+H.~Ye, X.~He, et al.
+MCE: Meta Context Engineering via Agentic Skill Evolution.
+\textit{arXiv:2601.21557}, January 2026.
+
+\bibitem{skillrl}
+SkillRL: Evolving Agents via Recursive Skill-Augmented Reinforcement Learning.
+\textit{arXiv:2602.08234}, February 2026.
+
+\bibitem{exif}
+EXIF: Exploration-First Automated Skill Discovery for Language Agents.
+\textit{arXiv:2506.04287}, June 2025.
+
+\bibitem{magma}
+MAGMA: Multi-Graph Agentic Memory Architecture.
+\textit{arXiv:2601.03236}, January 2026.
+
+\bibitem{synapse}
+SYNAPSE: Episodic-Semantic Memory via Spreading Activation.
+\textit{arXiv:2601.02744}, January 2026.
+
+\bibitem{amem}
+A-MEM: Agentic Memory for LLM Agents.
+\textit{arXiv:2502.12110}, February 2025.
+
+\bibitem{graphiti}
+Graphiti: Temporal Knowledge Graphs for AI Agents.
+\textit{arXiv:2501.13956}, January 2025.
+
+\bibitem{plugmem}
+PlugMem: Task-Agnostic Plugin Memory.
+\textit{arXiv:2603.03296}, March 2026 (Microsoft Research).
+
+\bibitem{amac}
+A-MAC: Adaptive Memory Admission Control.
+\textit{arXiv:2603.04549}, March 2026.
+
+\bibitem{timem}
+TiMem: Temporal-Hierarchical Memory Consolidation.
+\textit{arXiv:2601.02845}, January 2026.
+
+\bibitem{himem}
+HiMem: Hierarchical Long-Term Memory for LLM Agents.
+\textit{arXiv:2601.06377}, January 2026.
+
+\bibitem{memrl}
+MemRL: Self-Evolving Agents via Reinforcement Learning on Episodic Memory.
+\textit{arXiv:2601.03192}, January 2026.
+
+\bibitem{cma}
+Continuum Memory Architecture.
+\textit{arXiv:2601.09913}, January 2026.
+
+\bibitem{aeon}
+Aeon: Neuro-Symbolic Memory OS for LLM Agents.
+\textit{arXiv:2601.15311}, January 2026.
+
+\bibitem{memory_survey}
+Memory in the Age of AI Agents: A Survey.
+\textit{arXiv:2512.13564}, December 2025.
+
+\bibitem{graph_memory_survey}
+Graph-based Agent Memory: Taxonomy, Techniques, and Applications.
+\textit{arXiv:2602.05665}, February 2026.
+
+\bibitem{memagents_workshop}
+ICLR 2026 MemAgents Workshop: Memory for LLM-Based Agentic Systems.
+Vienna, May 2026.
+
+\bibitem{memoryagentbench}
+MemoryAgentBench.
+\textit{arXiv:2507.05257}, ICLR 2026.
+
+\bibitem{membench}
+MemBench: Evaluating Agent Memory.
+ACL 2025 Findings.
+
+\bibitem{locomo}
+LoCoMo: Long-term Conversational Memory Benchmark.
+Snap Research.
+
+\bibitem{amabench}
+AMA-Bench: Evaluating Long-Horizon Agentic Memory.
+\textit{arXiv:2602.22769}, February 2026.
+
+\bibitem{acon}
+ACON: Optimizing Context Compression for Long-Horizon Agents.
+\textit{arXiv:2510.00615}, ICLR 2025.
+
+\bibitem{cer}
+CER: Contextual Experience Replay for Self-Improvement.
+\textit{arXiv:2506.06698}, ACL 2025.
+
+\bibitem{arag}
+A-RAG: Scaling Agentic RAG via Hierarchical Retrieval Interfaces.
+\textit{arXiv:2602.03442}, February 2026.
+
+\bibitem{codified_context}
+Codified Context: Infrastructure for AI Agents in Complex Codebases.
+\textit{arXiv:2602.20478}, February 2026.
+
+\bibitem{alphaevolve}
+AlphaEvolve: A Coding Agent for Scientific and Algorithmic Discovery.
+\textit{arXiv:2506.13131}, DeepMind, May 2025.
+
+\bibitem{anthropic_ce}
+Effective Context Engineering for AI Agents.
+\textit{Anthropic Engineering Blog}, September 2025.
+
+\bibitem{anthropic_code_exec}
+Code Execution with MCP.
+\textit{Anthropic Engineering Blog}, November 2025.
+
+\bibitem{rlm_qwen3}
+RLM-Qwen3-8B: A Natively Recursive Language Model.
+2026.
+
+\bibitem{rlmenv}
+Prime Intellect.
+RLM as the Paradigm of 2026.
+\textit{Blog post}, 2026.
+
+\bibitem{openhands}
+OpenHands: An Open Platform for AI Software Developers.
+\textit{arXiv:2407.16741}, 2024.
+
+\bibitem{openhands_condensation}
+OpenHands Context Condensation for More Efficient AI Agents.
+\textit{OpenHands Blog}, 2025.
+
+\bibitem{devin}
+Cognition AI.
+Devin: AI Software Engineer.
+2024--2026.
+
+\bibitem{camel}
+CaMeL: Defeating Prompt Injections by Design.
+\textit{arXiv:2503.18813}, Google DeepMind, 2025.
+
+\bibitem{wassette}
+Microsoft.
+Wassette: WebAssembly-based Tools for AI Agents.
+August 2025.
+
+\bibitem{nono}
+nono: Kernel-level Agent Sandboxing.
+\textit{GitHub/HuggingFace}, 2026.
+
+\bibitem{owasp_agentic}
+OWASP Top 10 for Agentic Applications.
+2026 Edition.
+
+\bibitem{cloudflare_code_mode}
+Cloudflare.
+Code Mode MCP: Give Agents an Entire API in 1,000 Tokens.
+2026.
+
+\bibitem{mcp_spec}
+Model Context Protocol Specification.
+Version 2025-11-25.
+
+\bibitem{actr}
+J.~R.~Anderson.
+How Can the Human Mind Occur in the Physical Universe?
+Oxford University Press, 2007.
+
+\bibitem{actr_forgetting}
+Human-Like Remembering and Forgetting for LLM Agents.
+ACM HAI 2025.
+
+\bibitem{exp_to_strategy}
+From Experience to Strategy: Trainable Graph Memory for Agents.
+\textit{arXiv:2511.07800}, ICLR 2026 under review.
+
+\bibitem{agentic_programming}
+AI Agentic Programming: A Survey.
+\textit{arXiv:2508.11126}, 2025.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,74 @@
+gateway:
+  host: "127.0.0.1"
+  port: 7447
+  passthrough_on_error: true
+
+models:
+  primary:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    max_tokens: 16384
+  sub:
+    provider: "openai_compat"
+    model: "openai/gpt-oss-20b"
+    base_url: "http://localhost:11434/v1"
+    max_tokens: 8192
+
+context:
+  token_budget: 8000
+  index_max_file_size_kb: 500
+  index_extensions:
+    - ".py"
+    - ".ts"
+    - ".js"
+    - ".tsx"
+    - ".jsx"
+    - ".go"
+    - ".rs"
+    - ".java"
+    - ".md"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".json"
+    - ".sh"
+
+memory:
+  recent_commit_count: 3
+  milestones_kept: 5
+  log_max_lines: 500
+  proactive_commits: true
+
+router:
+  trivial_token_threshold: 500
+  simple_token_threshold: 2000
+  pack_token_budget: 8000
+  auto_commit_threshold: "moderate"
+  complex_keywords:
+    - "architecture"
+    - "refactor"
+    - "cross-file"
+    - "entire codebase"
+    - "design"
+    - "integrate"
+    - "all files"
+    - "system-wide"
+    - "restructure"
+  complex_patterns:
+    - "understand\\s+(the\\s+|this\\s+)?(codebase|project|repo|code|system|app)"
+    - "(walk|go)\\s+(me\\s+)?through\\s+(the\\s+|this\\s+)?(codebase|project|repo|code)"
+    - "(explain|describe|summarize|overview)\\s+(the\\s+|this\\s+)?(entire\\s+)?(codebase|project|repo|architecture|system)"
+    - "how\\s+does\\s+(the\\s+|this\\s+)?(entire\\s+)?(project|codebase|system|app)\\s+(work|function|operate)"
+    - "(map|trace|analyze)\\s+(the\\s+|this\\s+)?(codebase|project|architecture|dependencies|data\\s*flow)"
+    - "(what|how)\\s+is\\s+(the\\s+|this\\s+)?(project|codebase|app)\\s+(structured|organized|laid\\s+out)"
+    - "give\\s+(me\\s+)?(a\\s+)?(full|complete|high[- ]level)\\s+(overview|summary|picture)"
+
+ace:
+  enabled: true
+  playbook_token_budget: 80000
+  curator_frequency: 1
+  max_reflection_rounds: 3
+  prune_min_harmful: 3
+  max_tokens: 4096
+  refinement_frequency: 10
+  dedup_similarity_threshold: 0.6

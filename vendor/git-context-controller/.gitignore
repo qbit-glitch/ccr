@@ -1,0 +1,17 @@
+# GCC memory directory - should not be committed
+# Each user/agent generates their own context
+.GCC/
+
+# Internal planning
+ROADMAP.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
