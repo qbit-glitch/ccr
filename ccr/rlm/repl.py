@@ -10,6 +10,7 @@ that executes in a sandboxed REPL to programmatically inspect context.
 
 from __future__ import annotations
 
+import ast
 import builtins
 import io
 import json
@@ -29,7 +30,40 @@ from ccr.core.types import REPLResult
 _BLOCKED_MODULES = frozenset({
     "subprocess", "shutil", "signal", "ctypes", "multiprocessing",
     "pty", "fcntl", "termios", "resource",
+    # Critical security additions:
+    "os",           # arbitrary command execution, file ops
+    "sys",          # interpreter manipulation, module cache access
+    "socket",       # network access
+    "http",         # HTTP requests
+    "urllib",       # URL fetching
+    "importlib",    # dynamic import bypass
+    "pathlib",      # filesystem traversal
+    "glob",         # filesystem enumeration
+    "webbrowser",   # browser launch
+    "code",         # interactive interpreter
+    "codeop",       # code compilation
+    "io",           # raw file I/O bypass
+    "_thread",      # low-level threading
+    "threading",    # C5+H2: thread-based sandbox escape
+    "asyncio",      # event loop escape
+    # C2/C3: object graph traversal and low-level escapes
+    "gc",                # gc.get_objects() exposes all live objects
+    "pickle",            # arbitrary code execution via __reduce__
+    "marshal",           # bytecode manipulation
+    "_io",               # low-level I/O bypass
+    "_posixsubprocess",  # direct subprocess spawning
+    "_ctypes",           # FFI bypass
+    "_socket",           # low-level socket access
+    # faulthandler omitted: used by pytest, minimal security risk
+    "struct",            # raw memory packing
+    "copyreg",           # pickle dispatch manipulation
+    "_sitebuiltins",     # site module internals
+    "builtins",          # M4/C1-C4: import builtins restores everything
 })
+
+
+# Store the real __import__ once at module load time, before any patching.
+_REAL_IMPORT = builtins.__import__
 
 
 def _safe_import(name: str, *args, **kwargs):
@@ -40,14 +74,152 @@ def _safe_import(name: str, *args, **kwargs):
             f"Module '{name}' is blocked in the CCR sandbox. "
             f"Blocked modules: {', '.join(sorted(_BLOCKED_MODULES))}"
         )
-    return __import__(name, *args, **kwargs)
+    return _REAL_IMPORT(name, *args, **kwargs)
+
+
+def _make_restricted_open(allowed_dirs: list[str]):
+    """Create a restricted open() that only allows access to specific directories.
+
+    Args:
+        allowed_dirs: List of directory paths that the sandbox is allowed to access.
+                      Paths are resolved to their real (canonical) form for comparison.
+    """
+    # Use os.path directly (already imported at module level) to avoid
+    # going through builtins.__import__ which may be patched during sandbox exec.
+    osp = os.path
+    _real_open = open
+
+    def restricted_open(file, mode='r', *args, **kwargs):
+        resolved = osp.realpath(str(file))
+        for d in allowed_dirs:
+            if resolved.startswith(osp.realpath(d) + osp.sep) or resolved == osp.realpath(d):
+                return _real_open(resolved, mode, *args, **kwargs)  # H1: use resolved, not file
+        raise PermissionError(f"REPL sandbox: access denied to {file}")
+
+    restricted_open.__name__ = "restricted_open"
+    restricted_open.__doc__ = "Sandbox-restricted open(). Only allows access to project root and temp dir."
+    return restricted_open
+
+
+# --- C1: Safe type() wrapper — blocks 3-arg metaclass form ---
+def _safe_type(*args):
+    """type(obj) is allowed; type(name, bases, dict) is blocked in the sandbox."""
+    if len(args) != 1:
+        raise TypeError("type() with multiple arguments is blocked in the sandbox")
+    return type(args[0])
+
+_safe_type.__name__ = "type"
+
+
+# --- C2: Restricted object proxy — blocks __subclasses__ traversal ---
+class _RestrictedObject:
+    """Proxy for object that blocks __subclasses__ and other dangerous methods."""
+    pass
+
+
+# --- C3: Safe getattr/hasattr — blocks dunder attribute access ---
+_DUNDER_RE = re.compile(r'^__.*__$')
+
+
+def _safe_getattr(obj, name, *default):
+    """getattr() that blocks access to dunder attributes in the sandbox."""
+    if isinstance(name, str) and _DUNDER_RE.match(name):
+        raise AttributeError(f"Access to dunder attribute '{name}' is blocked in the sandbox")
+    if default:
+        return getattr(obj, name, default[0])
+    return getattr(obj, name)
+
+
+def _safe_hasattr(obj, name):
+    """hasattr() that returns False for dunder attributes in the sandbox."""
+    if isinstance(name, str) and _DUNDER_RE.match(name):
+        return False
+    return hasattr(obj, name)
+
+
+# --- C1-C4: AST-level sandbox hardening ---
+# Direct attribute syntax (obj.__class__) bypasses _safe_getattr,
+# so we must inspect the AST before execution.
+
+_ALLOWED_DUNDERS = frozenset({
+    '__name__', '__doc__', '__str__', '__repr__', '__len__',
+    '__init__', '__enter__', '__exit__', '__iter__', '__next__',
+    '__getitem__', '__setitem__', '__delitem__', '__contains__',
+    '__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__',
+    '__add__', '__sub__', '__mul__', '__truediv__', '__floordiv__',
+    '__mod__', '__pow__', '__neg__', '__pos__', '__abs__',
+    '__and__', '__or__', '__xor__', '__invert__',
+    '__radd__', '__rsub__', '__rmul__', '__rtruediv__',
+    '__iadd__', '__isub__', '__imul__', '__itruediv__',
+    '__hash__', '__bool__', '__int__', '__float__', '__complex__',
+    '__index__', '__call__',
+})
+
+_DANGEROUS_DUNDERS = frozenset({
+    '__class__', '__bases__', '__mro__', '__subclasses__',
+    '__globals__', '__code__', '__closure__', '__func__',
+    '__self__', '__dict__', '__slots__',
+    '__traceback__', '__context__', '__cause__', '__suppress_context__',
+    '__builtins__', '__import__', '__loader__', '__spec__',
+    '__file__', '__path__', '__package__', '__qualname__',
+    '__module__', '__annotations__', '__wrapped__',
+    '__init_subclass__', '__set_name__', '__class_getitem__',
+    '__getattribute__', '__getattr__', '__setattr__', '__delattr__',
+    'gi_frame', 'gi_code', 'gi_yieldfrom',
+    'cr_frame', 'cr_code', 'cr_origin',
+    'ag_frame', 'ag_code',
+    'tb_frame', 'tb_next', 'tb_lineno', 'tb_lasti',
+    'f_globals', 'f_locals', 'f_builtins', 'f_code', 'f_back',
+    'co_consts', 'co_names', 'co_code',
+})
+
+_DANGEROUS_FUNC_DEFS = frozenset({
+    '__init_subclass__', '__set_name__', '__del__',
+    '__getattr__', '__getattribute__',
+})
+
+
+def _validate_ast(code: str) -> None:
+    """Reject code that accesses dangerous dunder attributes.
+
+    Direct attribute syntax (obj.__class__) bypasses _safe_getattr,
+    so we must inspect the AST before execution.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return  # Let exec handle syntax errors naturally
+
+    for node in ast.walk(tree):
+        # Block dangerous attribute access: obj.__class__, obj.__globals__, etc.
+        if isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr in _DANGEROUS_DUNDERS:
+                raise PermissionError(
+                    f"Access to '{attr}' is blocked in the CCR sandbox"
+                )
+            # Block any remaining dunder not in allowlist
+            if attr.startswith('__') and attr.endswith('__') and attr not in _ALLOWED_DUNDERS:
+                raise PermissionError(
+                    f"Access to dunder attribute '{attr}' is blocked in the CCR sandbox"
+                )
+
+        # Block dangerous function definitions (__init_subclass__, __set_name__, etc.)
+        if isinstance(node, ast.FunctionDef) and node.name in _DANGEROUS_FUNC_DEFS:
+            raise PermissionError(
+                f"Defining '{node.name}' is blocked in the CCR sandbox"
+            )
 
 
 # Safe builtins — blocks eval/exec/compile/input, allows everything else.
+# C1: type replaced with _safe_type (blocks 3-arg form)
+# C2: object replaced with _RestrictedObject (blocks __subclasses__)
+# C3: getattr/hasattr replaced with safe versions (blocks dunder access)
+# C4: super, property, staticmethod, classmethod removed (descriptor abuse)
 _SAFE_BUILTINS: dict[str, Any] = {
     "print": print, "len": len, "str": str, "int": int, "float": float,
     "list": list, "dict": dict, "set": set, "tuple": tuple, "bool": bool,
-    "type": type, "isinstance": isinstance, "issubclass": issubclass,
+    "type": _safe_type, "isinstance": isinstance, "issubclass": issubclass,
     "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
     "sorted": sorted, "reversed": reversed, "range": range,
     "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
@@ -55,12 +227,11 @@ _SAFE_BUILTINS: dict[str, Any] = {
     "chr": chr, "ord": ord, "hex": hex, "bin": bin, "oct": oct,
     "repr": repr, "ascii": ascii, "format": format, "hash": hash, "id": id,
     "iter": iter, "next": next, "slice": slice, "callable": callable,
-    "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
-    "dir": dir, "vars": vars,
-    "bytes": bytes, "bytearray": bytearray, "memoryview": memoryview,
-    "complex": complex, "object": object, "super": super,
-    "property": property, "staticmethod": staticmethod, "classmethod": classmethod,
-    "__import__": _safe_import, "open": open,
+    "hasattr": _safe_hasattr, "getattr": _safe_getattr,
+    "bytes": bytes, "bytearray": bytearray,
+    "complex": complex, "object": _RestrictedObject,
+    "__build_class__": __build_class__,  # Required for 'class' statement
+    "__import__": _safe_import,
     # Exceptions
     "Exception": Exception, "BaseException": BaseException,
     "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
@@ -74,6 +245,29 @@ _SAFE_BUILTINS: dict[str, Any] = {
     "input": None, "eval": None, "compile": None, "exec": None,
     "globals": None, "locals": None,
 }
+
+class _BoundedStringIO(io.StringIO):
+    """StringIO with a maximum size limit to prevent unbounded output DoS (M1).
+
+    Tracks by character count (not bytes) since StringIO operates on str.
+    This avoids the char/byte mismatch where s[:remaining] could truncate
+    differently than the byte count suggests for multi-byte characters.
+    """
+
+    def __init__(self, *args, max_chars: int = 10_000_000, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._max_chars = max_chars
+        self._current_chars = 0
+
+    def write(self, s: str) -> int:
+        if self._current_chars + len(s) > self._max_chars:
+            remaining = self._max_chars - self._current_chars
+            if remaining <= 0:
+                return 0
+            s = s[:remaining]
+        self._current_chars += len(s)
+        return super().write(s)
+
 
 # Default execution timeout in seconds
 _DEFAULT_TIMEOUT_SECONDS = 30
@@ -95,6 +289,7 @@ def _run_in_namespace(code: str, namespace: dict) -> None:
 
     The namespace is restricted via _SAFE_BUILTINS (no eval/compile/input).
     """
+    _validate_ast(code)  # AST-level security check (C1-C4)
     # Python's built-in code execution in a restricted namespace
     builtins.__dict__  # ensure builtins loaded
     co = builtins.compile(code, "<ccr-repl>", "exec")
@@ -122,19 +317,54 @@ class CCRRepl:
         subcall_fn: Any = None,
         custom_tools: dict[str, Any] | None = None,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        project_root: str | None = None,
+        use_kernel_sandbox: bool = False,
     ):
         self.sub_client = sub_client
         self.repo_index = repo_index
         self.subcall_fn = subcall_fn  # Callback for rlm_query (spawns child CCRRlm)
         self.timeout_seconds = timeout_seconds
+        self.project_root = project_root
 
         self._last_final_answer: str | None = None
         self._exec_lock = threading.Lock()
         self._cleaned_up = False
         self.temp_dir = tempfile.mkdtemp(prefix="ccr_repl_")
 
+        # Kernel sandbox (macOS Seatbelt / Linux Landlock)
+        self._kernel_sandbox = None
+        self.use_kernel_sandbox = use_kernel_sandbox
+        if use_kernel_sandbox:
+            from ccr.rlm.sandbox import KernelSandbox, get_sandbox_type
+            sandbox_type = get_sandbox_type()
+            if sandbox_type != "none":
+                self._kernel_sandbox = KernelSandbox(
+                    project_root=project_root,
+                    timeout_seconds=timeout_seconds,
+                )
+                import logging
+                logging.getLogger(__name__).info(
+                    "Kernel sandbox enabled: %s", sandbox_type
+                )
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Kernel sandbox requested but unavailable on this platform. "
+                    "Using Python-level sandboxing only."
+                )
+
+        # Build restricted open with allowed directories
+        allowed_dirs = [self.temp_dir]
+        if project_root:
+            allowed_dirs.append(project_root)
+        self._restricted_open = _make_restricted_open(allowed_dirs)
+
         # Namespace: globals (builtins + tools) and locals (user variables)
-        self.globals: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS.copy()}
+        safe_builtins = _SAFE_BUILTINS.copy()
+        safe_builtins["open"] = self._restricted_open
+        self.globals: dict[str, Any] = {"__builtins__": safe_builtins, "__name__": "__ccr_repl__"}
+        # Also set __import__ at globals level to prevent bypass via module __builtins__
+        self.globals["__import__"] = _safe_import
         self.locals: dict[str, Any] = {}
 
         self._setup_tools(custom_tools or {})
@@ -265,9 +495,9 @@ class CCRRepl:
 
     @contextmanager
     def _capture_output(self):
-        """Capture stdout and stderr during code execution."""
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
+        """Capture stdout and stderr during code execution (M1: bounded to 10M chars)."""
+        stdout_buf = _BoundedStringIO(max_chars=10_000_000)
+        stderr_buf = _BoundedStringIO(max_chars=10_000_000)
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = stdout_buf, stderr_buf
         try:
@@ -290,8 +520,97 @@ class CCRRepl:
         if "context_0" in self.locals:
             self.locals["context"] = self.locals["context_0"]
 
+    def _execute_kernel_sandboxed(self, code: str) -> REPLResult:
+        """Execute code via kernel-sandboxed subprocess.
+
+        The kernel sandbox (Seatbelt/Landlock) enforces OS-level restrictions.
+        AST validation still runs as defense-in-depth before sending to subprocess.
+        """
+        start_time = time.perf_counter()
+
+        # AST validation as defense-in-depth (runs in-process, before subprocess)
+        try:
+            _validate_ast(code)
+        except PermissionError as e:
+            return REPLResult(
+                stdout="",
+                stderr=str(e),
+                locals_snapshot={},
+                execution_time=time.perf_counter() - start_time,
+                final_answer=None,
+                error=str(e),
+            )
+
+        # Serialize only JSON-safe locals for the subprocess
+        serializable_locals: dict[str, Any] = {}
+        for k, v in self.locals.items():
+            if k.startswith("_"):
+                continue
+            try:
+                json.dumps(v)
+                serializable_locals[k] = v
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        result = self._kernel_sandbox.execute(
+            code=code,
+            variables=serializable_locals,
+        )
+
+        # Update locals with variables returned from subprocess
+        for k, v in result.variables.items():
+            if not k.startswith("_"):
+                self.locals[k] = v
+
+        # Check for FINAL_VAR in the subprocess output
+        # The subprocess can't call our _final_var, so we check if any
+        # variable was assigned and FINAL_VAR was called in the code
+        if "FINAL_VAR" in code and not result.error:
+            # Try to extract the final answer from returned variables
+            # by re-running FINAL_VAR logic locally with updated locals
+            import re as _re
+            match = _re.search(r"FINAL_VAR\(['\"](\w+)['\"]\)", code)
+            if match:
+                var_name = match.group(1)
+                self._final_var(var_name)
+            else:
+                # Direct value FINAL_VAR(123) — check stdout
+                match = _re.search(r"FINAL_VAR\((.+?)\)", code)
+                if match:
+                    val = match.group(1).strip().strip("'\"")
+                    if val in self.locals:
+                        self._final_var(val)
+
+        # Build snapshot
+        snapshot = {}
+        for k, v in self.locals.items():
+            if not k.startswith("_") and k not in ("context",):
+                try:
+                    r = repr(v)
+                    snapshot[k] = r[:200] if len(r) > 200 else r
+                except Exception:
+                    snapshot[k] = f"<{type(v).__name__}>"
+
+        stderr = result.stderr or ""
+        if result.error:
+            stderr = (stderr + "\n" + result.error).strip()
+
+        return REPLResult(
+            stdout=result.stdout,
+            stderr=stderr,
+            locals_snapshot=snapshot,
+            execution_time=time.perf_counter() - start_time,
+            final_answer=self._last_final_answer,
+            error=result.error,
+        )
+
     def execute_code(self, code: str) -> REPLResult:
-        """Execute code in the persistent namespace and return result."""
+        """Execute code in the persistent namespace and return result.
+
+        If kernel sandboxing is enabled and available, executes in a
+        sandboxed subprocess. Otherwise uses in-process execution with
+        Python-level restrictions (AST validation, restricted builtins).
+        """
         if self._cleaned_up:
             return REPLResult(
                 stdout="",
@@ -301,6 +620,10 @@ class CCRRepl:
                 final_answer=None,
                 error="Error: REPL has been cleaned up. Create a new instance.",
             )
+
+        # Dispatch to kernel sandbox if available
+        if self._kernel_sandbox is not None:
+            return self._execute_kernel_sandboxed(code)
 
         start_time = time.perf_counter()
         self._last_final_answer = None
@@ -374,8 +697,29 @@ class CCRRepl:
         else:
             self.locals[name] = payload
 
+    @staticmethod
+    def _scrub_module_builtins(namespace: dict) -> None:
+        """Scrub __builtins__ on imported modules to prevent escape between calls.
+
+        After exec, any module the user imported has a __builtins__ dict that
+        may reference the real __import__. Replace it with our safe version.
+        """
+        import types
+        for val in namespace.values():
+            if isinstance(val, types.ModuleType):
+                try:
+                    b = getattr(val, "__builtins__", None)
+                    if isinstance(b, dict) and "__import__" in b:
+                        b["__import__"] = _safe_import
+                except (AttributeError, TypeError):
+                    pass
+
     def _run_with_timeout(self, code: str, namespace: dict) -> None:
-        """Execute code with a timeout using SIGALRM (Unix) or thread fallback."""
+        """Execute code with a timeout using SIGALRM (Unix) or thread fallback.
+
+        M6: Thread-based fallback cannot kill orphaned threads stuck in tight
+        CPU loops. The real fix is subprocess isolation. SIGALRM path is reliable.
+        """
         timeout = int(self.timeout_seconds) or _DEFAULT_TIMEOUT_SECONDS
 
         # Use SIGALRM on Unix for reliable timeout of tight loops
@@ -385,20 +729,31 @@ class CCRRepl:
 
             old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
             signal.alarm(timeout)
+            # C1 fix: patch builtins.__import__ during execution so that
+            # module.__builtins__['__import__'] also returns the safe version.
+            _original_import = builtins.__import__
+            builtins.__import__ = _safe_import
             try:
                 _run_in_namespace(code, namespace)
             finally:
+                builtins.__import__ = _original_import
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
+                self._scrub_module_builtins(namespace)
         else:
             # Fallback: thread-based timeout (cannot interrupt tight CPU loops)
             result_holder: dict[str, Any] = {"error": None}
 
             def _target():
+                _original_import = builtins.__import__
+                builtins.__import__ = _safe_import
                 try:
                     _run_in_namespace(code, namespace)
                 except Exception as e:
                     result_holder["error"] = e
+                finally:
+                    builtins.__import__ = _original_import
+                    self._scrub_module_builtins(namespace)
 
             t = threading.Thread(target=_target, daemon=True)
             t.start()
@@ -409,15 +764,23 @@ class CCRRepl:
                 raise result_holder["error"]
 
     def cleanup(self) -> None:
-        """Clean up temp directory and reset state."""
+        """Clean up temp directory, kernel sandbox, and reset state."""
         self._cleaned_up = True
+        if self._kernel_sandbox is not None:
+            try:
+                self._kernel_sandbox.cleanup()
+            except Exception:
+                pass
+            self._kernel_sandbox = None
         try:
             import shutil
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception:
             pass
-        self.globals.clear()
-        self.locals.clear()
+        if hasattr(self, "globals"):
+            self.globals.clear()
+        if hasattr(self, "locals"):
+            self.locals.clear()
 
     def __enter__(self):
         return self

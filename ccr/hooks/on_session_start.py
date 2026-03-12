@@ -18,17 +18,19 @@ _SESSION_MARKER = "/tmp/.ccr_session_{pid}.marker"
 
 
 def _is_first_prompt(ccr_root: str) -> bool:
-    """Check if this is the first prompt of the session using a marker file."""
+    """Check if this is the first prompt of the session using a marker file (M6: atomic create)."""
     marker = os.path.join(ccr_root, ".session_active")
-    if os.path.isfile(marker):
-        return False
-    # Create marker — will be cleaned up when .ccr/ is re-initialized
     try:
-        with open(marker, "w") as f:
-            f.write(str(os.getpid()))
+        # M6: Atomic create — O_CREAT|O_EXCL fails if file already exists
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
     except OSError:
-        pass
-    return True
+        # Fallback: if directory doesn't exist or permissions issue
+        return False
 
 
 def main():
@@ -55,7 +57,14 @@ def _handle_session_start(mem):
     # Get level-1 context
     context = mem.get_context(level=1)
 
-    # Get playbook if it exists
+    # Get global playbook (~/.ccr/)
+    global_playbook_path = os.path.expanduser("~/.ccr/global_playbook.txt")
+    global_text = ""
+    if os.path.isfile(global_playbook_path):
+        with open(global_playbook_path, "r", encoding="utf-8") as f:
+            global_text = f.read().strip()
+
+    # Get project playbook (.ccr/)
     playbook_path = os.path.join(mem.ccr_root, "playbook.txt")
     playbook_text = ""
     if os.path.isfile(playbook_path):
@@ -74,8 +83,13 @@ def _handle_session_start(mem):
     parts = []
     if context.strip():
         parts.append(f"<gcc_context>\n{context}\n</gcc_context>")
-    if playbook_text:
-        parts.append(f"<ace_playbook>\n{playbook_text}\n</ace_playbook>")
+    if global_text or playbook_text:
+        pb_parts = []
+        if global_text:
+            pb_parts.append(f"# GLOBAL STRATEGIES (all projects)\n{global_text}")
+        if playbook_text:
+            pb_parts.append(f"# PROJECT STRATEGIES (this project)\n{playbook_text}")
+        parts.append(f"<ace_playbook>\n{chr(10).join(pb_parts)}\n</ace_playbook>")
 
     # Strong session-start directive
     parts.append("""<MANDATORY_CCR_ACTIONS>

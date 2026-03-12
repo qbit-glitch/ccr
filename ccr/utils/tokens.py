@@ -53,7 +53,7 @@ def count_tokens(text: str | list[dict], model: str = "cl100k_base") -> int:
     return _count_tokens_cached(text, model)
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=64)  # M8: Reduced from 512 to prevent retaining large strings
 def _count_tokens_cached(text: str, model: str = "cl100k_base") -> int:
     """LRU-cached token counting for repeated strings."""
     enc = _get_tiktoken_encoding(model)

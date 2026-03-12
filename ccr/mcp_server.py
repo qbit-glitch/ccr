@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import threading
 from dataclasses import asdict
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ccr.ace.playbook import DeltaOperation, FailureLesson, Playbook, parse_delta_operations
 from ccr.context.indexer import RepoIndex
@@ -27,11 +30,17 @@ from ccr.rlm.repl import CCRRepl
 # Globals — initialized once at startup
 # ---------------------------------------------------------------------------
 
+# M3: Module-level lock for thread safety on global state mutations
+_state_lock = threading.Lock()
+
 _project_root: str = ""
 _memory: MemoryManager | None = None
 _playbook: Playbook | None = None
 _playbook_path: str = ""
 _failure_lessons_path: str = ""
+_global_playbook: Playbook | None = None
+_global_playbook_path: str = ""
+_global_failure_lessons_path: str = ""
 _repo_index: RepoIndex | None = None
 _repl: CCRRepl | None = None
 
@@ -48,7 +57,8 @@ mcp = FastMCP(
 
 def _init(project_root: str | None = None) -> None:
     """Initialize all subsystems for the given project root."""
-    global _project_root, _memory, _playbook, _playbook_path, _failure_lessons_path, _repo_index
+    global _project_root, _memory, _playbook, _playbook_path, _failure_lessons_path
+    global _global_playbook, _global_playbook_path, _global_failure_lessons_path, _repo_index
 
     _project_root = os.path.abspath(project_root or os.getcwd())
     _memory = MemoryManager(_project_root, CCRConfig())
@@ -66,6 +76,13 @@ def _init(project_root: str | None = None) -> None:
     _failure_lessons_path = os.path.join(_project_root, ".ccr", "failure_lessons.json")
     _playbook = _load_playbook()
 
+    # Initialize global playbook (~/.ccr/)
+    global_ccr = os.path.expanduser("~/.ccr")
+    os.makedirs(global_ccr, exist_ok=True)
+    _global_playbook_path = os.path.join(global_ccr, "global_playbook.txt")
+    _global_failure_lessons_path = os.path.join(global_ccr, "global_failure_lessons.json")
+    _global_playbook = _load_global_playbook()
+
     # Build repo index
     _repo_index = RepoIndex.build(_project_root)
 
@@ -74,6 +91,25 @@ def _init(project_root: str | None = None) -> None:
         _memory.save_index(_repo_index.to_json())
     except Exception:
         pass
+
+
+def _atomic_write(path: str, content: str) -> None:
+    """Write content to path atomically via tmp + fsync + os.replace (H5)."""
+    dir_name = os.path.dirname(path)
+    os.makedirs(dir_name, exist_ok=True)
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _load_playbook() -> Playbook:
@@ -90,14 +126,39 @@ def _load_playbook() -> Playbook:
 
 
 def _save_playbook() -> None:
-    """Persist playbook and failure lessons to disk."""
+    """Persist playbook and failure lessons to disk (H5: atomic writes)."""
     if _playbook is not None:
-        os.makedirs(os.path.dirname(_playbook_path), exist_ok=True)
-        with open(_playbook_path, "w", encoding="utf-8") as f:
-            f.write(_playbook.serialize())
+        _atomic_write(_playbook_path, _playbook.serialize())
         # Save failure lessons to companion JSON
         if _failure_lessons_path:
             _playbook.save_failure_lessons(_failure_lessons_path)
+
+
+def _load_global_playbook() -> Playbook:
+    """Load global playbook from ~/.ccr/ or create empty."""
+    if os.path.isfile(_global_playbook_path):
+        with open(_global_playbook_path, "r", encoding="utf-8") as f:
+            pb = Playbook(f.read())
+    else:
+        pb = Playbook()
+    if _global_failure_lessons_path:
+        pb.load_failure_lessons(_global_failure_lessons_path)
+    return pb
+
+
+def _save_global_playbook() -> None:
+    """Persist global playbook to ~/.ccr/ (H5: atomic writes)."""
+    if _global_playbook is not None:
+        _atomic_write(_global_playbook_path, _global_playbook.serialize())
+        if _global_failure_lessons_path:
+            _global_playbook.save_failure_lessons(_global_failure_lessons_path)
+
+
+def _ensure_global_playbook() -> Playbook:
+    if _global_playbook is None:
+        _init()
+    assert _global_playbook is not None
+    return _global_playbook
 
 
 def _ensure_memory() -> MemoryManager:
@@ -126,7 +187,7 @@ def _ensure_index() -> RepoIndex:
 # ===========================================================================
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def gcc_commit(
     title: str,
     what: str,
@@ -161,12 +222,13 @@ def gcc_commit(
         rejection_threshold: Admission score below which commits are rejected.
             Default 0.0 (disabled). Low score = low value = reject.
     """
-    mem = _ensure_memory()
-    return mem.commit(title, what, why, files_changed, next_step,
-                      admission_threshold, rejection_threshold)
+    with _state_lock:
+        mem = _ensure_memory()
+        return mem.commit(title, what, why, files_changed, next_step,
+                          admission_threshold, rejection_threshold)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def gcc_branch(name: str, purpose: str, hypothesis: str) -> str:
     """Create an exploration branch for experimental work.
 
@@ -178,11 +240,12 @@ def gcc_branch(name: str, purpose: str, hypothesis: str) -> str:
         purpose: What this branch explores.
         hypothesis: What you expect to learn or achieve.
     """
-    mem = _ensure_memory()
-    return mem.create_branch(name, purpose, hypothesis)
+    with _state_lock:
+        mem = _ensure_memory()
+        return mem.create_branch(name, purpose, hypothesis)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
 def gcc_merge(branch: str, outcome: str, conclusion: str) -> str:
     """Merge an exploration branch back into main.
 
@@ -194,11 +257,12 @@ def gcc_merge(branch: str, outcome: str, conclusion: str) -> str:
         outcome: One of 'success', 'failure', or 'partial'.
         conclusion: Summary of what was learned.
     """
-    mem = _ensure_memory()
-    return mem.merge(branch, outcome, conclusion)
+    with _state_lock:
+        mem = _ensure_memory()
+        return mem.merge(branch, outcome, conclusion)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def gcc_context(
     level: int = 2,
     search_term: str | None = None,
@@ -232,29 +296,30 @@ def gcc_context(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def gcc_log_ota(observation: str, thought: str, action: str) -> str:
     """Log an Observation-Thought-Action triple to the project log.
 
     OTA triples track your reasoning process. They're attached to
-    commits and preserved across sessions.
+    commits and preserved across sessions. Each call appends a new entry.
 
     Args:
         observation: What you observed (e.g., "Test failure in router.py").
         thought: Your reasoning (e.g., "The regex pattern is too greedy").
         action: What you did (e.g., "Fixed pattern to use non-greedy match").
     """
-    mem = _ensure_memory()
-    mem.log_ota(
-        tool_name="claude-code",
-        observation=observation,
-        thought=thought,
-        action=action,
-    )
+    with _state_lock:  # H3: protect memory state mutation
+        mem = _ensure_memory()
+        mem.log_ota(
+            tool_name="claude-code",
+            observation=observation,
+            thought=thought,
+            action=action,
+        )
     return "OTA logged."
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def gcc_status() -> str:
     """Show current project memory status.
 
@@ -279,28 +344,50 @@ def gcc_status() -> str:
 # ===========================================================================
 
 
-@mcp.tool()
-def ace_get_playbook() -> str:
-    """Get the current ACE playbook — your evolved strategies and insights.
+def _resolve_playbook(scope: str) -> tuple[Playbook, callable]:
+    """Resolve playbook and save function based on scope."""
+    if scope == "global":
+        return _ensure_global_playbook(), _save_global_playbook
+    return _ensure_playbook(), _save_playbook
 
-    The playbook contains structured bullets organized by section, each with
-    helpful/harmful counters tracking how useful they've been. Bullets tagged
-    harmful may include structured failure lessons explaining WHY they failed
-    and WHAT to do instead. Review this after loading context to learn from
-    past successes and failures.
-    """
-    pb = _ensure_playbook()
-    # Use failure-aware serialization if any lessons exist
+
+def _serialize_playbook(pb: Playbook) -> str:
+    """Serialize a playbook, using failure-aware format if lessons exist."""
     has_lessons = any(b.has_failure_lessons for b in pb.bullets)
-    if has_lessons:
-        text = pb.serialize_with_failures()
+    return pb.serialize_with_failures() if has_lessons else pb.serialize()
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def ace_get_playbook() -> str:
+    """Get the current ACE playbook — both global and project-specific strategies.
+
+    Returns two tiers:
+    - GLOBAL: Universal heuristics that transfer across all projects (~/.ccr/)
+    - PROJECT: Project-specific strategies (.ccr/)
+
+    Review this after loading context to learn from past successes and failures.
+    """
+    gpb = _ensure_global_playbook()
+    ppb = _ensure_playbook()
+
+    parts = []
+    g_text = _serialize_playbook(gpb)
+    if g_text.strip():
+        parts.append(f"# GLOBAL PLAYBOOK (applies to all projects)\n{g_text}")
     else:
-        text = pb.serialize()
-    return text if text.strip() else "(Playbook is empty — no strategies recorded yet.)"
+        parts.append("# GLOBAL PLAYBOOK (applies to all projects)\n(empty)")
+
+    p_text = _serialize_playbook(ppb)
+    if p_text.strip():
+        parts.append(f"# PROJECT PLAYBOOK (this project only)\n{p_text}")
+    else:
+        parts.append("# PROJECT PLAYBOOK (this project only)\n(empty)")
+
+    return "\n\n".join(parts)
 
 
-@mcp.tool()
-def ace_apply_delta(operations: list[dict]) -> str:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def ace_apply_delta(operations: list[dict], scope: str = "project") -> str:
     """Apply delta operations to the playbook.
 
     Supported operations:
@@ -316,16 +403,18 @@ def ace_apply_delta(operations: list[dict]) -> str:
 
     Args:
         operations: List of delta operation dicts.
+        scope: "project" (default) or "global". Global bullets apply across all projects.
     """
-    pb = _ensure_playbook()
-    ops = parse_delta_operations({"operations": operations})
-    applied = pb.apply_delta(ops)
-    _save_playbook()
-    return f"Applied {applied} operation(s). Playbook now has {len(pb.bullets)} bullets."
+    with _state_lock:
+        pb, save_fn = _resolve_playbook(scope)
+        ops = parse_delta_operations({"operations": operations})
+        applied = pb.apply_delta(ops)
+        save_fn()
+        return f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
 
 
-@mcp.tool()
-def ace_update_counters(bullet_tags: list[dict]) -> str:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> str:
     """Update helpful/harmful counters for playbook bullets.
 
     After completing a task, reflect on which strategies helped or hurt,
@@ -345,45 +434,41 @@ def ace_update_counters(bullet_tags: list[dict]) -> str:
                 "counterfactual": "What should have been done instead",
                 "prevention_principle": "General rule to avoid this failure"
               }
-
-    Example:
-        [{"id": "str-00001", "tag": "harmful", "failure_lesson": {
-            "failure_point": "Strategy assumed all inputs are UTF-8",
-            "flawed_reasoning": "Did not consider binary file inputs",
-            "counterfactual": "Should check encoding before processing",
-            "prevention_principle": "Always validate input encoding at boundaries"
-        }}]
+        scope: "project" (default) or "global".
     """
-    pb = _ensure_playbook()
-    updated = pb.update_bullet_counts(bullet_tags)
-    _save_playbook()
+    with _state_lock:
+        pb, save_fn = _resolve_playbook(scope)
+        updated = pb.update_bullet_counts(bullet_tags)
+        save_fn()
 
     # Count how many had structured lessons
     lessons_added = sum(
         1 for t in bullet_tags
         if t.get("tag") == "harmful" and isinstance(t.get("failure_lesson"), dict) and t["failure_lesson"]
     )
-    parts = [f"Updated {updated} bullet(s)."]
+    parts = [f"Updated {updated} bullet(s) in {scope} playbook."]
     if lessons_added:
         parts.append(f"Recorded {lessons_added} structured failure lesson(s).")
     return " ".join(parts)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def ace_get_stats() -> str:
     """Get playbook statistics — bullet counts, section breakdown, health metrics.
 
-    Includes evolution trigger info (SkillRL §3.3): when enough harmful bullets
-    have accumulated failure lessons, evolution_needed will be True. Call
-    ace_evolve_from_failures to generate new skills from those failures.
+    Returns stats for both global and project playbooks. Includes evolution
+    trigger info (SkillRL §3.3) and temporal decay stats.
     """
-    pb = _ensure_playbook()
-    stats = pb.get_stats()
-    return json.dumps(asdict(stats), indent=2)
+    gpb = _ensure_global_playbook()
+    ppb = _ensure_playbook()
+    return json.dumps({
+        "global": asdict(gpb.get_stats()),
+        "project": asdict(ppb.get_stats()),
+    }, indent=2)
 
 
-@mcp.tool()
-def ace_find_similar(threshold: float = 0.6) -> str:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> str:
     """Find similar bullet pairs that may be candidates for merging.
 
     Uses Jaccard + trigram similarity. Returns pairs above the threshold
@@ -391,44 +476,89 @@ def ace_find_similar(threshold: float = 0.6) -> str:
 
     Args:
         threshold: Similarity threshold (0.0-1.0, default 0.6).
+        scope: "project" (default), "global", or "cross" (find duplicates between tiers).
     """
-    pb = _ensure_playbook()
+    if scope == "cross":
+        gpb = _ensure_global_playbook()
+        ppb = _ensure_playbook()
+        # Cross-tier: compare every global bullet against every project bullet
+        pairs = []
+        for gb in gpb.bullets:
+            words_a = set(gb.content.lower().split())
+            trigrams_a = Playbook._char_trigrams(gb.content.lower())
+            if len(words_a) < 2:
+                continue
+            for pb_bullet in ppb.bullets:
+                words_b = set(pb_bullet.content.lower().split())
+                trigrams_b = Playbook._char_trigrams(pb_bullet.content.lower())
+                if len(words_b) < 2:
+                    continue
+                word_inter = words_a & words_b
+                word_union = words_a | words_b
+                word_jaccard = len(word_inter) / len(word_union) if word_union else 0.0
+                tri_inter = trigrams_a & trigrams_b
+                tri_union = trigrams_a | trigrams_b
+                tri_jaccard = len(tri_inter) / len(tri_union) if tri_union else 0.0
+                combined = 0.4 * word_jaccard + 0.6 * tri_jaccard
+                if combined >= threshold:
+                    pairs.append((gb, pb_bullet, combined))
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        if not pairs:
+            return "No cross-tier similar bullet pairs found."
+        lines = ["Cross-tier similarities (global vs project):"]
+        for a, b, sim in pairs[:10]:
+            lines.append(f"[{a.id}] (global) vs [{b.id}] (project) (similarity={sim:.2f})")
+            lines.append(f"  G: {a.content[:100]}")
+            lines.append(f"  P: {b.content[:100]}")
+        return "\n".join(lines)
+
+    pb, _ = _resolve_playbook(scope)
     pairs = pb.find_similar_pairs(threshold)
     if not pairs:
-        return "No similar bullet pairs found."
+        return f"No similar bullet pairs found in {scope} playbook."
     lines = []
-    for a, b, score in pairs[:10]:
-        lines.append(f"[{a.id}] vs [{b.id}] (similarity={score:.2f})")
+    for a, b, sim in pairs[:10]:
+        lines.append(f"[{a.id}] vs [{b.id}] (similarity={sim:.2f})")
         lines.append(f"  A: {a.content[:100]}")
         lines.append(f"  B: {b.content[:100]}")
     return "\n".join(lines)
 
 
-@mcp.tool()
-def ace_prune() -> str:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+def ace_prune(scope: str = "project") -> str:
     """Prune problematic bullets and enforce token budget.
 
-    Removes bullets where harmful >= helpful and harmful >= 3.
-    Also trims lowest-scoring bullets if playbook exceeds 80K chars.
+    First evolves failure lessons into new skills (threshold=1, aggressive),
+    then removes bullets where harmful >= helpful and harmful >= 3,
+    then trims lowest-scoring bullets if playbook exceeds 80K chars.
+
+    This ordering ensures failure lessons are distilled into new heuristic
+    bullets before the harmful source bullets are removed.
+
+    Args:
+        scope: "project" (default) or "global".
     """
-    pb = _ensure_playbook()
-    pruned = pb.prune_problematic(min_harmful=3)
-    budget_pruned = pb.enforce_token_budget(max_chars=80000)
-    _save_playbook()
+    with _state_lock:
+        pb, save_fn = _resolve_playbook(scope)
+        # Evolve failure lessons BEFORE pruning to prevent permanent loss
+        evolved = pb.evolve_from_failures(threshold=1)
+        pruned = pb.prune_problematic(min_harmful=3)
+        budget_pruned = pb.enforce_token_budget(max_chars=80000)
+        save_fn()
     total = len(pruned) + len(budget_pruned)
-    return f"Pruned {total} bullet(s). Playbook now has {len(pb.bullets)} bullets."
+    parts = []
+    if evolved:
+        parts.append(f"Evolved {len(evolved)} new skill(s) from failure lessons.")
+    parts.append(f"Pruned {total} bullet(s) from {scope} playbook. Now has {len(pb.bullets)} bullets.")
+    return " ".join(parts)
 
 
-@mcp.tool()
-def ace_evolve_from_failures(threshold: int = 3) -> str:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+def ace_evolve_from_failures(threshold: int = 3, scope: str = "project") -> str:
     """Evolve new skills from accumulated failure lessons (SkillRL §3.3 / Prompt B.1).
 
     When harmful bullets accumulate enough structured failure lessons, this tool
     generates NEW standalone skill bullets from their prevention principles.
-
-    Per SkillRL Prompt B.1: "Generate 1-3 NEW actionable skills... each must have:
-    skill_id, title, principle, when_to_apply." Failed strategies produce NEW skills,
-    not mere annotations on existing ones.
 
     New skills are added to PROBLEM-SOLVING HEURISTICS with scope="general" and
     when_to_apply derived from the failure's task_context.
@@ -436,17 +566,19 @@ def ace_evolve_from_failures(threshold: int = 3) -> str:
     Args:
         threshold: Minimum number of harmful-with-lessons bullets needed to trigger
                    evolution (default 3). Lower for aggressive learning.
+        scope: "project" (default) or "global".
     """
-    pb = _ensure_playbook()
-    new_bullets = pb.evolve_from_failures(threshold)
-    if not new_bullets:
-        check = pb.check_evolution_needed(threshold)
-        return (
-            f"Evolution not triggered. Need {threshold} harmful bullets with failure "
-            f"lessons, currently have {check['candidate_count']}."
-        )
-    _save_playbook()
-    lines = [f"Evolved {len(new_bullets)} new skill(s) from failure lessons:"]
+    with _state_lock:
+        pb, save_fn = _resolve_playbook(scope)
+        new_bullets = pb.evolve_from_failures(threshold)
+        if not new_bullets:
+            check = pb.check_evolution_needed(threshold)
+            return (
+                f"Evolution not triggered in {scope} playbook. Need {threshold} harmful bullets with failure "
+                f"lessons, currently have {check['candidate_count']}."
+            )
+        save_fn()
+    lines = [f"Evolved {len(new_bullets)} new skill(s) from {scope} failure lessons:"]
     for b in new_bullets:
         lines.append(f"  [{b.id}] {b.content[:100]}")
         if b.when_to_apply:
@@ -459,7 +591,7 @@ def ace_evolve_from_failures(threshold: int = 3) -> str:
 # ===========================================================================
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def rlm_init(task_prompt: str) -> str:
     """Initialize a sandboxed Python REPL for structured problem-solving.
 
@@ -478,14 +610,20 @@ def rlm_init(task_prompt: str) -> str:
         task_prompt: The problem or question to solve.
     """
     global _repl
-    idx = _ensure_index()
+    with _state_lock:
+        idx = _ensure_index()
 
-    # Clean up previous REPL if any
-    if _repl is not None:
-        _repl.cleanup()
+        # Clean up previous REPL if any
+        if _repl is not None:
+            _repl.cleanup()
 
-    _repl = CCRRepl(repo_index=idx)
-    _repl.locals["task_prompt"] = task_prompt
+        # Kernel sandbox runs code in a subprocess, which means in-process tools
+        # (search_repo, get_file, etc.) are NOT available there. Use Python-level
+        # sandboxing (AST validation + restricted builtins) for the RLM REPL,
+        # which needs these tools. The kernel sandbox is available for standalone
+        # code execution via KernelSandbox directly.
+        _repl = CCRRepl(repo_index=idx, project_root=_project_root, use_kernel_sandbox=False)
+        _repl.locals["task_prompt"] = task_prompt
 
     # Load playbook as variable if available
     pb = _ensure_playbook()
@@ -505,7 +643,7 @@ def rlm_init(task_prompt: str) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def rlm_execute(code: str) -> str:
     """Execute Python code in the sandboxed REPL.
 
@@ -519,10 +657,12 @@ def rlm_execute(code: str) -> str:
     Args:
         code: Python code to execute.
     """
-    if _repl is None:
-        return "Error: REPL not initialized. Call rlm_init first."
+    with _state_lock:
+        if _repl is None:
+            return "Error: REPL not initialized. Call rlm_init first."
+        repl_ref = _repl
 
-    result = _repl.execute_code(code)
+    result = repl_ref.execute_code(code)
 
     parts = []
     if result.stdout.strip():
@@ -550,7 +690,7 @@ def rlm_execute(code: str) -> str:
     return "\n".join(parts)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def rlm_finalize(variable_name: str) -> str:
     """Finalize the REPL session and return a variable's value as the result.
 
@@ -560,18 +700,25 @@ def rlm_finalize(variable_name: str) -> str:
     Args:
         variable_name: Name of the variable to return.
     """
-    if _repl is None:
-        return "Error: REPL not initialized. Call rlm_init first."
+    global _repl
+    with _state_lock:
+        if _repl is None:
+            return "Error: REPL not initialized. Call rlm_init first."
+        repl_ref = _repl
 
-    # Execute FINAL_VAR
-    result = _repl.execute_code(f'FINAL_VAR("{variable_name}")')
+    # H1: Validate variable_name to prevent code injection
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', variable_name):
+        return f"Error: Invalid variable name '{variable_name}'. Must be a valid Python identifier."
 
-    answer = result.final_answer
-    _repl.cleanup()
+    # Call _final_var directly instead of constructing code string (H1)
+    answer = repl_ref._final_var(variable_name)
+    with _state_lock:
+        repl_ref.cleanup()
+        _repl = None  # M4: Reset _repl after cleanup
 
-    if answer is not None:
+    if answer is not None and not answer.startswith("Error:"):
         return answer
-    return f"Error: Variable '{variable_name}' not found. {result.error or ''}"
+    return f"Error: Variable '{variable_name}' not found."
 
 
 # ===========================================================================
@@ -579,7 +726,7 @@ def rlm_finalize(variable_name: str) -> str:
 # ===========================================================================
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 def index_build() -> str:
     """Build or rebuild the repo index.
 
@@ -588,20 +735,21 @@ def index_build() -> str:
     get_file in the RLM sandbox.
     """
     global _repo_index
-    _repo_index = RepoIndex.build(_project_root)
+    with _state_lock:  # H2: protect global state mutation
+        _repo_index = RepoIndex.build(_project_root)
 
-    # Cache
-    mem = _ensure_memory()
-    try:
-        mem.save_index(_repo_index.to_json())
-        mem.update_metadata_file_tree([f for f in _repo_index.files.keys()])
-    except Exception:
-        pass
+        # Cache
+        mem = _ensure_memory()
+        try:
+            mem.save_index(_repo_index.to_json())
+            mem.update_metadata_file_tree([f for f in _repo_index.files.keys()])
+        except Exception:
+            pass
 
     return _repo_index.get_summary()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def index_search(query: str, top_k: int = 10) -> str:
     """Search the repo index for files matching a query.
 
@@ -612,6 +760,7 @@ def index_search(query: str, top_k: int = 10) -> str:
         query: Search term (file name, symbol, or content keyword).
         top_k: Maximum results to return (default 10).
     """
+    top_k = max(1, min(top_k, 100))  # M3: bound top_k to prevent excessive results
     idx = _ensure_index()
     results = idx.search(query)[:top_k]
     if not results:

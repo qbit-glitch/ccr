@@ -139,12 +139,31 @@ class Bullet:
     section: str = ""
     scope: str = "general"  # "general" or "task_specific" (SkillRL §3.2 hierarchical SkillBank)
     when_to_apply: str = ""  # Applicability condition (SkillRL Table 5: "When to Apply")
+    last_updated: str = ""  # ISO-8601 timestamp of last counter update (for temporal decay)
     failure_lessons: list[FailureLesson] = field(default_factory=list)
 
     @property
     def score(self) -> int:
         """Net score: helpful - harmful."""
         return self.helpful - self.harmful
+
+    def effective_score(self, decay_rate: float = 0.95) -> float:
+        """Net score with temporal decay: (helpful - harmful) * decay_rate^days_since_update.
+
+        Inspired by ACT-R memory decay / SYNAPSE spreading activation.
+        A bullet unused for 30 days retains ~21%, 90 days ~1%.
+        """
+        if not self.last_updated:
+            return float(self.score)  # No timestamp = no decay
+        try:
+            updated = datetime.fromisoformat(self.last_updated)
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            days = (now - updated).total_seconds() / 86400
+            return self.score * (decay_rate ** days)
+        except (ValueError, TypeError):
+            return float(self.score)
 
     @property
     def is_problematic(self) -> bool:
@@ -206,6 +225,8 @@ class PlaybookStats:
     # Evolution trigger stats (SkillRL §3.3)
     evolution_needed: bool = False  # True when accumulated failures exceed threshold
     evolution_candidates: int = 0  # Number of bullets eligible for evolution
+    # Temporal decay stats
+    decayed_bullets: int = 0  # Bullets whose effective_score < 50% of raw score
 
 
 class Playbook:
@@ -353,6 +374,7 @@ class Playbook:
             if bid:
                 tag_map[bid] = {"tag": tag_val, "failure_lesson": tag.get("failure_lesson")}
 
+        now_iso = datetime.now(timezone.utc).isoformat()
         updated = 0
         for bullet in self._bullets:
             if bullet.id in tag_map:
@@ -360,9 +382,11 @@ class Playbook:
                 tag = entry["tag"]
                 if tag == "helpful":
                     bullet.helpful += 1
+                    bullet.last_updated = now_iso
                     updated += 1
                 elif tag == "harmful":
                     bullet.harmful += 1
+                    bullet.last_updated = now_iso
                     updated += 1
                     # Attach structured failure lesson if provided
                     lesson_data = entry.get("failure_lesson")
@@ -429,6 +453,7 @@ class Playbook:
             harmful=0,
             content=op.content,
             section=section,
+            last_updated=datetime.now(timezone.utc).isoformat(),
         )
         self._bullets.append(bullet)
         return 1
@@ -544,7 +569,10 @@ class Playbook:
         return removed
 
     def enforce_token_budget(self, max_chars: int) -> list[Bullet]:
-        """Remove lowest-scoring bullets until under budget.
+        """Remove lowest-scoring bullets until under budget (M7: O(n log n) not O(n^2)).
+
+        Pre-sorts bullets by score once, then removes cheapest until under budget,
+        estimating size reduction from format_line() length instead of re-serializing.
 
         Args:
             max_chars: Maximum character count for the serialized playbook.
@@ -553,11 +581,20 @@ class Playbook:
             List of removed bullets.
         """
         removed = []
-        while len(self.serialize()) > max_chars and self._bullets:
-            # Find lowest-scoring bullet
-            worst = min(self._bullets, key=lambda b: (b.score, -b.harmful))
-            self._bullets.remove(worst)
-            removed.append(worst)
+        current_size = len(self.serialize())
+        if current_size <= max_chars:
+            return removed
+        # Sort ascending by score (worst first)
+        ranked = sorted(self._bullets, key=lambda b: (b.effective_score(), -b.harmful))
+        keep = set(id(b) for b in self._bullets)
+        for bullet in ranked:
+            if current_size <= max_chars:
+                break
+            keep.discard(id(bullet))
+            removed.append(bullet)
+            # Estimate size reduction: format_line + newline + section header overhead
+            current_size -= len(bullet.format_line()) + 1
+        self._bullets = [b for b in self._bullets if id(b) in keep]
         return removed
 
     def get_stats(self) -> PlaybookStats:
@@ -590,6 +627,14 @@ class Playbook:
                     stats.harmful_with_lessons += 1
                 else:
                     stats.harmful_without_lessons += 1
+
+        # Temporal decay stats
+        for bullet in self._bullets:
+            raw = float(bullet.score)
+            if raw != 0 and bullet.last_updated:
+                eff = bullet.effective_score()
+                if abs(eff) < abs(raw) * 0.5:
+                    stats.decayed_bullets += 1
 
         # Evolution trigger check (SkillRL §3.3)
         evo = self.check_evolution_needed()
@@ -753,11 +798,13 @@ class Playbook:
                 # No extended fields in old format
             elif isinstance(entry, dict):
                 lessons_raw = entry.get("lessons", [])
-                # N1: Restore scope and when_to_apply
+                # N1: Restore scope, when_to_apply, and last_updated
                 if "scope" in entry:
                     bullet.scope = entry["scope"]
                 if "when_to_apply" in entry:
                     bullet.when_to_apply = entry["when_to_apply"]
+                if "last_updated" in entry:
+                    bullet.last_updated = entry["last_updated"]
             else:
                 continue
             if isinstance(lessons_raw, list):
@@ -787,6 +834,7 @@ class Playbook:
                 bullet.failure_lessons
                 or bullet.scope != "general"
                 or bullet.when_to_apply
+                or bullet.last_updated
             )
             if has_extended:
                 entry: dict[str, Any] = {}
@@ -797,12 +845,27 @@ class Playbook:
                     entry["scope"] = bullet.scope
                 if bullet.when_to_apply:
                     entry["when_to_apply"] = bullet.when_to_apply
+                if bullet.last_updated:
+                    entry["last_updated"] = bullet.last_updated
                 if entry:
                     data[bullet.id] = entry
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        dir_name = os.path.dirname(path)
+        os.makedirs(dir_name, exist_ok=True)
+        # H5: Atomic write via tmp + fsync + os.replace
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return total
 
     def get_failure_lessons_for_bullet(self, bullet_id: str) -> list[FailureLesson]:

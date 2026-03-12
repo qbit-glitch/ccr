@@ -90,6 +90,8 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 - **MCP server**: 18 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
 - **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.60·Novelty + 0.40·TypePrior. Algorithm 1 with S(m) vs S(m_conflict) comparison, recency-modulated FindConflict (sim threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
+- **Two-tier playbook**: Global (`~/.ccr/global_playbook.txt`) + project (`.ccr/playbook.txt`). All ACE tools accept `scope="global"|"project"`. Cross-tier similarity detection via `ace_find_similar(scope="cross")`.
+- **Temporal decay**: Bullet counters decay via `effective_score = raw * 0.95^days`. Unused 30d → 21%, 90d → 1%. `last_updated` persisted in companion JSON. Budget pruning uses effective scores.
 - **Playbook evolution**: ACE playbook with helpful/harmful counters. Claude Code reflects and curates — no sub-model needed.
 - **Structured Failure Lessons** (SkillRL-inspired): When tagging harmful, include a failure_lesson dict explaining why. Lessons accumulate, then `ace_evolve_from_failures` generates NEW skill bullets from prevention principles. Companion data in `.ccr/failure_lessons.json`.
 - **Sandboxed REPL**: RLM-inspired REPL with repo tools (search_repo, get_file, FINAL_VAR). Claude Code drives the iteration loop.
@@ -100,7 +102,7 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ```bash
 source .venv/bin/activate
-pytest tests/unit/ tests/integration/ -x -q  # Run all tests (728 pass, 5 skip)
+pytest tests/unit/ tests/integration/ -x -q  # Run all tests (815 pass)
 python -m ccr.mcp_server                     # Start MCP server (stdio)
 ccr init                                     # Init .ccr/ in current dir
 ccr index                                    # Build repo index

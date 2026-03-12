@@ -1328,3 +1328,124 @@ class TestEvolveIdempotency:
         new_bullets = pb.evolve_from_failures(threshold=3)
         assert len(new_bullets) == 1
         assert new_bullets[0].content == "Brand new rule"
+
+
+# ==========================================================================
+# Temporal Decay (ACT-R / SYNAPSE inspired)
+# ==========================================================================
+
+
+class TestTemporalDecay:
+    def test_effective_score_no_timestamp(self):
+        """Without last_updated, returns raw score (no decay)."""
+        b = Bullet(id="str-00001", helpful=5, harmful=1, content="test")
+        assert b.effective_score() == 4.0
+
+    def test_effective_score_fresh(self):
+        """Recently updated bullet retains near-full score."""
+        from datetime import datetime, timezone
+        b = Bullet(id="str-00001", helpful=5, harmful=1, content="test",
+                   last_updated=datetime.now(timezone.utc).isoformat())
+        eff = b.effective_score()
+        assert 3.9 <= eff <= 4.0  # within minutes, essentially no decay
+
+    def test_effective_score_30_days(self):
+        """After 30 days, ~21% retained."""
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        b = Bullet(id="str-00001", helpful=10, harmful=0, content="test",
+                   last_updated=past)
+        eff = b.effective_score()
+        expected = 10 * (0.95 ** 30)  # ~2.14
+        assert abs(eff - expected) < 0.5
+
+    def test_effective_score_90_days(self):
+        """After 90 days, ~1% retained."""
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        b = Bullet(id="str-00001", helpful=10, harmful=0, content="test",
+                   last_updated=past)
+        eff = b.effective_score()
+        expected = 10 * (0.95 ** 90)  # ~0.10
+        assert eff < 1.0
+
+    def test_effective_score_negative(self):
+        """Decay works with negative scores too."""
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        b = Bullet(id="str-00001", helpful=1, harmful=5, content="bad",
+                   last_updated=past)
+        eff = b.effective_score()
+        assert eff < 0  # still negative
+        assert abs(eff) < abs(b.score)  # but closer to zero
+
+    def test_update_counters_sets_timestamp(self):
+        """Calling update_bullet_counts sets last_updated."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        b = pb.get_bullet("str-00001")
+        assert b.last_updated == ""
+        pb.update_bullet_counts([{"id": "str-00001", "tag": "helpful"}])
+        assert b.last_updated != ""
+        from datetime import datetime
+        # Should be a valid ISO timestamp
+        datetime.fromisoformat(b.last_updated)
+
+    def test_add_sets_timestamp(self):
+        """_apply_add sets last_updated on new bullets."""
+        pb = Playbook()
+        pb.apply_delta([DeltaOperation(
+            op_type="ADD", section="STRATEGIES & INSIGHTS",
+            content="New insight"
+        )])
+        b = pb.bullets[0]
+        assert b.last_updated != ""
+
+    def test_enforce_budget_uses_effective_score(self):
+        """Decayed bullets are pruned before fresh ones."""
+        from datetime import datetime, timezone, timedelta
+        text = "## STRATEGIES & INSIGHTS\n"
+        text += "[str-00001] helpful=5 harmful=0 :: Old strategy\n"
+        text += "[str-00002] helpful=2 harmful=0 :: Fresh strategy\n"
+        pb = Playbook(text)
+        # str-00001 has higher raw score but is old
+        old = pb.get_bullet("str-00001")
+        old.last_updated = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        fresh = pb.get_bullet("str-00002")
+        fresh.last_updated = datetime.now(timezone.utc).isoformat()
+        # Force very tight budget to trigger pruning
+        removed = pb.enforce_token_budget(max_chars=50)
+        # Old bullet should be pruned first despite higher raw score
+        removed_ids = [b.id for b in removed]
+        assert "str-00001" in removed_ids
+
+    def test_last_updated_persisted(self):
+        """Save/load round-trip preserves last_updated."""
+        from datetime import datetime, timezone
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        b = pb.get_bullet("str-00001")
+        ts = datetime.now(timezone.utc).isoformat()
+        b.last_updated = ts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "failure_lessons.json")
+            pb.save_failure_lessons(path)
+
+            pb2 = Playbook(SAMPLE_PLAYBOOK)
+            pb2.load_failure_lessons(path)
+            b2 = pb2.get_bullet("str-00001")
+            assert b2.last_updated == ts
+
+    def test_effective_score_invalid_timestamp(self):
+        """Malformed timestamp returns raw score."""
+        b = Bullet(id="str-00001", helpful=5, harmful=1, content="test",
+                   last_updated="not-a-date")
+        assert b.effective_score() == 4.0
+
+    def test_decayed_bullets_stat(self):
+        """get_stats reports decayed_bullets count."""
+        from datetime import datetime, timezone, timedelta
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        b = pb.get_bullet("str-00001")  # helpful=5, harmful=0
+        b.last_updated = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        stats = pb.get_stats()
+        assert stats.decayed_bullets >= 1

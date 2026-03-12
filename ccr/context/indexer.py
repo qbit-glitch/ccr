@@ -105,16 +105,21 @@ class RepoIndex:
         ignore_patterns: list[str] | None = None,
         max_file_size_kb: int = 500,
         extensions: set[str] | None = None,
+        max_files: int = 50000,
     ) -> RepoIndex:
         """Build index from filesystem. No LLM calls."""
         index = cls(root)
         ignores = (ignore_patterns or []) + DEFAULT_IGNORES
         ignores += cls._load_gitignore(root)
         max_bytes = max_file_size_kb * 1024
+        file_count = 0
 
         for entry in cls._walk(root, ignores):
             if not entry.is_file():
                 continue
+            # M2: Bound total indexed files to prevent unbounded memory use
+            if file_count >= max_files:
+                break
 
             rel = os.path.relpath(entry.path, root)
             ext = os.path.splitext(entry.name)[1].lower()
@@ -142,6 +147,7 @@ class RepoIndex:
                     line_count=0,
                     _content="",
                 )
+                file_count += 1
                 continue
 
             language = LANGUAGE_MAP.get(ext, ext.lstrip(".") or "unknown")
@@ -166,6 +172,7 @@ class RepoIndex:
                 line_count=lines,
                 _content=content,
             )
+            file_count += 1
 
         index._built_at = time.time()
         index._mtime_sig = index._compute_mtime_sig()

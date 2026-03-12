@@ -29,11 +29,22 @@ from ccr.mcp_server import (
     rlm_init,
 )
 import ccr.mcp_server as mcp_mod
+from ccr.mcp_server import mcp as mcp_instance
 
 
 @pytest.fixture(autouse=True)
-def setup_project(tmp_path):
+def setup_project(tmp_path, monkeypatch):
     """Initialize CCR in a temp directory for each test."""
+    # Redirect ~/.ccr/ to temp dir so tests don't touch real global playbook
+    fake_home_ccr = tmp_path / "global_ccr"
+    fake_home_ccr.mkdir()
+    original_expanduser = os.path.expanduser
+    def mock_expanduser(path):
+        if path.startswith("~/.ccr"):
+            return str(fake_home_ccr) + path[5:]  # Replace ~/.ccr with fake
+        return original_expanduser(path)
+    monkeypatch.setattr(os.path, "expanduser", mock_expanduser)
+
     # Create a sample file for indexing
     src = tmp_path / "hello.py"
     src.write_text("def greet(name):\n    return f'Hello, {name}!'\n\nclass Greeter:\n    pass\n")
@@ -46,6 +57,7 @@ def setup_project(tmp_path):
     # Cleanup globals
     mcp_mod._memory = None
     mcp_mod._playbook = None
+    mcp_mod._global_playbook = None
     mcp_mod._repo_index = None
     mcp_mod._repl = None
 
@@ -347,15 +359,15 @@ class TestACEUpdateCountersWithFailureLessons:
         }])
 
         stats = json.loads(ace_get_stats())
-        assert stats["total_failure_lessons"] == 1
-        assert stats["harmful_with_lessons"] == 1
+        assert stats["project"]["total_failure_lessons"] == 1
+        assert stats["project"]["harmful_with_lessons"] == 1
 
 
 class TestACEGetStats:
     def test_stats_empty(self):
         result = ace_get_stats()
         stats = json.loads(result)
-        assert stats["total_bullets"] == 0
+        assert stats["project"]["total_bullets"] == 0
 
     def test_stats_with_bullets(self):
         ace_apply_delta([
@@ -364,7 +376,7 @@ class TestACEGetStats:
         ])
         result = ace_get_stats()
         stats = json.loads(result)
-        assert stats["total_bullets"] == 2
+        assert stats["project"]["total_bullets"] == 2
 
 
 class TestACEFindSimilar:
@@ -409,6 +421,75 @@ class TestACEPrune:
 
         result = ace_prune()
         assert "Pruned 1" in result
+
+
+class TestPrunePreservesLessons:
+    """Tests that ace_prune evolves failure lessons before removing bullets."""
+
+    def _add_harmful_bullets_with_lessons(self, n=3):
+        """Helper: add n harmful bullets each with a failure lesson."""
+        import re
+        for i in range(n):
+            ace_apply_delta([{
+                "type": "ADD",
+                "section": "STRATEGIES & INSIGHTS",
+                "content": f"Strategy that fails {i}",
+            }])
+        pb_text = ace_get_playbook()
+        ids = re.findall(r"\[(str-\d+)\]", pb_text)
+        for i, bid in enumerate(ids[:n]):
+            # Mark harmful enough times to trigger pruning (>=3)
+            for _ in range(3):
+                ace_update_counters([{"id": bid, "tag": "harmful"}])
+            # Add failure lesson on last harmful call is already done above;
+            # we need to add the lesson separately
+            ace_update_counters([{
+                "id": bid,
+                "tag": "harmful",
+                "failure_lesson": {
+                    "failure_point": f"Failure {i}",
+                    "flawed_reasoning": f"Flaw {i}",
+                    "counterfactual": f"Fix {i}",
+                    "prevention_principle": f"Prevention rule {i}",
+                    "task_context": f"Task context {i}",
+                },
+            }])
+        return ids[:n]
+
+    def test_prune_evolves_before_removing(self):
+        """Pruning harmful bullets with lessons first evolves them into new skills."""
+        self._add_harmful_bullets_with_lessons(3)
+        # Prune — should auto-evolve first
+        result = ace_prune()
+        # Harmful source bullets should be removed
+        pb = ace_get_playbook()
+        assert "Strategy that fails" not in pb
+        # But prevention principles should survive as new heuristic bullets
+        assert "Prevention rule 0" in pb
+        assert "Prevention rule 1" in pb
+        assert "Prevention rule 2" in pb
+
+    def test_prune_message_includes_evolved_count(self):
+        """Return message mentions how many skills were evolved."""
+        self._add_harmful_bullets_with_lessons(3)
+        result = ace_prune()
+        assert "Evolved 3 new skill" in result
+        assert "Pruned" in result
+
+    def test_prune_with_no_lessons_works_normally(self):
+        """Pruning bullets without failure lessons still works fine."""
+        import re
+        ace_apply_delta([
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Bad no-lesson strategy"}
+        ])
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        bid = match.group(1)
+        for _ in range(3):
+            ace_update_counters([{"id": bid, "tag": "harmful"}])
+        result = ace_prune()
+        assert "Pruned 1" in result
+        assert "Evolved" not in result
+        assert "Bad no-lesson strategy" not in ace_get_playbook()
 
 
 class TestACEEvolveFromFailures:
@@ -464,8 +545,8 @@ class TestACEEvolveFromFailures:
     def test_stats_show_evolution_needed(self):
         self._add_harmful_bullets_with_lessons(3)
         stats = json.loads(ace_get_stats())
-        assert stats["evolution_needed"] is True
-        assert stats["evolution_candidates"] == 3
+        assert stats["project"]["evolution_needed"] is True
+        assert stats["project"]["evolution_candidates"] == 3
 
 
 # ===========================================================================
@@ -651,3 +732,246 @@ class TestWorkflows:
         data = json.loads(result)
         assert "hello.py" in data["file"]
         assert "greet" in data["functions"]
+
+
+# ===========================================================================
+# Two-Tier Playbook (Global + Project)
+# ===========================================================================
+
+
+class TestTwoTierPlaybook:
+    def test_apply_delta_global_scope(self):
+        """Operations with scope='global' go to global playbook."""
+        result = ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Global strategy"}],
+            scope="global",
+        )
+        assert "global" in result
+        gpb = mcp_mod._global_playbook
+        assert len(gpb.bullets) == 1
+        assert gpb.bullets[0].content == "Global strategy"
+
+    def test_apply_delta_project_scope_default(self):
+        """Default scope is 'project'."""
+        ace_apply_delta([{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Project strategy"}])
+        ppb = mcp_mod._playbook
+        assert any(b.content == "Project strategy" for b in ppb.bullets)
+        # Global should be empty
+        gpb = mcp_mod._global_playbook
+        assert not any(b.content == "Project strategy" for b in gpb.bullets)
+
+    def test_get_playbook_shows_both(self):
+        """ace_get_playbook returns both global and project sections."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "G1"}],
+            scope="global",
+        )
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "P1"}],
+            scope="project",
+        )
+        result = ace_get_playbook()
+        assert "GLOBAL PLAYBOOK" in result
+        assert "PROJECT PLAYBOOK" in result
+        assert "G1" in result
+        assert "P1" in result
+
+    def test_get_playbook_both_sections_present(self):
+        """Both global and project sections are always present."""
+        result = ace_get_playbook()
+        assert "GLOBAL PLAYBOOK" in result
+        assert "PROJECT PLAYBOOK" in result
+
+    def test_update_counters_global(self):
+        """Update counters in global playbook."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Global insight"}],
+            scope="global",
+        )
+        gpb = mcp_mod._global_playbook
+        bid = gpb.bullets[0].id
+        ace_update_counters([{"id": bid, "tag": "helpful"}], scope="global")
+        assert gpb.bullets[0].helpful == 1
+
+    def test_stats_both_tiers(self):
+        """ace_get_stats returns stats for both global and project."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "G"}],
+            scope="global",
+        )
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "P"}],
+        )
+        stats = json.loads(ace_get_stats())
+        assert "global" in stats
+        assert "project" in stats
+        assert stats["global"]["total_bullets"] == 1
+        assert stats["project"]["total_bullets"] == 1
+
+    def test_find_similar_with_scope(self):
+        """ace_find_similar respects scope."""
+        ace_apply_delta([
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Alpha beta gamma delta epsilon"},
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Alpha beta gamma delta zeta"},
+        ], scope="global")
+        result = ace_find_similar(threshold=0.5, scope="global")
+        assert "similarity" in result
+
+    def test_find_similar_cross_scope(self):
+        """Cross-tier similarity detection."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Always validate user input before processing"}],
+            scope="global",
+        )
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Always validate user input before processing"}],
+            scope="project",
+        )
+        result = ace_find_similar(threshold=0.5, scope="cross")
+        assert "global" in result.lower() and "project" in result.lower()
+
+    def test_prune_with_scope(self):
+        """ace_prune respects scope."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Bad global"}],
+            scope="global",
+        )
+        gpb = mcp_mod._global_playbook
+        bid = gpb.bullets[0].id
+        for _ in range(4):
+            ace_update_counters([{"id": bid, "tag": "harmful"}], scope="global")
+        result = ace_prune(scope="global")
+        assert "1" in result  # pruned 1
+        assert len(gpb.bullets) == 0
+
+    def test_global_playbook_persistence(self, tmp_path):
+        """Global playbook persists to disk."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Persistent global"}],
+            scope="global",
+        )
+        # Check file exists
+        assert os.path.isfile(mcp_mod._global_playbook_path)
+        with open(mcp_mod._global_playbook_path) as f:
+            text = f.read()
+        assert "Persistent global" in text
+
+    def test_tiers_are_independent(self):
+        """Adding to one tier doesn't affect the other."""
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Only global"}],
+            scope="global",
+        )
+        ace_apply_delta(
+            [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Only project"}],
+        )
+        gpb = mcp_mod._global_playbook
+        ppb = mcp_mod._playbook
+        g_contents = {b.content for b in gpb.bullets}
+        p_contents = {b.content for b in ppb.bullets}
+        assert "Only global" in g_contents
+        assert "Only global" not in p_contents
+        assert "Only project" in p_contents
+        assert "Only project" not in g_contents
+
+
+# ===========================================================================
+# Tool Annotations (MCP spec 2025-11-25)
+# ===========================================================================
+
+
+def _get_tool_annotations(tool_name: str):
+    """Helper to retrieve annotations for a registered MCP tool."""
+    tool = mcp_instance._tool_manager._tools[tool_name]
+    return tool.annotations
+
+
+class TestToolAnnotations:
+    """Verify readOnlyHint, destructiveHint, idempotentHint on all 18 tools."""
+
+    # -- Read-only tools --
+
+    @pytest.mark.parametrize("tool_name", [
+        "gcc_context", "gcc_status",
+        "ace_get_playbook", "ace_get_stats", "ace_find_similar",
+        "index_search",
+    ])
+    def test_read_only_tools(self, tool_name):
+        ann = _get_tool_annotations(tool_name)
+        assert ann.readOnlyHint is True, f"{tool_name} should be readOnlyHint=True"
+        assert ann.destructiveHint is False, f"{tool_name} should be destructiveHint=False"
+        assert ann.idempotentHint is True, f"{tool_name} should be idempotentHint=True"
+
+    # -- gcc_log_ota: writes to OTA log, not idempotent (each call appends) --
+
+    def test_gcc_log_ota_annotations(self):
+        ann = _get_tool_annotations("gcc_log_ota")
+        assert ann.readOnlyHint is False, "gcc_log_ota writes to OTA log"
+        assert ann.destructiveHint is False, "gcc_log_ota appends, doesn't destroy"
+        assert ann.idempotentHint is False, "gcc_log_ota creates new entry each call"
+
+    # -- Destructive tools --
+
+    @pytest.mark.parametrize("tool_name", [
+        "gcc_merge", "ace_prune",
+    ])
+    def test_destructive_tools(self, tool_name):
+        ann = _get_tool_annotations(tool_name)
+        assert ann.destructiveHint is True, f"{tool_name} should be destructiveHint=True"
+        assert ann.readOnlyHint is False, f"{tool_name} should be readOnlyHint=False"
+
+    # -- gcc_branch: creates branches, not destructive --
+
+    def test_gcc_branch_annotations(self):
+        ann = _get_tool_annotations("gcc_branch")
+        assert ann.readOnlyHint is False, "gcc_branch creates state"
+        assert ann.destructiveHint is False, "gcc_branch only creates, doesn't destroy"
+        assert ann.idempotentHint is False, "gcc_branch fails if branch exists"
+
+    # -- Mutating non-destructive tools --
+
+    @pytest.mark.parametrize("tool_name", [
+        "gcc_commit", "ace_apply_delta", "ace_update_counters",
+        "rlm_init", "rlm_execute", "rlm_finalize",
+    ])
+    def test_mutating_non_destructive_tools(self, tool_name):
+        ann = _get_tool_annotations(tool_name)
+        assert ann.readOnlyHint is False, f"{tool_name} should be readOnlyHint=False"
+        assert ann.destructiveHint is False, f"{tool_name} should be destructiveHint=False"
+        assert ann.idempotentHint is False, f"{tool_name} should be idempotentHint=False"
+
+    # -- ace_evolve_from_failures: idempotent due to evolved flag --
+
+    def test_ace_evolve_from_failures_annotations(self):
+        ann = _get_tool_annotations("ace_evolve_from_failures")
+        assert ann.readOnlyHint is False, "ace_evolve_from_failures may create bullets"
+        assert ann.destructiveHint is False, "ace_evolve_from_failures adds, doesn't destroy"
+        assert ann.idempotentHint is True, "ace_evolve_from_failures is idempotent (evolved flag)"
+
+    # -- Idempotent tools --
+
+    @pytest.mark.parametrize("tool_name", [
+        "gcc_context", "gcc_status",
+        "ace_get_playbook", "ace_get_stats", "ace_find_similar",
+        "index_search", "index_build",
+        "ace_evolve_from_failures",
+    ])
+    def test_idempotent_tools(self, tool_name):
+        ann = _get_tool_annotations(tool_name)
+        assert ann.idempotentHint is True, f"{tool_name} should be idempotentHint=True"
+
+    # -- index_build: idempotent but not read-only --
+
+    def test_index_build_annotations(self):
+        ann = _get_tool_annotations("index_build")
+        assert ann.readOnlyHint is False
+        assert ann.destructiveHint is False
+        assert ann.idempotentHint is True
+
+    # -- All 18 tools have annotations --
+
+    def test_all_tools_have_annotations(self):
+        all_tools = mcp_instance._tool_manager._tools
+        assert len(all_tools) == 18, f"Expected 18 tools, got {len(all_tools)}"
+        for name, tool in all_tools.items():
+            assert tool.annotations is not None, f"{name} missing annotations"

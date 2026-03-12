@@ -15,13 +15,16 @@ GCC paper features:
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
 import re
 import subprocess
+import tempfile
 import threading
 from collections import defaultdict
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import yaml
@@ -145,7 +148,7 @@ class MemoryManager:
 
         os.makedirs(main_branch_dir, exist_ok=True)
 
-        now = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         self._write_if_missing(
             os.path.join(self.ccr_root, "main.md"),
@@ -209,8 +212,8 @@ class MemoryManager:
                 raise ValueError(f"Branch already exists: {name}")
 
         os.makedirs(branch_dir, exist_ok=True)
-        now = datetime.now().strftime("%Y-%m-%d")
-        now_full = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_full = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
         # Write commits.md with header
         self._write_file(
@@ -284,12 +287,14 @@ class MemoryManager:
                 Set to 0.0 to disable rejection (default).
         """
         branch = self.get_active_branch()
+        admission_score_value = None  # Will be set if admission control runs
 
         # --- Admission Control (A-MAC Algorithm 1) ---
         if admission_threshold < 1.0 or rejection_threshold > 0.0:
             score = self.compute_admission_score(
                 branch, title, what, why, files_changed, next_step,
             )
+            admission_score_value = score["score"]
 
             # Step 3: Rejection — low admission score = low value (Alg. 1 line 11)
             # Correct polarity (G9): reject when score is LOW (not valuable enough)
@@ -335,15 +340,24 @@ class MemoryManager:
 
         # --- Normal commit path ---
         commit_id = self._get_next_commit_id(branch)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         files_str = ", ".join(files_changed) if files_changed else "(none)"
+
+        # Compute admission score for storage if not already computed.
+        # This allows future S(m_conflict) comparisons to use the real score.
+        if admission_score_value is None:
+            score = self.compute_admission_score(
+                branch, title, what, why, files_changed, next_step,
+            )
+            admission_score_value = score["score"]
 
         entry = (
             f"## [{commit_id}] {now} | branch:{branch} | {title}\n"
             f"**What**: {what}\n"
             f"**Why**: {why}\n"
             f"**Files**: {files_str}\n"
-            f"**Next**: {next_step}\n\n---\n\n"
+            f"**Next**: {next_step}\n"
+            f"**Score**: {admission_score_value:.2f}\n\n---\n\n"
         )
 
         # Reference OTA log slice in commit (per GCC paper)
@@ -385,15 +399,15 @@ class MemoryManager:
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return []
-        parts = re.split(r"(?=## \[C\d{3}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3}\]", p.strip())]
+        parts = re.split(r"(?=## \[C\d{3,}\])", content)
+        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
 
         results = []
         for part in commit_parts[:k]:
             data: dict[str, Any] = {}
             # Parse header: ## [C021] 2026-03-10 22:25 | branch:main | Title
             header_match = re.match(
-                r"## \[(C\d{3})\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|[^|]*\|\s*(.*)",
+                r"## \[(C\d{3,})\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|[^|]*\|\s*(.*)",
                 part.strip(),
             )
             if header_match:
@@ -408,10 +422,20 @@ class MemoryManager:
             why_match = re.search(r"\*\*Why\*\*:\s*(.*)", part)
             files_match = re.search(r"\*\*Files\*\*:\s*(.*)", part)
             next_match = re.search(r"\*\*Next\*\*:\s*(.*)", part)
+            score_match = re.search(r"\*\*Score\*\*:\s*([\d.]+)", part)
 
             data["what"] = what_match.group(1).strip() if what_match else ""
             data["why"] = why_match.group(1).strip() if why_match else ""
             data["next"] = next_match.group(1).strip() if next_match else ""
+
+            # Stored admission score (None if not present — backward compat)
+            if score_match:
+                try:
+                    data["stored_score"] = float(score_match.group(1))
+                except (ValueError, TypeError):
+                    data["stored_score"] = None
+            else:
+                data["stored_score"] = None
 
             files_str = files_match.group(1).strip() if files_match else ""
             if files_str and files_str != "(none)":
@@ -626,20 +650,20 @@ class MemoryManager:
                 best_conflict_id = commit.get("id")
                 best_conflict_recency = conflict_recency
 
-                # --- G1-NEW: Compute S(m_conflict) per Alg. 1 line 6 ---
-                # The existing commit's score mirrors S(m) = w_N * N + w_T * T.
-                # N(m'): We can't retroactively compute novelty, so we assume
-                # the commit WAS novel when stored (N≈0.7, a reasonable prior
-                # for commits that passed admission). Recency decays this:
-                # old commits lose assumed novelty over time.
-                # T(m'): Classify the existing commit's type for its type prior.
-                conflict_type = self._classify_commit_type(
-                    commit.get("title", ""), commit.get("what", ""), commit.get("files", []),
-                )
-                conflict_tp = self._type_prior(conflict_type)
-                # S(m_conflict) = w_N * (assumed_novelty * recency) + w_T * T(m')
-                assumed_novelty = 0.7 * conflict_recency  # decays with age
-                best_conflict_score = 0.60 * assumed_novelty + 0.40 * conflict_tp
+                # --- Compute S(m_conflict) per Alg. 1 line 6 ---
+                # Use stored admission score if available (computed at commit time).
+                # Fall back to heuristic for old commits without stored scores.
+                stored = commit.get("stored_score")
+                if stored is not None:
+                    best_conflict_score = stored
+                else:
+                    # Backward compat: fabricate score for old commits
+                    conflict_type = self._classify_commit_type(
+                        commit.get("title", ""), commit.get("what", ""), commit.get("files", []),
+                    )
+                    conflict_tp = self._type_prior(conflict_type)
+                    assumed_novelty = 0.7 * conflict_recency
+                    best_conflict_score = 0.60 * assumed_novelty + 0.40 * conflict_tp
 
         # Novelty N(m) = 1 - max_similarity (Eq. 3)
         novelty = 1.0 - best_similarity
@@ -676,12 +700,18 @@ class MemoryManager:
         """Parse commit timestamp and return hours elapsed.
 
         Per A-MAC Eq. 4: τ(m) is measured in hours (λ=0.01/hour).
+        Handles both timezone-aware and timezone-naive timestamps
+        for backward compatibility with existing commits.
         """
         if not timestamp_str:
             return 999.0  # treat missing as very old
         try:
             commit_time = datetime.strptime(timestamp_str.strip(), "%Y-%m-%d %H:%M")
-            delta = datetime.now() - commit_time
+            # Assume naive timestamps are UTC (backward compat)
+            if commit_time.tzinfo is None:
+                commit_time = commit_time.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = now - commit_time
             return delta.total_seconds() / 3600.0
         except (ValueError, TypeError):
             return 999.0
@@ -704,32 +734,33 @@ class MemoryManager:
         Returns the merged commit ID.
         """
         path = self._get_commits_path(branch)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         files_str = ", ".join(files_changed) if files_changed else ""
 
         with self._locks[path]:
             content = self._read_file_unlocked(path) or ""
 
             # Find the target commit block
-            pattern = rf"(## \[{re.escape(commit_id)}\].*?)(?=## \[C\d{{3}}\]|---\n\n|\Z)"
+            pattern = rf"(## \[{re.escape(commit_id)}\].*?)(?=## \[C\d{{3,}}\]|---\n\n|\Z)"
             match = re.search(pattern, content, re.DOTALL)
             if not match:
                 return commit_id  # fallback: can't find commit
 
             old_block = match.group(1)
 
-            # Update timestamp to now
+            # Update timestamp to now (H5: use lambda to avoid backreference interpretation)
             new_block = re.sub(
                 r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
-                now,
+                lambda m: now,
                 old_block,
                 count=1,
             )
 
             # Append to title (keep original, note merge)
+            # Use lambda to avoid regex backreference interpretation of title
             new_block = re.sub(
                 rf"(\[{re.escape(commit_id)}\]\s+{re.escape(now)}\s*\|[^|]*\|\s*)(.*)",
-                rf"\g<1>\2 + {title}",
+                lambda m: f"{m.group(1)}{m.group(2)} + {title}",
                 new_block,
             )
 
@@ -853,7 +884,7 @@ class MemoryManager:
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 r"(## Rolling Summary\n).*?(?=\n---|\n# |\Z)",
-                rf"\g<1>{summary}\n",
+                lambda m: f"{m.group(1)}{summary}\n",
                 content,
                 count=1,
                 flags=re.DOTALL,
@@ -884,7 +915,7 @@ class MemoryManager:
 
         # Create merge commit on main
         commit_id = self._get_next_commit_id("main")
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
         merge_entry = (
             f"## [{commit_id}] {now} | branch:main | Merge: {branch_name} ({outcome})\n"
@@ -1054,7 +1085,7 @@ class MemoryManager:
     ) -> str:
         """Format an OTA log entry in the GCC paper triple format."""
         branch = self.get_active_branch()
-        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         ota_id = self._get_next_ota_id(branch)
 
         if observation or thought or action:
@@ -1070,15 +1101,18 @@ class MemoryManager:
         return f"| {now} | {tool_name} | {file_path or '-'} | {status} |"
 
     def _get_next_ota_id(self, branch: str) -> str:
-        """Get the next OTA sequential ID for a branch."""
-        content = self._read_file(self._get_log_path(branch))
-        if not content:
-            return "OTA-001"
-        matches = re.findall(r"\[OTA-(\d{3})\]", content)
-        if not matches:
-            return "OTA-001"
-        latest = max(int(m) for m in matches)
-        return f"OTA-{latest + 1:03d}"
+        """Get the next OTA sequential ID for a branch (M2: cached to avoid O(n) scan)."""
+        if not hasattr(self, '_ota_counters'):
+            self._ota_counters: dict[str, int] = {}
+        if branch not in self._ota_counters:
+            content = self._read_file(self._get_log_path(branch))
+            if content:
+                matches = re.findall(r"\[OTA-(\d+)\]", content)
+                self._ota_counters[branch] = max(int(m) for m in matches) if matches else 0
+            else:
+                self._ota_counters[branch] = 0
+        self._ota_counters[branch] += 1
+        return f"OTA-{self._ota_counters[branch]:03d}"
 
     # --- Session Context (for gateway injection) ---
 
@@ -1103,6 +1137,9 @@ class MemoryManager:
     # --- Internal Helpers ---
 
     def _get_branch_dir(self, branch: str) -> str:
+        # H3: Validate branch name to prevent path traversal
+        if branch != "main" and not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", branch):
+            raise ValueError(f"Invalid branch name: {branch}")
         return os.path.join(self.branches_dir, branch)
 
     def _get_commits_path(self, branch: str) -> str:
@@ -1116,7 +1153,7 @@ class MemoryManager:
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return "C001"
-        matches = re.findall(r"\[C(\d{3})\]", content)
+        matches = re.findall(r"\[C(\d{3,})\]", content)
         if not matches:
             return "C001"
         latest = max(int(m) for m in matches)
@@ -1167,8 +1204,8 @@ class MemoryManager:
         if not content:
             return ""
         # Split by ## [C markers
-        parts = re.split(r"(?=## \[C\d{3}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3}\]", p.strip())]
+        parts = re.split(r"(?=## \[C\d{3,}\])", content)
+        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
         return "\n".join(commit_parts[:count])
 
     def _get_branch_header(self, branch: str) -> str:
@@ -1176,7 +1213,7 @@ class MemoryManager:
         if not content:
             return ""
         # Everything before first ## [C commit marker
-        match = re.search(r"## \[C\d{3}\]", content)
+        match = re.search(r"## \[C\d{3,}\]", content)
         if match:
             return content[: match.start()].strip()
         return content.strip()
@@ -1187,7 +1224,7 @@ class MemoryManager:
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 r"\(Fill in at merge time — success/failure/partial\)",
-                f"{outcome}: {conclusion}",
+                lambda m: f"{outcome}: {conclusion}",
                 content,
             )
             self._write_file_unlocked(path, content)
@@ -1196,7 +1233,7 @@ class MemoryManager:
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return ""
-        parts = re.split(r"(?=## \[C\d{3}\])", content)
+        parts = re.split(r"(?=## \[C\d{3,}\])", content)
         for part in parts:
             if f"[{commit_id}]" in part:
                 return part.strip()
@@ -1206,7 +1243,7 @@ class MemoryManager:
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return ""
-        parts = re.split(r"(?=## \[C\d{3}\])", content)
+        parts = re.split(r"(?=## \[C\d{3,}\])", content)
         matches = [p.strip() for p in parts if term.lower() in p.lower()]
         return "\n\n".join(matches[:max_results])
 
@@ -1216,7 +1253,7 @@ class MemoryManager:
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 r"(## Active Branch\s*\n)\S+",
-                rf"\g<1>{branch}",
+                lambda m: f"{m.group(1)}{branch}",
                 content,
             )
             self._write_file_unlocked(path, content)
@@ -1235,7 +1272,7 @@ class MemoryManager:
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 rf"(\| {re.escape(name)} \| [^|]+ \| )\w+( \|)",
-                rf"\g<1>{status}\2",
+                lambda m: f"{m.group(1)}{status}{m.group(2)}",
                 content,
             )
             self._write_file_unlocked(path, content)
@@ -1284,11 +1321,24 @@ class MemoryManager:
                 return yaml.safe_load(f) or dict(METADATA_TEMPLATE)
 
     def _save_metadata(self, data: dict) -> None:
+        """Save metadata atomically via tmp + fsync + os.replace (H4)."""
         path = self._get_metadata_path()
         with self._locks[path]:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            content = yaml.dump(data, default_flow_style=False, sort_keys=False, Dumper=yaml.SafeDumper)
+            tmp_path = path + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
     def _update_metadata_branch(self, name: str, status: str, created: str, parent: str) -> None:
         meta = self._load_metadata()
@@ -1342,7 +1392,7 @@ class MemoryManager:
         with self._locks[path]:
             content = self._read_file_unlocked(path)
             if content:
-                content = re.sub(r"(## Status\n)\S+.*", rf"\g<1>{status}", content)
+                content = re.sub(r"(## Status\n)\S+.*", lambda m: f"{m.group(1)}{status}", content)
                 self._write_file_unlocked(path, content)
 
     def _add_key_decision_to_summary(self, branch: str, decision: str) -> None:
@@ -1363,8 +1413,8 @@ class MemoryManager:
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return ""
-        parts = re.split(r"(?=## \[C\d{3}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3}\]", p.strip())]
+        parts = re.split(r"(?=## \[C\d{3,}\])", content)
+        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
         windowed = commit_parts[offset:offset + count]
         return "\n".join(windowed)
 
@@ -1395,7 +1445,7 @@ class MemoryManager:
         # Compact: just IDs and observations
         refs = []
         for entry in recent:
-            id_match = re.search(r"\[OTA-(\d{3})\]", entry)
+            id_match = re.search(r"\[OTA-(\d+)\]", entry)
             obs_match = re.search(r"\*\*Observation\*\*: (.+)", entry)
             if id_match:
                 ota_id = f"OTA-{id_match.group(1)}"
@@ -1411,7 +1461,7 @@ class MemoryManager:
             new_focus = f"{title}. Next: {next_step}"
             content = re.sub(
                 r"(## Current Focus\n).*?(?=\n## )",
-                rf"\g<1>{new_focus}\n",
+                lambda m: f"{m.group(1)}{new_focus}\n",
                 content,
                 count=1,
                 flags=re.DOTALL,
@@ -1456,10 +1506,33 @@ class MemoryManager:
             with open(gitignore_path, "a") as f:
                 f.write("\n# CCR context directory\n.ccr/\n")
 
-    # --- File I/O (thread-safe wrappers) ---
+    # --- File I/O (thread-safe + cross-process wrappers) ---
+
+    @contextmanager
+    def _file_lock(self, path: str):
+        """Cross-process file lock using fcntl.flock.
+
+        Creates a .lock file alongside the target file. Uses LOCK_EX
+        (exclusive) to prevent concurrent writes from multiple MCP server
+        instances sharing the same .ccr/ directory.
+        """
+        lock_path = path + ".lock"
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
+            # M5: Clean up .lock files
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass  # Race condition: another process may have already removed it
 
     def _read_file(self, path: str) -> str:
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             return self._read_file_unlocked(path)
 
     def _read_file_unlocked(self, path: str) -> str:
@@ -1469,15 +1542,28 @@ class MemoryManager:
             return f.read()
 
     def _write_file(self, path: str, content: str) -> None:
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             self._write_file_unlocked(path, content)
 
     def _write_file_unlocked(self, path: str, content: str) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         # Sanitize surrogates that can't be encoded in UTF-8
         content = content.encode("utf-8", errors="replace").decode("utf-8")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        # Atomic write: write to tmp file, fsync, then os.replace
+        dir_name = os.path.dirname(path) or "."
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _write_if_missing(self, path: str, content: str) -> None:
         if not os.path.isfile(path):

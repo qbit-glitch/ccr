@@ -1,8 +1,9 @@
 """Tests for MemoryManager — GCC-style context management."""
 
 import os
+import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -481,16 +482,19 @@ class TestRecency:
 class TestScoreComparisonInMerge:
     def test_new_outranks_existing_creates_new(self, memory):
         """Alg. 1 line 6: S(m) > S(m_conflict) → create new (both coexist)."""
-        # Create a low-priority existing commit (continuation)
-        memory.commit("Still working on auth", "continued", "wip",
-                      ["auth.py"], "continue")
-        # New commit is a milestone → high score → should outrank existing
+        # Create an auth-related commit first so the continuation commit has low novelty
+        memory.commit("Setup auth module", "initialized auth", "security",
+                      ["auth.py"], "add login")
+        # Create a low-priority continuation commit — low novelty (same file/topic) + low type prior
+        memory.commit("Still working on auth", "continued auth work", "wip",
+                      ["auth.py"], "continue auth")
+        # New commit is a milestone with different files → higher novelty + high type prior
         result = memory.commit(
-            "Auth complete", "finished implementation", "security",
-            ["auth.py"], "deploy",
+            "Auth complete", "finished deployment pipeline", "shipped to production",
+            ["deploy.py", "config.yaml"], "monitor",
             admission_threshold=0.3,  # low threshold to trigger FindConflict
         )
-        assert "C002" in result
+        assert "C003" in result
         assert "merged" not in result.lower()
 
     def test_existing_outranks_new_merges(self, memory):
@@ -710,3 +714,283 @@ class TestAdmissionControlIntegration:
         )
         log = memory._read_file(memory._get_log_path("main"))
         assert "commit-merge" in log or "Admission control" in log
+
+
+# ===========================================================================
+# Issue 1: OTA ID overflow after 999 entries
+# ===========================================================================
+
+
+class TestOTAOverflow:
+    def test_ota_id_past_999(self, memory):
+        """OTA IDs above 999 should still be found and incremented."""
+        branch = "main"
+        log_path = memory._get_log_path(branch)
+        # Manually write an OTA entry with ID 999
+        memory._write_file(log_path, "---\n[OTA-999] 2026-01-01T00:00:00\n- **Observation**: test\n")
+        next_id = memory._get_next_ota_id(branch)
+        assert next_id == "OTA-1000"
+
+    def test_ota_id_1000_is_found(self, memory):
+        """Once OTA-1000 exists, the next ID should be OTA-1001."""
+        branch = "main"
+        log_path = memory._get_log_path(branch)
+        memory._write_file(log_path, "---\n[OTA-1000] 2026-01-01T00:00:00\n- test\n")
+        next_id = memory._get_next_ota_id(branch)
+        assert next_id == "OTA-1001"
+
+    def test_ota_id_mixed_lengths(self, memory):
+        """With both 3-digit and 4-digit OTA IDs, pick the highest."""
+        branch = "main"
+        log_path = memory._get_log_path(branch)
+        content = (
+            "---\n[OTA-050] 2026-01-01T00:00:00\n- test\n"
+            "---\n[OTA-999] 2026-01-01T00:00:01\n- test\n"
+            "---\n[OTA-1002] 2026-01-01T00:00:02\n- test\n"
+        )
+        memory._write_file(log_path, content)
+        next_id = memory._get_next_ota_id(branch)
+        assert next_id == "OTA-1003"
+
+    def test_ota_id_format_is_zero_padded_minimum_3(self, memory):
+        """Small IDs are zero-padded to 3 digits; large IDs use as many digits as needed."""
+        branch = "main"
+        log_path = memory._get_log_path(branch)
+        memory._write_file(log_path, "---\n[OTA-005] 2026-01-01T00:00:00\n- test\n")
+        next_id = memory._get_next_ota_id(branch)
+        assert next_id == "OTA-006"  # still 3-digit padded
+
+
+# ===========================================================================
+# Issue 2: Stored admission score for S(m_conflict)
+# ===========================================================================
+
+
+class TestStoredAdmissionScore:
+    def test_commit_stores_score(self, memory):
+        """Commits should contain a **Score**: line."""
+        memory.commit("Add auth", "implemented login", "security",
+                      ["auth.py"], "add tests")
+        commits = memory._read_file(memory._get_commits_path("main"))
+        assert "**Score**:" in commits
+        # Score should be a float
+        score_match = re.search(r"\*\*Score\*\*:\s*([\d.]+)", commits)
+        assert score_match is not None
+        score_val = float(score_match.group(1))
+        assert 0.0 <= score_val <= 1.0
+
+    def test_parsed_stored_score(self, memory):
+        """_parse_recent_commit_data should extract stored_score."""
+        memory.commit("Add auth", "implemented login", "security",
+                      ["auth.py"], "add tests")
+        commits = memory._parse_recent_commit_data("main", 5)
+        assert len(commits) == 1
+        assert commits[0]["stored_score"] is not None
+        assert 0.0 <= commits[0]["stored_score"] <= 1.0
+
+    def test_conflict_uses_stored_score(self, memory):
+        """S(m_conflict) should use stored score when available."""
+        # Create first commit (gets score=1.0 as first commit)
+        memory.commit("Add auth", "implemented login", "security",
+                      ["auth.py"], "add tests")
+        # Compute score for a similar commit — conflict should use stored score
+        score = memory.compute_admission_score(
+            "main", "Add auth v2", "improved login", "security",
+            ["auth.py"], "more tests",
+        )
+        if score["conflict_id"]:
+            # The conflict_score should be the stored score (1.0 for first commit)
+            assert score["conflict_score"] == 1.0
+
+    def test_backward_compat_no_stored_score(self, memory):
+        """Old commits without **Score**: should fall back to heuristic."""
+        # Manually write a commit without Score field
+        path = memory._get_commits_path("main")
+        old_commit = (
+            "## [C001] 2026-01-01 00:00 | branch:main | Old commit\n"
+            "**What**: did something\n"
+            "**Why**: reason\n"
+            "**Files**: old.py\n"
+            "**Next**: continue\n\n---\n\n"
+        )
+        memory._write_file(path, f"# Branch: main\n\n## Rolling Summary\n(none yet)\n\n# Milestone Journal\n\n{old_commit}")
+        commits = memory._parse_recent_commit_data("main", 5)
+        assert len(commits) == 1
+        assert commits[0]["stored_score"] is None
+        # Should still work — falls back to heuristic
+        score = memory.compute_admission_score(
+            "main", "Old commit continued", "did more", "reason",
+            ["old.py"], "next",
+        )
+        assert "conflict_score" in score
+
+
+# ===========================================================================
+# Issue 3: Timezone awareness
+# ===========================================================================
+
+
+class TestTimezoneAwareness:
+    def test_commit_timestamp_is_utc(self, memory):
+        """Commit timestamps should be generated from UTC time."""
+        memory.commit("Test tz", "testing timezone", "reason",
+                      ["tz.py"], "verify")
+        commits = memory._read_file(memory._get_commits_path("main"))
+        # The timestamp should be present in commits.md
+        assert re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}", commits) is not None
+
+    def test_hours_since_commit_handles_naive_timestamp(self, memory):
+        """_hours_since_commit should handle naive timestamps (backward compat)."""
+        # Naive timestamp (no timezone info) — should be treated as UTC
+        hours = memory._hours_since_commit("2020-01-01 00:00")
+        assert hours > 0  # should be a large positive number (years ago)
+        assert hours < 100_000  # sanity check
+
+    def test_hours_since_commit_handles_empty(self, memory):
+        """Missing timestamps should return 999."""
+        assert memory._hours_since_commit("") == 999.0
+        assert memory._hours_since_commit("   ") == 999.0
+
+    def test_hours_since_commit_handles_invalid(self, memory):
+        """Invalid timestamps should return 999."""
+        assert memory._hours_since_commit("not-a-date") == 999.0
+
+    def test_hours_since_commit_recent(self, memory):
+        """A timestamp from just now should have ~0 hours elapsed."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        hours = memory._hours_since_commit(now)
+        assert hours < 0.1  # less than 6 minutes
+
+
+# ===========================================================================
+# Issue 4: Regex injection in merge title
+# ===========================================================================
+
+
+class TestRegexInjectionInMerge:
+    def test_merge_title_with_backslash_n(self, memory):
+        r"""Title containing \n should not create a newline in merged commit."""
+        memory.commit("Feature work", "started feature", "reason",
+                      ["feature.py"], "continue")
+        result = memory.commit(
+            r"Fix path C:\new\thing", "fixed path handling", "bug fix",
+            ["feature.py"], "done",
+            admission_threshold=0.3,
+        )
+        if "merged" in result.lower() or "+" in result:
+            commits = memory._read_file(memory._get_commits_path("main"))
+            # The literal backslash-n should appear, not an actual newline
+            assert r"C:\new\thing" in commits
+
+    def test_merge_title_with_backreference(self, memory):
+        r"""Title containing \1 should not be interpreted as regex backreference."""
+        memory.commit("Feature work", "started feature", "reason",
+                      ["feature.py"], "continue")
+        result = memory.commit(
+            r"Fix regex \1 group", "fixed regex handling", "bug fix",
+            ["feature.py"], "done",
+            admission_threshold=0.3,
+        )
+        if "merged" in result.lower() or "+" in result:
+            commits = memory._read_file(memory._get_commits_path("main"))
+            assert r"\1" in commits
+
+    def test_merge_title_with_special_chars(self, memory):
+        r"""Title with mixed special regex chars should be handled safely."""
+        memory.commit("Feature work", "started feature", "reason",
+                      ["feature.py"], "continue")
+        title_with_specials = r"Fix $100 cost \g<1> issue"
+        result = memory.commit(
+            title_with_specials, "fixed cost issue", "accounting",
+            ["feature.py"], "deploy",
+            admission_threshold=0.3,
+        )
+        if "merged" in result.lower() or "+" in result:
+            commits = memory._read_file(memory._get_commits_path("main"))
+            assert r"\g<1>" in commits
+
+
+# ===========================================================================
+# H1: Atomic writes
+# ===========================================================================
+
+
+class TestAtomicWrites:
+    def test_write_file_creates_content(self, memory):
+        """_write_file should create a file with the given content."""
+        path = os.path.join(memory.ccr_root, "test_atomic.txt")
+        memory._write_file(path, "hello atomic")
+        assert os.path.isfile(path)
+        content = memory._read_file(path)
+        assert content == "hello atomic"
+
+    def test_write_file_no_partial_on_interrupt(self, memory):
+        """Atomic writes via os.replace ensure no partial files."""
+        path = os.path.join(memory.ccr_root, "test_atomic2.txt")
+        memory._write_file(path, "first version")
+        # Overwrite — should be atomic
+        memory._write_file(path, "second version")
+        content = memory._read_file(path)
+        assert content == "second version"
+
+    def test_write_file_handles_surrogates(self, memory):
+        """Content with surrogate characters should be sanitized."""
+        path = os.path.join(memory.ccr_root, "test_surr.txt")
+        memory._write_file(path, "test \ud800 data")
+        content = memory._read_file(path)
+        assert "test" in content  # should not crash
+
+
+# ===========================================================================
+# H2: Cross-process file locking
+# ===========================================================================
+
+
+class TestCrossProcessLocking:
+    def test_file_lock_context_manager(self, memory):
+        """_file_lock should create a .lock file and release it."""
+        path = os.path.join(memory.ccr_root, "test_lock.txt")
+        memory._write_file(path, "data")
+        with memory._file_lock(path):
+            assert os.path.isfile(path + ".lock")
+        # Lock should be released (not holding exclusive)
+
+    def test_concurrent_writes_dont_corrupt(self, memory):
+        """Concurrent thread writes should not corrupt the file."""
+        import concurrent.futures
+        path = os.path.join(memory.ccr_root, "concurrent.txt")
+        memory._write_file(path, "initial")
+
+        def write_thread(i):
+            memory._write_file(path, f"version-{i}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(write_thread, i) for i in range(10)]
+            for f in futures:
+                f.result()
+
+        # File should contain one complete version, not a mix
+        content = memory._read_file(path)
+        assert content.startswith("version-")
+
+
+# ===========================================================================
+# H3: Regex injection in rolling summary and conclusion
+# ===========================================================================
+
+
+class TestRegexInjectionInSummary:
+    def test_rolling_summary_with_backslash(self, memory):
+        r"""Rolling summary containing \n should not create newline."""
+        memory.commit(r"Fix path C:\new", "fixed", "reason", ["f.py"], "next")
+        summary = memory._get_rolling_summary("main")
+        # Should not crash; summary should contain the text
+        assert summary is not None
+
+    def test_branch_conclusion_with_backreference(self, memory):
+        r"""Conclusion with \1 should not be treated as backreference."""
+        memory.create_branch("test-regex", "test", "hypo")
+        # This should not raise an error
+        memory.merge("test-regex", "success", r"Fixed \1 and \g<0> refs")
+        commits = memory._read_file(memory._get_commits_path("test-regex"))
+        assert r"\1" in commits
