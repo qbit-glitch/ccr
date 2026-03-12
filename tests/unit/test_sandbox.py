@@ -627,9 +627,8 @@ class TestRunnerScript:
         assert '"__builtins__": __builtins__' not in _RUNNER_SCRIPT
 
     def test_runner_script_blocks_dangerous_imports(self):
-        """Runner script should block dangerous module imports."""
-        assert "_blocked_modules" in _RUNNER_SCRIPT
-        assert '"subprocess"' in _RUNNER_SCRIPT
+        """Runner script should use allowlist for module imports."""
+        assert "_allowed_modules" in _RUNNER_SCRIPT
         assert "_safe_import" in _RUNNER_SCRIPT
 
     def test_runner_script_tracks_dropped_vars(self):

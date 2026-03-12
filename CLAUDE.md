@@ -41,7 +41,7 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
 
 ```
 ccr/
-  mcp_server.py     # MCP server: all 18 tools (GCC + ACE + RLM + Index)
+  mcp_server.py     # MCP server: all 20 tools (GCC + ACE + RLM + Index)
   hooks/
     on_session_start.py  # Injects playbook + context on UserPromptSubmit
     on_session_end.py    # Logs session end OTA
@@ -88,7 +88,7 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ## Key Patterns
 
-- **MCP server**: 18 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
+- **MCP server**: 20 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
 - **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.60·Novelty + 0.40·TypePrior. Algorithm 1 with S(m) vs S(m_conflict) comparison, recency-modulated FindConflict (sim threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
 - **Two-tier playbook**: Global (`~/.ccr/global_playbook.txt`) + project (`.ccr/playbook.txt`). All ACE tools accept `scope="global"|"project"`. Cross-tier similarity detection via `ace_find_similar(scope="cross")`.
 - **Temporal decay**: Bullet counters decay via `effective_score = raw * 0.95^days`. Unused 30d → 21%, 90d → 1%. `last_updated` persisted in companion JSON. Budget pruning uses effective scores.

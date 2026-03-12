@@ -222,10 +222,15 @@ def gcc_commit(
         rejection_threshold: Admission score below which commits are rejected.
             Default 0.0 (disabled). Low score = low value = reject.
     """
-    with _state_lock:
-        mem = _ensure_memory()
-        return mem.commit(title, what, why, files_changed, next_step,
-                          admission_threshold, rejection_threshold)
+    try:
+        with _state_lock:
+            mem = _ensure_memory()
+            return mem.commit(title, what, why, files_changed, next_step,
+                              admission_threshold, rejection_threshold)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -240,9 +245,14 @@ def gcc_branch(name: str, purpose: str, hypothesis: str) -> str:
         purpose: What this branch explores.
         hypothesis: What you expect to learn or achieve.
     """
-    with _state_lock:
-        mem = _ensure_memory()
-        return mem.create_branch(name, purpose, hypothesis)
+    try:
+        with _state_lock:
+            mem = _ensure_memory()
+            return mem.create_branch(name, purpose, hypothesis)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
@@ -257,9 +267,14 @@ def gcc_merge(branch: str, outcome: str, conclusion: str) -> str:
         outcome: One of 'success', 'failure', or 'partial'.
         conclusion: Summary of what was learned.
     """
-    with _state_lock:
-        mem = _ensure_memory()
-        return mem.merge(branch, outcome, conclusion)
+    try:
+        with _state_lock:
+            mem = _ensure_memory()
+            return mem.merge(branch, outcome, conclusion)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -287,7 +302,8 @@ def gcc_context(
         commit_id: Specific commit ID to retrieve (level 5 only).
         log_window: Number of recent OTA log entries to include.
     """
-    mem = _ensure_memory()
+    with _state_lock:
+        mem = _ensure_memory()
     return mem.get_context(
         level=level,
         search_term=search_term,
@@ -308,15 +324,20 @@ def gcc_log_ota(observation: str, thought: str, action: str) -> str:
         thought: Your reasoning (e.g., "The regex pattern is too greedy").
         action: What you did (e.g., "Fixed pattern to use non-greedy match").
     """
-    with _state_lock:  # H3: protect memory state mutation
-        mem = _ensure_memory()
-        mem.log_ota(
-            tool_name="claude-code",
-            observation=observation,
-            thought=thought,
-            action=action,
-        )
-    return "OTA logged."
+    try:
+        with _state_lock:  # H3: protect memory state mutation
+            mem = _ensure_memory()
+            mem.log_ota(
+                tool_name="claude-code",
+                observation=observation,
+                thought=thought,
+                action=action,
+            )
+        return "OTA logged."
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -326,9 +347,10 @@ def gcc_status() -> str:
     Returns the active branch, recent milestones, open branches,
     and metadata summary.
     """
-    mem = _ensure_memory()
-    parts = []
+    with _state_lock:
+        mem = _ensure_memory()
 
+    parts = []
     branch = mem.get_active_branch()
     parts.append(f"Active branch: {branch}")
 
@@ -337,6 +359,68 @@ def gcc_status() -> str:
     parts.append(overview)
 
     return "\n\n".join(parts)
+
+
+# ===========================================================================
+# GCC Hierarchical Summary Tools (TiMem-inspired)
+# ===========================================================================
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def gcc_consolidate(tier: str = "session", content: str | None = None) -> str:
+    """Generate or save a hierarchical memory summary (TiMem-inspired).
+
+    Three tiers of consolidation, inspired by TiMem's Temporal Memory Tree
+    (note: TMT tree structure and §3.3 recall pipeline are NOT implemented —
+    this uses flat aggregation with mechanical consolidation):
+
+    Tiers:
+        "session": Generate a session summary from recent commits (mechanical, immediate).
+                   Consolidates the last N commits into a structured paragraph.
+        "phase": Generate a phase summary from recent sessions (mechanical, immediate).
+                 Aggregates session summaries + branch metadata into a strategic view.
+        "project": Returns a prompt for Claude Code to generate a project overview.
+                   Call again with content= to save the generated overview.
+
+    The session and phase tiers produce summaries immediately using mechanical
+    consolidation (template-based extraction from commits). The project tier
+    requires two calls: first to get the prompt, then to save the result.
+
+    Args:
+        tier: "session", "phase", or "project".
+        content: For tier="project" only — the generated overview text to save.
+    """
+    try:
+        with _state_lock:
+            mem = _ensure_memory()
+            if tier == "project" and content is not None:
+                mem.save_overview(content)
+                return "Project overview saved."
+            return mem.get_consolidation_prompt(tier=tier)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_summaries(tier: str = "all", count: int = 5) -> str:
+    """Retrieve hierarchical memory summaries.
+
+    Returns consolidated summaries at the specified tier:
+        "session": Recent session summaries from the active branch.
+        "phase": Recent phase summaries (cross-branch).
+        "project": The current project overview.
+        "all": All tiers combined.
+
+    Args:
+        tier: Which tier(s) to retrieve ("session", "phase", "project", "all").
+        count: Maximum number of summaries per tier (default 5).
+    """
+    with _state_lock:
+        mem = _ensure_memory()
+    count = max(1, min(count, 50))
+    return mem.get_summaries(tier=tier, count=count)
 
 
 # ===========================================================================
@@ -405,12 +489,17 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> str:
         operations: List of delta operation dicts.
         scope: "project" (default) or "global". Global bullets apply across all projects.
     """
-    with _state_lock:
-        pb, save_fn = _resolve_playbook(scope)
-        ops = parse_delta_operations({"operations": operations})
-        applied = pb.apply_delta(ops)
-        save_fn()
-        return f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
+    try:
+        with _state_lock:
+            pb, save_fn = _resolve_playbook(scope)
+            ops = parse_delta_operations({"operations": operations})
+            applied = pb.apply_delta(ops)
+            save_fn()
+            return f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -436,20 +525,25 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> str:
               }
         scope: "project" (default) or "global".
     """
-    with _state_lock:
-        pb, save_fn = _resolve_playbook(scope)
-        updated = pb.update_bullet_counts(bullet_tags)
-        save_fn()
+    try:
+        with _state_lock:
+            pb, save_fn = _resolve_playbook(scope)
+            updated = pb.update_bullet_counts(bullet_tags)
+            save_fn()
 
-    # Count how many had structured lessons
-    lessons_added = sum(
-        1 for t in bullet_tags
-        if t.get("tag") == "harmful" and isinstance(t.get("failure_lesson"), dict) and t["failure_lesson"]
-    )
-    parts = [f"Updated {updated} bullet(s) in {scope} playbook."]
-    if lessons_added:
-        parts.append(f"Recorded {lessons_added} structured failure lesson(s).")
-    return " ".join(parts)
+        # Count how many had structured lessons
+        lessons_added = sum(
+            1 for t in bullet_tags
+            if t.get("tag") == "harmful" and isinstance(t.get("failure_lesson"), dict) and t["failure_lesson"]
+        )
+        parts = [f"Updated {updated} bullet(s) in {scope} playbook."]
+        if lessons_added:
+            parts.append(f"Recorded {lessons_added} structured failure lesson(s).")
+        return " ".join(parts)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -538,52 +632,131 @@ def ace_prune(scope: str = "project") -> str:
     Args:
         scope: "project" (default) or "global".
     """
-    with _state_lock:
-        pb, save_fn = _resolve_playbook(scope)
-        # Evolve failure lessons BEFORE pruning to prevent permanent loss
-        evolved = pb.evolve_from_failures(threshold=1)
-        pruned = pb.prune_problematic(min_harmful=3)
-        budget_pruned = pb.enforce_token_budget(max_chars=80000)
-        save_fn()
-    total = len(pruned) + len(budget_pruned)
-    parts = []
-    if evolved:
-        parts.append(f"Evolved {len(evolved)} new skill(s) from failure lessons.")
-    parts.append(f"Pruned {total} bullet(s) from {scope} playbook. Now has {len(pb.bullets)} bullets.")
-    return " ".join(parts)
+    try:
+        with _state_lock:
+            pb, save_fn = _resolve_playbook(scope)
+            # Evolve failure lessons BEFORE pruning to prevent permanent loss
+            evolved = pb.evolve_from_failures(threshold=1)
+            pruned = pb.prune_problematic(min_harmful=3)
+            budget_pruned = pb.enforce_token_budget(max_chars=80000)
+            save_fn()
+        total = len(pruned) + len(budget_pruned)
+        parts = []
+        if evolved:
+            parts.append(f"Evolved {len(evolved)} new skill(s) from failure lessons.")
+        parts.append(f"Pruned {total} bullet(s) from {scope} playbook. Now has {len(pb.bullets)} bullets.")
+        return " ".join(parts)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
-def ace_evolve_from_failures(threshold: int = 3, scope: str = "project") -> str:
+def ace_evolve_from_failures(
+    threshold: int = 3,
+    scope: str = "project",
+    synthesized_skills: list[dict] | None = None,
+) -> str:
     """Evolve new skills from accumulated failure lessons (SkillRL §3.3 / Prompt B.1).
 
-    When harmful bullets accumulate enough structured failure lessons, this tool
-    generates NEW standalone skill bullets from their prevention principles.
+    Two-call pattern (caller-driven synthesis):
+      1. Call with no synthesized_skills → returns failure lessons + prompt for
+         Claude Code to synthesize new skills (teacher-model role per SkillRL §4.2).
+      2. Call again with synthesized_skills=[{"content": "...", "when_to_apply": "..."}]
+         → saves the synthesized skills as new playbook bullets.
 
-    New skills are added to PROBLEM-SOLVING HEURISTICS with scope="general" and
-    when_to_apply derived from the failure's task_context.
+    If synthesized_skills is not provided and the threshold is met, the tool
+    falls back to mechanical evolution (prevention_principle extraction) for
+    backward compatibility. The caller-driven path is preferred for higher
+    quality synthesis per SkillRL's teacher-model pattern.
 
     Args:
-        threshold: Minimum number of harmful-with-lessons bullets needed to trigger
-                   evolution (default 3). Lower for aggressive learning.
+        threshold: Minimum harmful-with-lessons bullets to trigger (default 3).
         scope: "project" (default) or "global".
+        synthesized_skills: Optional list of dicts with "content" and "when_to_apply"
+            keys, provided by Claude Code after reviewing the failure lessons prompt.
     """
-    with _state_lock:
-        pb, save_fn = _resolve_playbook(scope)
-        new_bullets = pb.evolve_from_failures(threshold)
-        if not new_bullets:
+    try:
+        with _state_lock:
+            pb, save_fn = _resolve_playbook(scope)
+
+            # Path 2: Save synthesized skills from Claude Code
+            if synthesized_skills:
+                from ccr.ace.playbook import DeltaOperation
+                ops = []
+                for skill in synthesized_skills:
+                    content = skill.get("content", "").strip()
+                    when = skill.get("when_to_apply", "")
+                    if content:
+                        ops.append(DeltaOperation(
+                            op_type="ADD",
+                            section="PROBLEM-SOLVING HEURISTICS",
+                            content=content,
+                        ))
+                applied = pb.apply_delta(ops)
+                # Set when_to_apply on newly added bullets
+                for skill, bullet in zip(synthesized_skills, pb.bullets[-applied:]):
+                    if skill.get("when_to_apply"):
+                        bullet.when_to_apply = skill["when_to_apply"]
+                    bullet.scope = skill.get("scope", "general")
+                save_fn()
+                return f"Saved {applied} synthesized skill(s) to {scope} playbook."
+
+            # Path 1: Check if evolution is needed
             check = pb.check_evolution_needed(threshold)
-            return (
-                f"Evolution not triggered in {scope} playbook. Need {threshold} harmful bullets with failure "
-                f"lessons, currently have {check['candidate_count']}."
-            )
-        save_fn()
-    lines = [f"Evolved {len(new_bullets)} new skill(s) from {scope} failure lessons:"]
-    for b in new_bullets:
-        lines.append(f"  [{b.id}] {b.content[:100]}")
-        if b.when_to_apply:
-            lines.append(f"    When: {b.when_to_apply[:100]}")
-    return "\n".join(lines)
+            if not check.get("needed"):
+                return (
+                    f"Evolution not triggered in {scope} playbook. Need {threshold} harmful bullets with failure "
+                    f"lessons, currently have {check['candidate_count']}."
+                )
+
+            # Run mechanical evolution (backward compat + fallback)
+            new_bullets = pb.evolve_from_failures(threshold)
+            if new_bullets:
+                save_fn()
+
+            # Build synthesis prompt for Claude Code (teacher-model per SkillRL §4.2)
+            # Include the candidates so Claude can optionally synthesize better skills
+            candidate_ids = set(check.get("candidate_ids", []))
+            candidates = [b for b in pb.bullets if b.id in candidate_ids]
+            lessons_text = []
+            for b in candidates:
+                lessons_text.append(f"## Bullet [{b.id}]: {b.content[:100]}")
+                for lesson in b.failure_lessons:
+                    fp = getattr(lesson, 'failure_point', '?') if not isinstance(lesson, dict) else lesson.get('failure_point', '?')
+                    fr = getattr(lesson, 'flawed_reasoning', '?') if not isinstance(lesson, dict) else lesson.get('flawed_reasoning', '?')
+                    cf = getattr(lesson, 'counterfactual', '?') if not isinstance(lesson, dict) else lesson.get('counterfactual', '?')
+                    pp = getattr(lesson, 'prevention_principle', '?') if not isinstance(lesson, dict) else lesson.get('prevention_principle', '?')
+                    lessons_text.append(
+                        f"  - Failure: {fp}\n"
+                        f"    Flawed reasoning: {fr}\n"
+                        f"    Counterfactual: {cf}\n"
+                        f"    Prevention: {pp}"
+                    )
+
+            result_parts = []
+            if new_bullets:
+                result_parts.append(f"Evolved {len(new_bullets)} new skill(s) from {scope} failure lessons:")
+                for b in new_bullets:
+                    result_parts.append(f"  [{b.id}] {b.content[:100]}")
+                    if b.when_to_apply:
+                        result_parts.append(f"    When: {b.when_to_apply[:100]}")
+
+            if lessons_text:
+                result_parts.append(
+                    f"\n---\n# Optional: Caller-driven synthesis (SkillRL §4.2)\n"
+                    f"For higher-quality skill synthesis, review these failure lessons and call\n"
+                    f"ace_evolve_from_failures again with synthesized_skills=[\n"
+                    f'  {{"content": "skill text", "when_to_apply": "condition", "scope": "general"}}\n'
+                    f"]\n\n" + "\n".join(lessons_text)
+                )
+
+            return "\n".join(result_parts) if result_parts else "No skills evolved."
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 # ===========================================================================
@@ -609,38 +782,43 @@ def rlm_init(task_prompt: str) -> str:
     Args:
         task_prompt: The problem or question to solve.
     """
-    global _repl
-    with _state_lock:
-        idx = _ensure_index()
+    try:
+        global _repl
+        with _state_lock:
+            idx = _ensure_index()
 
-        # Clean up previous REPL if any
-        if _repl is not None:
-            _repl.cleanup()
+            # Clean up previous REPL if any
+            if _repl is not None:
+                _repl.cleanup()
 
-        # Kernel sandbox runs code in a subprocess, which means in-process tools
-        # (search_repo, get_file, etc.) are NOT available there. Use Python-level
-        # sandboxing (AST validation + restricted builtins) for the RLM REPL,
-        # which needs these tools. The kernel sandbox is available for standalone
-        # code execution via KernelSandbox directly.
-        _repl = CCRRepl(repo_index=idx, project_root=_project_root, use_kernel_sandbox=False)
-        _repl.locals["task_prompt"] = task_prompt
+            # Kernel sandbox runs code in a subprocess, which means in-process tools
+            # (search_repo, get_file, etc.) are NOT available there. Use Python-level
+            # sandboxing (AST validation + restricted builtins) for the RLM REPL,
+            # which needs these tools. The kernel sandbox is available for standalone
+            # code execution via KernelSandbox directly.
+            _repl = CCRRepl(repo_index=idx, project_root=_project_root, use_kernel_sandbox=False)
+            _repl.locals["task_prompt"] = task_prompt
 
-    # Load playbook as variable if available
-    pb = _ensure_playbook()
-    pb_text = pb.serialize()
-    if pb_text.strip():
-        _repl.locals["playbook"] = pb_text
+        # Load playbook as variable if available
+        pb = _ensure_playbook()
+        pb_text = pb.serialize()
+        if pb_text.strip():
+            _repl.locals["playbook"] = pb_text
 
-    prompt_preview = task_prompt[:120] + "..." if len(task_prompt) > 120 else task_prompt
-    file_count = len(idx.files) if idx.files else 0
+        prompt_preview = task_prompt[:120] + "..." if len(task_prompt) > 120 else task_prompt
+        file_count = len(idx.files) if idx.files else 0
 
-    return (
-        f"REPL initialized.\n"
-        f"- task_prompt: {len(task_prompt)} chars — \"{prompt_preview}\"\n"
-        f"- context: repo metadata ({file_count} files indexed)\n"
-        f"- Tools: get_file(), search_repo(), estimate_tokens(), FINAL_VAR(), SHOW_VARS()\n"
-        f"\nUse rlm_execute to run code. Use rlm_finalize when done."
-    )
+        return (
+            f"REPL initialized.\n"
+            f"- task_prompt: {len(task_prompt)} chars — \"{prompt_preview}\"\n"
+            f"- context: repo metadata ({file_count} files indexed)\n"
+            f"- Tools: get_file(), search_repo(), estimate_tokens(), FINAL_VAR(), SHOW_VARS()\n"
+            f"\nUse rlm_execute to run code. Use rlm_finalize when done."
+        )
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -657,40 +835,45 @@ def rlm_execute(code: str) -> str:
     Args:
         code: Python code to execute.
     """
-    with _state_lock:
-        if _repl is None:
-            return "Error: REPL not initialized. Call rlm_init first."
-        repl_ref = _repl
+    try:
+        with _state_lock:
+            if _repl is None:
+                return "Error: REPL not initialized. Call rlm_init first."
+            repl_ref = _repl
 
-    result = repl_ref.execute_code(code)
+        result = repl_ref.execute_code(code)
 
-    parts = []
-    if result.stdout.strip():
-        # Metadata-only: show length + preview (RLM paper pattern)
-        stdout = result.stdout.strip()
-        if len(stdout) > 500:
-            parts.append(f"stdout ({len(stdout)} chars): {stdout[:500]}...")
-        else:
-            parts.append(f"stdout: {stdout}")
+        parts = []
+        if result.stdout.strip():
+            # Metadata-only: show length + preview (RLM paper pattern)
+            stdout = result.stdout.strip()
+            if len(stdout) > 500:
+                parts.append(f"stdout ({len(stdout)} chars): {stdout[:500]}...")
+            else:
+                parts.append(f"stdout: {stdout}")
 
-    if result.error:
-        parts.append(f"error: {result.error}")
+        if result.error:
+            parts.append(f"error: {result.error}")
 
-    if result.final_answer is not None:
-        parts.append(f"FINAL_ANSWER: {result.final_answer}")
+        if result.final_answer is not None:
+            parts.append(f"FINAL_ANSWER: {result.final_answer}")
 
-    if result.locals_snapshot:
-        var_summary = ", ".join(
-            f"{k}: {v[:60]}" for k, v in list(result.locals_snapshot.items())[:10]
-        )
-        parts.append(f"vars: {var_summary}")
+        if result.locals_snapshot:
+            var_summary = ", ".join(
+                f"{k}: {v[:60]}" for k, v in list(result.locals_snapshot.items())[:10]
+            )
+            parts.append(f"vars: {var_summary}")
 
-    parts.append(f"time: {result.execution_time:.3f}s")
+        parts.append(f"time: {result.execution_time:.3f}s")
 
-    return "\n".join(parts)
+        return "\n".join(parts)
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
 def rlm_finalize(variable_name: str) -> str:
     """Finalize the REPL session and return a variable's value as the result.
 
@@ -700,25 +883,30 @@ def rlm_finalize(variable_name: str) -> str:
     Args:
         variable_name: Name of the variable to return.
     """
-    global _repl
-    with _state_lock:
-        if _repl is None:
-            return "Error: REPL not initialized. Call rlm_init first."
-        repl_ref = _repl
+    try:
+        global _repl
+        with _state_lock:
+            if _repl is None:
+                return "Error: REPL not initialized. Call rlm_init first."
+            repl_ref = _repl
 
-    # H1: Validate variable_name to prevent code injection
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', variable_name):
-        return f"Error: Invalid variable name '{variable_name}'. Must be a valid Python identifier."
+        # H1: Validate variable_name to prevent code injection
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', variable_name):
+            return f"Error: Invalid variable name '{variable_name}'. Must be a valid Python identifier."
 
-    # Call _final_var directly instead of constructing code string (H1)
-    answer = repl_ref._final_var(variable_name)
-    with _state_lock:
-        repl_ref.cleanup()
-        _repl = None  # M4: Reset _repl after cleanup
+        # Call _final_var directly instead of constructing code string (H1)
+        answer = repl_ref._final_var(variable_name)
+        with _state_lock:
+            repl_ref.cleanup()
+            _repl = None  # M4: Reset _repl after cleanup
 
-    if answer is not None and not answer.startswith("Error:"):
-        return answer
-    return f"Error: Variable '{variable_name}' not found."
+        if answer is not None and not answer.startswith("Error:"):
+            return answer
+        return f"Error: Variable '{variable_name}' not found."
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 # ===========================================================================
@@ -734,19 +922,24 @@ def index_build() -> str:
     functions) and imports per file. The index enables search_repo and
     get_file in the RLM sandbox.
     """
-    global _repo_index
-    with _state_lock:  # H2: protect global state mutation
-        _repo_index = RepoIndex.build(_project_root)
+    try:
+        global _repo_index
+        with _state_lock:  # H2: protect global state mutation
+            _repo_index = RepoIndex.build(_project_root)
 
-        # Cache
-        mem = _ensure_memory()
-        try:
-            mem.save_index(_repo_index.to_json())
-            mem.update_metadata_file_tree([f for f in _repo_index.files.keys()])
-        except Exception:
-            pass
+            # Cache
+            mem = _ensure_memory()
+            try:
+                mem.save_index(_repo_index.to_json())
+                mem.update_metadata_file_tree([f for f in _repo_index.files.keys()])
+            except Exception:
+                pass
 
-    return _repo_index.get_summary()
+        return _repo_index.get_summary()
+    except ValueError:
+        raise  # User input validation — let MCP propagate
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))

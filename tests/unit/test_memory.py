@@ -788,19 +788,21 @@ class TestStoredAdmissionScore:
         assert commits[0]["stored_score"] is not None
         assert 0.0 <= commits[0]["stored_score"] <= 1.0
 
-    def test_conflict_uses_stored_score(self, memory):
-        """S(m_conflict) should use stored score when available."""
-        # Create first commit (gets score=1.0 as first commit)
+    def test_conflict_uses_recomputed_score(self, memory):
+        """S(m_conflict) should be recomputed with current R(m') for temporal decay."""
+        # Create first commit (gets score=1.0 as first commit, but R decays over time)
         memory.commit("Add auth", "implemented login", "security",
                       ["auth.py"], "add tests")
-        # Compute score for a similar commit — conflict should use stored score
+        # Compute score for a similar commit — conflict score is recomputed
         score = memory.compute_admission_score(
             "main", "Add auth v2", "improved login", "security",
             ["auth.py"], "more tests",
         )
         if score["conflict_id"]:
-            # The conflict_score should be the stored score (1.0 for first commit)
-            assert score["conflict_score"] == 1.0
+            # Recomputed conflict_score uses current R(m') which decays with time.
+            # For a very recent commit, R ≈ 1.0, so score should be close to stored.
+            # S(m') = 0.50*T + 0.35*N + 0.15*R where R ≈ 1.0 for recent commits.
+            assert 0.5 <= score["conflict_score"] <= 1.0
 
     def test_backward_compat_no_stored_score(self, memory):
         """Old commits without **Score**: should fall back to heuristic."""

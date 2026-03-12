@@ -26,39 +26,26 @@ from typing import Any
 
 from ccr.core.types import REPLResult
 
-# Modules blocked from import inside the REPL sandbox.
-_BLOCKED_MODULES = frozenset({
-    "subprocess", "shutil", "signal", "ctypes", "multiprocessing",
-    "pty", "fcntl", "termios", "resource",
-    # Critical security additions:
-    "os",           # arbitrary command execution, file ops
-    "sys",          # interpreter manipulation, module cache access
-    "socket",       # network access
-    "http",         # HTTP requests
-    "urllib",       # URL fetching
-    "importlib",    # dynamic import bypass
-    "pathlib",      # filesystem traversal
-    "glob",         # filesystem enumeration
-    "webbrowser",   # browser launch
-    "code",         # interactive interpreter
-    "codeop",       # code compilation
-    "io",           # raw file I/O bypass
-    "_thread",      # low-level threading
-    "threading",    # C5+H2: thread-based sandbox escape
-    "asyncio",      # event loop escape
-    # C2/C3: object graph traversal and low-level escapes
-    "gc",                # gc.get_objects() exposes all live objects
-    "pickle",            # arbitrary code execution via __reduce__
-    "marshal",           # bytecode manipulation
-    "_io",               # low-level I/O bypass
-    "_posixsubprocess",  # direct subprocess spawning
-    "_ctypes",           # FFI bypass
-    "_socket",           # low-level socket access
-    # faulthandler omitted: used by pytest, minimal security risk
-    "struct",            # raw memory packing
-    "copyreg",           # pickle dispatch manipulation
-    "_sitebuiltins",     # site module internals
-    "builtins",          # M4/C1-C4: import builtins restores everything
+# Modules ALLOWED for import inside the REPL sandbox.
+# Allowlist is safer than denylist: new stdlib modules are blocked by default,
+# and no new dangerous module can slip through by being added to Python.
+_ALLOWED_MODULES = frozenset({
+    # Math/numeric
+    "math", "decimal", "fractions", "statistics", "random",
+    # String/text
+    "string", "re", "textwrap", "unicodedata", "difflib",
+    # Data structures
+    "collections", "functools", "itertools", "operator",
+    # Date/time
+    "datetime", "time", "calendar", "zoneinfo",
+    # Serialization (safe subset)
+    "json", "csv", "base64", "hashlib", "hmac",
+    # Type system
+    "dataclasses", "enum", "typing", "types", "abc",
+    # Utilities
+    "copy", "pprint", "numbers",
+    "heapq", "bisect", "array",
+    "contextlib", "warnings",
 })
 
 
@@ -67,12 +54,12 @@ _REAL_IMPORT = builtins.__import__
 
 
 def _safe_import(name: str, *args, **kwargs):
-    """Restricted __import__ that blocks dangerous modules."""
+    """Restricted __import__ that only allows safe modules (allowlist)."""
     top_level = name.split(".")[0]
-    if top_level in _BLOCKED_MODULES:
+    if top_level not in _ALLOWED_MODULES:
         raise ImportError(
-            f"Module '{name}' is blocked in the CCR sandbox. "
-            f"Blocked modules: {', '.join(sorted(_BLOCKED_MODULES))}"
+            f"Module '{name}' is blocked in the CCR sandbox (not in allowlist). "
+            f"Allowed modules: {', '.join(sorted(_ALLOWED_MODULES))}"
         )
     return _REAL_IMPORT(name, *args, **kwargs)
 
@@ -699,20 +686,21 @@ class CCRRepl:
 
     @staticmethod
     def _scrub_module_builtins(namespace: dict) -> None:
-        """Scrub __builtins__ on imported modules to prevent escape between calls.
+        """Remove user-imported modules from the namespace to prevent escape.
 
-        After exec, any module the user imported has a __builtins__ dict that
-        may reference the real __import__. Replace it with our safe version.
+        Previously this replaced __import__ on shared module objects, but that
+        contaminates process-global module state (modules are singletons in
+        sys.modules). Instead, we remove module references from the namespace
+        so they can't be used between REPL calls.
         """
         import types
-        for val in namespace.values():
-            if isinstance(val, types.ModuleType):
-                try:
-                    b = getattr(val, "__builtins__", None)
-                    if isinstance(b, dict) and "__import__" in b:
-                        b["__import__"] = _safe_import
-                except (AttributeError, TypeError):
-                    pass
+        to_remove = [
+            k for k, v in namespace.items()
+            if isinstance(v, types.ModuleType) and not k.startswith("_")
+            and k not in ("__builtins__",)
+        ]
+        for k in to_remove:
+            del namespace[k]
 
     def _run_with_timeout(self, code: str, namespace: dict) -> None:
         """Execute code with a timeout using SIGALRM (Unix) or thread fallback.

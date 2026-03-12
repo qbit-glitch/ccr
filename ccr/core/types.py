@@ -187,6 +187,12 @@ class CCRConfig:
     log_max_lines: int = 500
     proactive_commits: bool = True
     index_max_file_size_kb: int = 500
+    # Hierarchical summary configuration (TiMem §3.1-3.2 adapted)
+    session_summary_interval: int = 5       # commits between session summaries (TiMem L2)
+    phase_summary_interval: int = 20        # commits on main before auto phase summary (TiMem L3-4)
+    session_summary_max_chars: int = 500    # max chars per session summary
+    phase_summary_max_items: int = 5        # max key accomplishments per phase summary
+    overview_staleness_threshold: int = 5   # phase summaries before suggesting overview regen
 
 
 @dataclass

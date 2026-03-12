@@ -18,10 +18,12 @@ from ccr.mcp_server import (
     ace_update_counters,
     gcc_branch,
     gcc_commit,
+    gcc_consolidate,
     gcc_context,
     gcc_log_ota,
     gcc_merge,
     gcc_status,
+    gcc_summaries,
     index_build,
     index_search,
     rlm_execute,
@@ -932,13 +934,20 @@ class TestToolAnnotations:
 
     @pytest.mark.parametrize("tool_name", [
         "gcc_commit", "ace_apply_delta", "ace_update_counters",
-        "rlm_init", "rlm_execute", "rlm_finalize",
+        "rlm_init", "rlm_execute",
     ])
     def test_mutating_non_destructive_tools(self, tool_name):
         ann = _get_tool_annotations(tool_name)
         assert ann.readOnlyHint is False, f"{tool_name} should be readOnlyHint=False"
         assert ann.destructiveHint is False, f"{tool_name} should be destructiveHint=False"
         assert ann.idempotentHint is False, f"{tool_name} should be idempotentHint=False"
+
+    def test_rlm_finalize_annotations(self):
+        """rlm_finalize is destructive — it cleans up the REPL and destroys session state."""
+        ann = _get_tool_annotations("rlm_finalize")
+        assert ann.readOnlyHint is False
+        assert ann.destructiveHint is True, "rlm_finalize destroys REPL session state"
+        assert ann.idempotentHint is False
 
     # -- ace_evolve_from_failures: idempotent due to evolved flag --
 
@@ -968,10 +977,79 @@ class TestToolAnnotations:
         assert ann.destructiveHint is False
         assert ann.idempotentHint is True
 
-    # -- All 18 tools have annotations --
+    # -- gcc_consolidate: not read-only, not destructive, not idempotent --
+
+    def test_gcc_consolidate_annotations(self):
+        ann = _get_tool_annotations("gcc_consolidate")
+        assert ann.readOnlyHint is False
+        assert ann.destructiveHint is False
+        assert ann.idempotentHint is False
+
+    # -- gcc_summaries: read-only, not destructive, idempotent --
+
+    def test_gcc_summaries_annotations(self):
+        ann = _get_tool_annotations("gcc_summaries")
+        assert ann.readOnlyHint is True
+        assert ann.destructiveHint is False
+        assert ann.idempotentHint is True
+
+    # -- All 20 tools have annotations --
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) == 18, f"Expected 18 tools, got {len(all_tools)}"
+        assert len(all_tools) == 20, f"Expected 20 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
+
+
+# ===========================================================================
+# GCC Hierarchical Summary MCP Tool Tests
+# ===========================================================================
+
+
+class TestGCCHierarchicalSummaryTools:
+    """Tests for gcc_consolidate and gcc_summaries MCP tools."""
+
+    def _make_commits(self, n):
+        for i in range(1, n + 1):
+            gcc_commit(
+                title=f"Task {i}",
+                what=f"Implemented feature {i}",
+                why=f"Milestone {i}",
+                files_changed=[f"src/mod{i}.py"],
+                next_step=f"Continue {i + 1}",
+                admission_threshold=1.0,
+            )
+
+    def test_gcc_consolidate_session(self):
+        self._make_commits(5)
+        result = gcc_consolidate(tier="session")
+        assert "Session Summary" in result
+
+    def test_gcc_consolidate_phase(self):
+        self._make_commits(5)
+        result = gcc_consolidate(tier="phase")
+        assert "Phase Summary" in result
+
+    def test_gcc_consolidate_project_prompt(self):
+        result = gcc_consolidate(tier="project")
+        assert "Please generate a project overview" in result
+
+    def test_gcc_consolidate_project_save(self):
+        result = gcc_consolidate(tier="project", content="Test project builds AI tools.")
+        assert "saved" in result.lower()
+
+    def test_gcc_summaries_all(self):
+        self._make_commits(5)
+        gcc_consolidate(tier="phase")
+        gcc_consolidate(tier="project", content="AI project overview")
+        result = gcc_summaries(tier="all", count=5)
+        assert "Session" in result or "Phase" in result or "Project" in result
+
+    def test_gcc_summaries_empty(self):
+        result = gcc_summaries(tier="all", count=5)
+        assert result  # Should return something, not crash
+
+    def test_gcc_summaries_count_bounded(self):
+        result = gcc_summaries(tier="all", count=0)
+        assert result  # count=0 should be bounded to 1

@@ -310,21 +310,25 @@ def _run():
                 return _real_open(resolved, mode, *args, **kwargs)
         raise PermissionError(f"Sandbox: access denied to {file}")
 
-    # Blocked import
-    _blocked_modules = frozenset({
-        "subprocess", "shutil", "signal", "ctypes", "multiprocessing",
-        "pty", "fcntl", "termios", "resource", "os", "sys", "socket",
-        "http", "urllib", "importlib", "pathlib", "glob", "webbrowser",
-        "code", "codeop", "io", "_thread", "threading", "asyncio",
-        "gc", "pickle", "marshal", "_io", "_posixsubprocess", "_ctypes",
-        "_socket", "struct", "copyreg", "_sitebuiltins", "builtins",
+    # Allowlist import — only these modules can be imported in the sandbox.
+    # Allowlist is safer than denylist: new stdlib modules are blocked by default.
+    _allowed_modules = frozenset({
+        "math", "decimal", "fractions", "statistics", "random",
+        "string", "re", "textwrap", "unicodedata", "difflib",
+        "collections", "functools", "itertools", "operator",
+        "datetime", "time", "calendar", "zoneinfo",
+        "json", "csv", "base64", "hashlib", "hmac",
+        "dataclasses", "enum", "typing", "types", "abc",
+        "copy", "pprint", "numbers",
+        "heapq", "bisect", "array",
+        "contextlib", "warnings",
     })
     _real_import = _builtins.__import__
 
     def _safe_import(name, *args, **kwargs):
         top_level = name.split(".")[0]
-        if top_level in _blocked_modules:
-            raise ImportError(f"Module '{name}' is blocked in the CCR sandbox")
+        if top_level not in _allowed_modules:
+            raise ImportError(f"Module '{name}' is blocked in the CCR sandbox (not in allowlist)")
         return _real_import(name, *args, **kwargs)
 
     _safe_builtins = {
