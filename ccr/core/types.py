@@ -180,6 +180,47 @@ class RLMResult:
 
 
 @dataclass
+class CommitLink:
+    """A heuristic cross-link between two GCC commits.
+
+    Taxonomy inspired by A-MEM (bidirectional links) and MAGMA (typed edges),
+    but uses mechanical heuristics instead of the papers' LLM inference and
+    dense vector embeddings. See CLAUDE.md "Limitations vs. Paper" for details.
+
+    Link types:
+        entity: Shared files touched (file-set Jaccard; cf. MAGMA entity graph
+                which uses LLM-extracted abstract entity nodes)
+        causal: Explicit commit ID reference in text (regex detection; cf. MAGMA
+                causal graph which uses LLM-inferred logical entailment)
+        supersession: Replacement language + commit ID (heuristic; no paper analog)
+        semantic: Keyword overlap above threshold (word Jaccard; cf. MAGMA semantic
+                  graph which uses dense vector cosine similarity)
+    """
+    target: str           # Commit ID (e.g., "C005")
+    link_type: str        # "entity" | "causal" | "supersession" | "semantic"
+    score: float = 0.0    # Similarity/relevance score (0-1)
+    shared_files: list[str] = field(default_factory=list)  # Entity links only
+    snippet: str = ""     # Triggering text for causal/supersession
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {"target": self.target, "score": self.score}
+        if self.shared_files:
+            d["shared_files"] = self.shared_files
+        if self.snippet:
+            d["snippet"] = self.snippet
+        return d
+
+    @classmethod
+    def from_dict(cls, link_type: str, d: dict) -> "CommitLink":
+        return cls(
+            target=d["target"], link_type=link_type,
+            score=d.get("score", 0.0),
+            shared_files=d.get("shared_files", []),
+            snippet=d.get("snippet", ""),
+        )
+
+
+@dataclass
 class CCRConfig:
     """Memory layer config."""
     recent_commit_count: int = 3
@@ -193,6 +234,11 @@ class CCRConfig:
     session_summary_max_chars: int = 500    # max chars per session summary
     phase_summary_max_items: int = 5        # max key accomplishments per phase summary
     overview_staleness_threshold: int = 5   # phase summaries before suggesting overview regen
+    # Heuristic commit cross-linking (A-MEM/MAGMA inspired taxonomy)
+    link_scan_window: int = 20            # recent commits to scan for links
+    link_semantic_threshold: float = 0.3  # min keyword Jaccard for semantic links
+    link_entity_threshold: float = 0.0    # min file Jaccard for entity links (any shared file)
+    link_max_results: int = 10            # max results from BFS link traversal
 
 
 @dataclass

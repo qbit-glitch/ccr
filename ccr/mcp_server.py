@@ -283,6 +283,7 @@ def gcc_context(
     search_term: str | None = None,
     commit_id: str | None = None,
     log_window: int = 0,
+    follow_links: bool = False,
 ) -> str:
     """Retrieve project memory at the specified depth.
 
@@ -291,7 +292,7 @@ def gcc_context(
         2: + rolling summary + last 3 commits
         3: + branch summary (purpose/hypothesis/conclusion)
         4: + last 10 commits
-        5: + specific commit by ID or keyword search
+        5: + specific commit by ID or keyword search + cross-links
 
     Use level 2 at session start for grounding. Use level 5 with
     search_term to find specific past work.
@@ -301,6 +302,7 @@ def gcc_context(
         search_term: Keyword to search commits (level 5 only).
         commit_id: Specific commit ID to retrieve (level 5 only).
         log_window: Number of recent OTA log entries to include.
+        follow_links: If True and level >= 5, include linked commit summaries (1-hop BFS).
     """
     with _state_lock:
         mem = _ensure_memory()
@@ -309,7 +311,66 @@ def gcc_context(
         search_term=search_term,
         commit_id=commit_id,
         log_window=log_window,
+        follow_links=follow_links,
     )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_links(
+    commit_id: str,
+    link_types: str | None = None,
+    max_hops: int = 1,
+) -> str:
+    """Retrieve cross-links for a commit.
+
+    Shows which other commits are related via shared files (entity),
+    explicit C### references (causal), replacement language (supersession),
+    or keyword overlap (semantic). Useful for tracing the evolution of
+    a feature or understanding why a decision was made.
+
+    Link taxonomy inspired by A-MEM (bidirectional links) and MAGMA (typed
+    edges), but uses mechanical heuristics — not the papers' LLM inference
+    or dense vector embeddings. See CLAUDE.md for limitations.
+
+    Args:
+        commit_id: The commit to look up (e.g., "C012").
+        link_types: Comma-separated link types to filter (default: all).
+                    Options: entity, causal, supersession, semantic.
+        max_hops: How many link hops to traverse (1 = direct, 2 = friends-of-friends).
+    """
+    with _state_lock:
+        mem = _ensure_memory()
+    types = [t.strip() for t in link_types.split(",")] if link_types else None
+    linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops)
+    if not linked:
+        # Still show direct link summary even if BFS returned nothing
+        direct = mem.get_commit_links(commit_id)
+        if any(v for v in direct.values()):
+            return mem._format_links_for_context(commit_id, direct)
+        return f"No links found for {commit_id}."
+    # Group by link type for readability
+    lines = [f"# Links for {commit_id} (max_hops={max_hops})"]
+    by_type: dict[str, list[dict]] = {}
+    for entry in linked:
+        by_type.setdefault(entry["link_type"], []).append(entry)
+    for lt in ("entity", "causal", "supersession", "semantic"):
+        entries = by_type.get(lt, [])
+        if not entries:
+            continue
+        lines.append(f"\n## {lt.capitalize()} Links")
+        for e in entries:
+            hop_tag = f" (hop {e['hop']})" if e.get("hop", 1) > 1 else ""
+            title = e.get("title", "")
+            what = e.get("what", "")[:120]
+            detail = ""
+            if lt == "entity" and e.get("shared_files"):
+                detail = f" | shared: {', '.join(e['shared_files'])}"
+            elif lt in ("causal", "supersession") and e.get("snippet"):
+                detail = f' | "{e["snippet"]}"'
+            lines.append(f"- **[{e['id']}]**{hop_tag} {title}{detail}")
+            if what:
+                lines.append(f"  {what}")
+    return "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

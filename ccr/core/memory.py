@@ -16,6 +16,7 @@ GCC paper features:
 from __future__ import annotations
 
 import fcntl
+import json
 import math
 import os
 import re
@@ -29,7 +30,7 @@ from typing import Any
 
 import yaml
 
-from ccr.core.types import CCRConfig
+from ccr.core.types import CCRConfig, CommitLink
 
 # --- Templates (from open-gcc bootstrap.ts) ---
 
@@ -395,6 +396,16 @@ class MemoryManager:
         # Git commit integration
         self._git_commit(f"ccr: {title}")
 
+        # Heuristic commit cross-linking (A-MEM/MAGMA inspired taxonomy)
+        try:
+            commit_links = self._compute_links(
+                branch, commit_id, title, what, why, files_changed, next_step,
+            )
+            if commit_links:
+                self._update_links(commit_id, commit_links)
+        except Exception:
+            pass  # Linking is supplementary — never fail the commit
+
         # TiMem §3.2.2: Check if session summary should be generated
         self._maybe_generate_session_summary(branch)
 
@@ -465,6 +476,339 @@ class MemoryManager:
             return 0.0
         union = a | b
         return len(a & b) / len(union) if union else 0.0
+
+    # --- Heuristic Commit Cross-Linking (A-MEM/MAGMA inspired taxonomy) ---
+    # Uses mechanical heuristics (file overlap, regex, word Jaccard) instead of
+    # the papers' LLM inference (A-MEM Eq. 6, MAGMA Eq. 8) and dense vector
+    # embeddings (A-MEM Eq. 4, MAGMA semantic graph). MAGMA's temporal graph
+    # (immutable chronological chain) is implicit in sequential commit IDs.
+    # MAGMA's adaptive beam search (Alg. 1) is replaced with plain BFS.
+    # A-MEM's memory evolution (Eq. 7) is not implemented.
+
+    _LINK_TYPES = ("entity", "causal", "supersession", "semantic")
+    _STOP_WORDS = frozenset({
+        # Articles & determiners
+        "the", "a", "an", "this", "that", "these", "those", "some", "any",
+        "each", "every", "all", "both", "few", "more", "most", "other",
+        # Prepositions
+        "to", "for", "of", "in", "on", "at", "by", "from", "into", "about",
+        "between", "through", "during", "before", "after", "above", "below",
+        "up", "out", "off", "over", "under", "again", "further", "then",
+        # Conjunctions
+        "and", "or", "but", "nor", "yet", "so", "if", "when", "while",
+        "because", "although", "than",
+        # Pronouns
+        "it", "its", "they", "them", "their", "we", "our", "you", "your",
+        "he", "she", "his", "her", "who", "which", "what", "how",
+        # Be/have/do
+        "is", "are", "was", "were", "be", "been", "being",
+        "has", "have", "had", "having",
+        "do", "does", "did", "doing",
+        # Modals
+        "will", "would", "can", "could", "shall", "should", "may", "might",
+        "must",
+        # Common adverbs/adjectives
+        "not", "no", "just", "also", "very", "only", "now", "here", "there",
+        "where", "still", "already",
+        # Common verbs (too generic for keywords)
+        "get", "got", "set", "use", "used", "using", "make", "made",
+    })
+    _SUPERSESSION_KEYWORDS = re.compile(
+        r"(?:replaced|superseded|reverted|refactored\s+from|deprecated|reworked|improved\s+upon)",
+        re.IGNORECASE,
+    )
+    _COMMIT_ID_RE = re.compile(r"\b(C\d{3,})\b")
+
+    def _get_links_path(self) -> str:
+        return os.path.join(self.ccr_root, "commit_links.json")
+
+    def _load_links(self) -> dict:
+        """Load the commit link graph from JSON. Returns default if missing/corrupt."""
+        path = self._get_links_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+        if not raw:
+            return {"version": 1, "links": {}}
+        try:
+            data = json.loads(raw)
+            if not isinstance(data.get("links"), dict):
+                return {"version": 1, "links": {}}
+            return data
+        except (json.JSONDecodeError, TypeError):
+            return {"version": 1, "links": {}}
+
+    def _save_links(self, data: dict) -> None:
+        """Atomically save the commit link graph."""
+        path = self._get_links_path()
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        with self._locks[path], self._file_lock(path):
+            self._write_file_unlocked(path, content)
+
+    def _update_links(self, commit_id: str, links: list[CommitLink]) -> None:
+        """Load, modify, and save links under a single lock (avoids TOCTOU)."""
+        path = self._get_links_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+            if not raw:
+                data: dict = {"version": 1, "links": {}}
+            else:
+                try:
+                    data = json.loads(raw)
+                    if not isinstance(data.get("links"), dict):
+                        data = {"version": 1, "links": {}}
+                except (json.JSONDecodeError, TypeError):
+                    data = {"version": 1, "links": {}}
+            for cl in links:
+                self._add_link(data, commit_id, cl.target, cl)
+            content = json.dumps(data, indent=2, ensure_ascii=False)
+            self._write_file_unlocked(path, content)
+
+    @staticmethod
+    def _add_link(data: dict, source: str, target: str, link: CommitLink) -> None:
+        """Add a bidirectional link (A-MEM Zettelkasten). Deduplicates by higher score."""
+        for src, tgt in [(source, target), (target, source)]:
+            node = data["links"].setdefault(src, {})
+            bucket = node.setdefault(link.link_type, [])
+            # Dedup: if same target exists, keep higher score
+            for existing in bucket:
+                if existing["target"] == tgt:
+                    if link.score > existing.get("score", 0.0):
+                        update: dict[str, Any] = {"target": tgt, "score": link.score}
+                        if link.shared_files:
+                            update["shared_files"] = link.shared_files
+                        if link.snippet:
+                            update["snippet"] = link.snippet
+                        existing.update(update)
+                    break
+            else:
+                entry = link.to_dict()
+                entry["target"] = tgt
+                bucket.append(entry)
+
+    @staticmethod
+    def _extract_commit_references(text: str) -> list[str]:
+        """Extract all commit ID references (C###) from text."""
+        return re.findall(r"\b(C\d{3,})\b", text)
+
+    @classmethod
+    def _detect_supersession(cls, text: str) -> list[tuple[str, str]]:
+        """Detect replacement language near commit IDs.
+
+        Returns list of (commit_id, snippet) tuples.
+        """
+        results = []
+        for m in cls._COMMIT_ID_RE.finditer(text):
+            cid = m.group(1)
+            # Check within 120 chars on either side for replacement keywords
+            start = max(0, m.start() - 120)
+            end = min(len(text), m.end() + 120)
+            window = text[start:end]
+            if cls._SUPERSESSION_KEYWORDS.search(window):
+                # Extract a concise snippet around the match
+                snippet = text[max(0, m.start() - 40):min(len(text), m.end() + 40)].strip()
+                results.append((cid, snippet))
+        return results
+
+    @classmethod
+    def _extract_keywords(cls, text: str) -> set[str]:
+        """Extract keywords from text, filtering stop words, short tokens, and pure digits."""
+        return {w for w in re.findall(r"\w+", text.lower())
+                if w not in cls._STOP_WORDS and len(w) > 2 and not w.isdigit()}
+
+    def _compute_links(
+        self,
+        branch: str,
+        commit_id: str,
+        title: str,
+        what: str,
+        why: str,
+        files_changed: list[str],
+        next_step: str,
+    ) -> list[CommitLink]:
+        """Compute heuristic cross-links for a new commit against recent history.
+
+        All linking is mechanical (zero LLM calls). Scans the last k commits
+        (config.link_scan_window, default 20) — NOT global retrieval across
+        all history. Commits older than the window are never scanned.
+
+        Link types:
+        1. Entity links: file-set Jaccard > threshold (cf. MAGMA entity graph
+           which uses LLM-extracted abstract entity nodes — we use file paths)
+        2. Causal links: regex detection of C### IDs in text, validated against
+           existing commits (cf. MAGMA causal graph which uses LLM inference
+           for implicit causality — we only detect explicit references)
+        3. Supersession links: replacement language + C### (heuristic, no paper analog)
+        4. Semantic links: word Jaccard > threshold (cf. MAGMA semantic graph
+           which uses dense vector cosine similarity — we use bag-of-words)
+
+        MAGMA's temporal graph (immutable chronological chain) is implicit in
+        sequential commit IDs and not stored as explicit links.
+        """
+        recent = self._parse_recent_commit_data(branch, k=self.config.link_scan_window)
+        if not recent:
+            return []
+
+        new_files = {f.strip().lower() for f in files_changed if f.strip()}
+        combined_text = f"{title} {what} {why} {next_step}"
+        new_keywords = self._extract_keywords(combined_text)
+
+        # Pre-compute causal and supersession references from the new commit's text
+        all_refs = set(self._extract_commit_references(combined_text))
+        supersession_hits = {cid: snip for cid, snip in self._detect_supersession(combined_text)}
+
+        # Validate: only keep references to commits that actually exist
+        existing_ids = {c.get("id", "") for c in recent if c.get("id")}
+        all_refs = all_refs & existing_ids
+        supersession_hits = {k: v for k, v in supersession_hits.items() if k in existing_ids}
+
+        links: list[CommitLink] = []
+
+        for commit in recent:
+            cid = commit.get("id", "")
+            if not cid or cid == commit_id:
+                continue
+
+            has_typed_link = False  # Track if entity/causal/supersession already found
+
+            # 1. Entity links (shared files)
+            old_files = {f.strip().lower() for f in commit.get("files", []) if f.strip()}
+            file_sim = self._jaccard(new_files, old_files)
+            if file_sim > self.config.link_entity_threshold:
+                shared = sorted(new_files & old_files)
+                links.append(CommitLink(
+                    target=cid, link_type="entity", score=round(file_sim, 3),
+                    shared_files=shared,
+                ))
+                has_typed_link = True
+
+            # 2 & 3. Causal / supersession links
+            if cid in supersession_hits:
+                # Supersession subsumes causal
+                links.append(CommitLink(
+                    target=cid, link_type="supersession", score=1.0,
+                    snippet=supersession_hits[cid],
+                ))
+                has_typed_link = True
+            elif cid in all_refs:
+                # Pure causal reference
+                # Extract snippet around the reference
+                idx = combined_text.find(cid)
+                snippet = combined_text[max(0, idx - 40):min(len(combined_text), idx + len(cid) + 40)].strip()
+                links.append(CommitLink(
+                    target=cid, link_type="causal", score=1.0,
+                    snippet=snippet,
+                ))
+                has_typed_link = True
+
+            # 4. Semantic links (only if no other link type to this target)
+            if not has_typed_link:
+                old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
+                old_keywords = self._extract_keywords(old_text)
+                kw_sim = self._jaccard(new_keywords, old_keywords)
+                if kw_sim > self.config.link_semantic_threshold:
+                    links.append(CommitLink(
+                        target=cid, link_type="semantic", score=round(kw_sim, 3),
+                    ))
+
+        return links
+
+    def get_commit_links(self, commit_id: str) -> dict[str, list[dict]]:
+        """Retrieve all cross-links for a commit.
+
+        Returns dict with keys per link type, each containing a list of link dicts.
+        """
+        data = self._load_links()
+        node = data.get("links", {}).get(commit_id, {})
+        result: dict[str, list[dict]] = {}
+        for lt in self._LINK_TYPES:
+            result[lt] = node.get(lt, [])
+        return result
+
+    def get_linked_commits(
+        self,
+        commit_id: str,
+        link_types: list[str] | None = None,
+        max_hops: int = 1,
+    ) -> list[dict]:
+        """BFS traversal of commit links up to max_hops deep.
+
+        Returns list of dicts: {id, link_type, score, hop, title, what}.
+        Caps at config.link_max_results (default 10) to avoid context explosion.
+
+        Note: This is plain BFS, not MAGMA's intent-aware beam search (Alg. 1,
+        Eq. 5-6). No query-dependent edge weighting or transition scoring.
+        """
+        data = self._load_links()
+        branch = self.get_active_branch()
+        types = set(link_types) if link_types else set(self._LINK_TYPES)
+        visited = {commit_id}
+        frontier = [commit_id]
+        results: list[dict] = []
+
+        for hop in range(1, max_hops + 1):
+            next_frontier: list[str] = []
+            for src in frontier:
+                node = data.get("links", {}).get(src, {})
+                for lt in types:
+                    for link_entry in node.get(lt, []):
+                        tgt = link_entry.get("target", "")
+                        if tgt in visited:
+                            continue
+                        visited.add(tgt)
+                        # Fetch commit data for context
+                        commit_text = self._find_commit_by_id(branch, tgt)
+                        parsed = self._parse_commit_block(commit_text) if commit_text else {}
+                        results.append({
+                            "id": tgt,
+                            "link_type": lt,
+                            "score": link_entry.get("score", 0.0),
+                            "hop": hop,
+                            "title": parsed.get("title", ""),
+                            "what": parsed.get("what", ""),
+                            **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
+                        })
+                        next_frontier.append(tgt)
+                        if len(results) >= self.config.link_max_results:
+                            return results
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        return results
+
+    @staticmethod
+    def _parse_commit_block(text: str) -> dict:
+        """Parse a single commit block (Markdown) into a dict with title/what/why."""
+        result: dict[str, str] = {}
+        title_match = re.search(r"\[C\d{3,}\]\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*\|\s*branch:[\w-]+\s*\|\s*(.*)", text)
+        if title_match:
+            result["title"] = title_match.group(1).strip()
+        for field in ("What", "Why", "Files", "Next"):
+            m = re.search(rf"\*\*{field}\*\*:\s*(.*?)(?=\n\*\*(?:What|Why|Files|Next|Score|OTA)\*\*|\n##|\Z)", text, re.DOTALL)
+            if m:
+                result[field.lower()] = m.group(1).strip()
+        return result
+
+    def _format_links_for_context(self, commit_id: str, links: dict[str, list[dict]]) -> str:
+        """Format commit links as Markdown for gcc_context output."""
+        lines = [f"# Links for {commit_id}"]
+        for lt in self._LINK_TYPES:
+            entries = links.get(lt, [])
+            if not entries:
+                continue
+            parts = []
+            for e in entries:
+                tgt = e.get("target", "?")
+                if lt == "entity":
+                    shared = ", ".join(e.get("shared_files", []))
+                    parts.append(f"{tgt} (shared: {shared})" if shared else tgt)
+                elif lt in ("causal", "supersession"):
+                    snippet = e.get("snippet", "")
+                    parts.append(f'{tgt} ("{snippet}")' if snippet else tgt)
+                else:
+                    parts.append(f"{tgt} (score: {e.get('score', 0):.2f})")
+            lines.append(f"- **{lt.capitalize()}**: {', '.join(parts)}")
+        return "\n".join(lines)
 
     # --- Commit Type Classification (A-MAC §3.2 Factor 5: Type Prior T(m)) ---
 
@@ -621,10 +965,8 @@ class MemoryManager:
             }
 
         # --- Similarity computation: max over all k commits (Eq. 3) ---
-        stop_words = {"the", "a", "an", "is", "was", "to", "for", "of", "in", "on", "with", "and", "or", "but"}
         new_files = {f.strip().lower() for f in files_changed if f.strip()}
-        new_text = f"{title} {what} {why}".lower()
-        new_words = {w for w in re.findall(r"\w+", new_text) if w not in stop_words and len(w) > 2}
+        new_words = self._extract_keywords(f"{title} {what} {why}")
 
         best_similarity = 0.0
         best_file_sim = 0.0
@@ -637,8 +979,9 @@ class MemoryManager:
             old_files = {f.strip().lower() for f in commit.get("files", []) if f.strip()}
             file_sim = self._jaccard(new_files, old_files)
 
-            old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
-            old_words = {w for w in re.findall(r"\w+", old_text) if w not in stop_words and len(w) > 2}
+            old_words = self._extract_keywords(
+                f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}"
+            )
             keyword_sim = self._jaccard(new_words, old_words)
 
             # Raw content similarity
@@ -1004,6 +1347,7 @@ class MemoryManager:
         offset: int = 0,
         log_window: int = 0,
         metadata_segment: str | None = None,
+        follow_links: bool = False,
     ) -> str:
         """Multi-level context retrieval with windowing support.
 
@@ -1011,12 +1355,13 @@ class MemoryManager:
         Level 2: + last 3 commits from active branch (windowed by offset)
         Level 3: + branch summary.md (purpose/hypothesis/conclusion)
         Level 4: + last 10 commits (windowed by offset)
-        Level 5: + specific commit by ID or keyword search
+        Level 5: + specific commit by ID or keyword search + cross-links
 
         Args:
             offset: Scroll position for commit window (0 = most recent)
             log_window: Number of recent OTA log entries to include (0 = none)
             metadata_segment: Metadata key to include (e.g. "file_tree", "dependencies")
+            follow_links: If True and level >= 5, include linked commit summaries (BFS 1-hop)
         """
         branch = branch or self.get_active_branch()
         parts = []
@@ -1081,11 +1426,23 @@ class MemoryManager:
                 parts.append("\n".join(phase_lines))
 
         if level >= 5:
-            # Level 5: specific commit or search
+            # Level 5: specific commit or search + cross-links
             if commit_id:
                 found = self._find_commit_by_id(branch, commit_id)
                 if found:
                     parts.append(f"# Commit {commit_id}\n{found}")
+                    # Show heuristic cross-links
+                    commit_links_data = self.get_commit_links(commit_id)
+                    if any(v for v in commit_links_data.values()):
+                        parts.append(self._format_links_for_context(commit_id, commit_links_data))
+                    # Optionally include linked commit summaries
+                    if follow_links:
+                        linked = self.get_linked_commits(commit_id, max_hops=1)
+                        for lc in linked[:5]:
+                            parts.append(
+                                f"## Linked: [{lc['id']}] {lc.get('title', '')} ({lc['link_type']})\n"
+                                f"**What**: {lc.get('what', '')}"
+                            )
             elif search_term:
                 results = self._search_commits(branch, search_term)
                 if results:

@@ -20,6 +20,7 @@ from ccr.mcp_server import (
     gcc_commit,
     gcc_consolidate,
     gcc_context,
+    gcc_links,
     gcc_log_ota,
     gcc_merge,
     gcc_status,
@@ -993,13 +994,60 @@ class TestToolAnnotations:
         assert ann.destructiveHint is False
         assert ann.idempotentHint is True
 
-    # -- All 20 tools have annotations --
+    # -- All 21 tools have annotations --
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) == 20, f"Expected 20 tools, got {len(all_tools)}"
+        assert len(all_tools) == 21, f"Expected 21 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
+
+
+# ===========================================================================
+# GCC Commit Links MCP Tool Tests
+# ===========================================================================
+
+
+class TestGccLinks:
+    """Tests for gcc_links MCP tool and gcc_context follow_links."""
+
+    def test_gcc_links_basic(self):
+        gcc_commit("Setup", "Created server", "Need infra",
+                   ["mcp_server.py"], "Next", admission_threshold=1.0)
+        gcc_commit("Fix server", "Fixed bug in server",
+                   "Bug discovered in C001", ["mcp_server.py"], "Test",
+                   admission_threshold=1.0)
+        result = gcc_links("C002")
+        assert "C001" in result
+        assert "Links for C002" in result
+
+    def test_gcc_links_no_links(self):
+        result = gcc_links("C999")
+        assert "No links found" in result
+
+    def test_gcc_links_filtered_types(self):
+        gcc_commit("A", "X", "Y", ["shared.py"], "N", admission_threshold=1.0)
+        gcc_commit("B", "X", "Y", ["shared.py"], "N", admission_threshold=1.0)
+        result = gcc_links("C002", link_types="entity")
+        assert "Entity" in result
+
+    def test_gcc_links_multi_hop(self):
+        gcc_commit("A", "X", "Y", ["a.py"], "N", admission_threshold=1.0)
+        gcc_commit("B", "Refs C001", "See C001", ["b.py"], "N",
+                   admission_threshold=1.0)
+        gcc_commit("C", "Refs C002", "See C002", ["c.py"], "N",
+                   admission_threshold=1.0)
+        result = gcc_links("C001", max_hops=2)
+        # Should reach C003 via C002 -> C003 (hop 2)
+        assert "C002" in result
+
+    def test_gcc_context_follow_links(self):
+        gcc_commit("A", "Created server module", "Foundation",
+                   ["server.py"], "Next", admission_threshold=1.0)
+        gcc_commit("B", "Extended server module", "Build on A",
+                   ["server.py"], "Test", admission_threshold=1.0)
+        result = gcc_context(level=5, commit_id="C001", follow_links=True)
+        assert "Linked:" in result
 
 
 # ===========================================================================

@@ -41,7 +41,7 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
 
 ```
 ccr/
-  mcp_server.py     # MCP server: all 20 tools (GCC + ACE + RLM + Index)
+  mcp_server.py     # MCP server: all 21 tools (GCC + ACE + RLM + Index)
   hooks/
     on_session_start.py  # Injects playbook + context on UserPromptSubmit
     on_session_end.py    # Logs session end OTA
@@ -88,8 +88,9 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ## Key Patterns
 
-- **MCP server**: 20 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
+- **MCP server**: 21 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
 - **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.60·Novelty + 0.40·TypePrior. Algorithm 1 with S(m) vs S(m_conflict) comparison, recency-modulated FindConflict (sim threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
+- **Heuristic commit cross-linking** (A-MEM/MAGMA inspired taxonomy): When `gcc_commit` creates a new entry, scans recent commits for overlap and stores bidirectional cross-links in `.ccr/commit_links.json`. Four link types: entity (file-set Jaccard), causal (regex C### detection), supersession (replacement language), semantic (word Jaccard). `gcc_links` tool traverses via BFS; `gcc_context` level 5 shows links. All mechanical — zero LLM calls.
 - **Two-tier playbook**: Global (`~/.ccr/global_playbook.txt`) + project (`.ccr/playbook.txt`). All ACE tools accept `scope="global"|"project"`. Cross-tier similarity detection via `ace_find_similar(scope="cross")`.
 - **Temporal decay**: Bullet counters decay via `effective_score = raw * 0.95^days`. Unused 30d → 21%, 90d → 1%. `last_updated` persisted in companion JSON. Budget pruning uses effective scores.
 - **Playbook evolution**: ACE playbook with helpful/harmful counters. Claude Code reflects and curates — no sub-model needed.
@@ -140,6 +141,27 @@ ccr status                                   # Show memory state
    - Hierarchical scope (general/task_specific), when_to_apply per SkillRL Table 5
    - Idempotent evolution with `evolved` flag, dedup against existing bullets
    - Extended data in `.ccr/failure_lessons.json` (backward-compatible format)
+
+5. **A-MEM** (arXiv:2502.12110) + **MAGMA** (arXiv:2601.03236): Commit cross-linking taxonomy
+   - Bidirectional links inspired by A-MEM's Zettelkasten architecture
+   - Four link types inspired by MAGMA's multi-graph edge taxonomy
+   - See "Limitations vs. Paper" below for what is NOT implemented
+
+## Limitations vs. Paper (Commit Cross-Linking)
+
+All commit linking is **mechanical heuristics** (zero LLM calls). Key gaps vs. papers:
+
+| Paper Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| A-MEM link generation (§3.2, Eq. 4-6) | Dense vector cosine similarity + LLM analysis | Word Jaccard + regex |
+| A-MEM memory evolution (§3.3, Eq. 7) | LLM rewrites existing memories on new info | Not implemented (commits immutable) |
+| MAGMA temporal graph (§3.2) | Immutable chronological chain | Implicit in sequential C### IDs, not stored as links |
+| MAGMA causal graph (§3.2, Eq. 8) | LLM-inferred logical entailment | Regex detection of explicit C### references only |
+| MAGMA semantic graph (§3.2) | Dense vector cosine (all-MiniLM-L6-v2) | Word Jaccard with ~100-word stop list |
+| MAGMA entity graph (§3.2) | Abstract entity nodes (people, orgs) via LLM | File-path overlap (Jaccard) |
+| MAGMA adaptive traversal (§3.3, Alg. 1) | Intent-aware beam search with Eq. 5-6 | Plain BFS with configurable result cap. **Largest ablation impact in MAGMA (Table 3)** — removing adaptive traversal caused the biggest performance drop |
+| MAGMA fast/slow paths (§3.4) | Sync ingestion + async LLM consolidation | Sync only (all in commit path) |
+| Link scan scope | Global retrieval across all memories | Fixed sliding window (`link_scan_window`, default 20 most recent commits). Older commits are never scanned for links at commit time |
 
 ## ACE Playbook Format
 
