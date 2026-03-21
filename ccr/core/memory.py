@@ -596,14 +596,20 @@ class MemoryManager:
             return None
         import numpy as np  # soft dep -- only reachable when ONNX available
         try:
+            # embed_query is expensive ONNX inference — run outside the lock
             vec = model.embed_query(text)
-            cache = load_embeddings(self._get_commit_embeddings_path())
-            cache[commit_id] = vec.tolist()
-            cap = self.config.link_scan_window * 2
-            if len(cache) > cap:
-                for old_id in sorted(cache.keys())[: len(cache) - cap]:
-                    del cache[old_id]
-            save_embeddings(cache, self._get_commit_embeddings_path())
+            path = self._get_commit_embeddings_path()
+            with self._locks[path], self._file_lock(path):
+                cache = load_embeddings(path)
+                cache[commit_id] = vec.tolist()
+                cap = self.config.link_scan_window * 2
+                if len(cache) > cap:
+                    for old_id in sorted(
+                        cache.keys(),
+                        key=lambda c: int(re.search(r"\d+$", c).group()) if re.search(r"\d+$", c) else 0,
+                    )[: len(cache) - cap]:
+                        del cache[old_id]
+                save_embeddings(cache, path)
             return vec
         except Exception:
             return None

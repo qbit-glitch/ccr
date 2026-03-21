@@ -1648,9 +1648,12 @@ class TestCommitEmbeddings:
         from ccr.context.embeddings import load_embeddings
         cache = load_embeddings(memory._get_commit_embeddings_path())
         assert len(cache) == cap
-        # Oldest evicted: C000..C004 should be gone
-        assert "C000" not in cache
-        assert "C004" not in cache
+        # All evicted IDs (C000-C004) are gone
+        for i in range(5):
+            assert f"C{i:03d}" not in cache
+        # All retained IDs are present
+        for i in range(5, cap + 5):
+            assert f"C{i:03d}" in cache
 
     def test_load_commit_embeddings_returns_ndarrays(self, memory):
         """_load_commit_embeddings converts list[float] -> np.ndarray."""
