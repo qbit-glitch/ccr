@@ -1574,6 +1574,17 @@ class TestRollingSummaryCompressionPrompt:
         assert "compressed_summary" in result
         assert "gcc_consolidate" in result
 
+    def test_warning_includes_current_summary_inline(self, memory):
+        """Compression prompt includes the actual summary so Claude Code
+        doesn't need an extra round-trip to retrieve it."""
+        # Base must exceed 1200 chars even after a new entry is appended
+        summary = "x" * 1200 + " important context here"
+        memory._write_rolling_summary("main", summary)
+        result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
+        assert "important context here" in result
+        # Should show the summary between delimiters
+        assert "---" in result
+
 
 class TestCommitEmbeddings:
     """Tests for ONNX commit embedding cache."""

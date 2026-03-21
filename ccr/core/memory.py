@@ -458,11 +458,11 @@ class MemoryManager:
         if len(current_summary) > summary_compression_threshold and compressed_summary is None:
             result += (
                 f"\n\n\u26a0\ufe0f Rolling summary is getting long ({len(current_summary)} chars). "
-                f"To preserve summary quality (GCC paper S_t = f(S_{{t-1}}, D_t)), "
-                f"call gcc_commit with compressed_summary= containing a concise "
-                f"compression of the current rolling summary, or call gcc_consolidate "
-                f"to compress project memory. Without compression, the summary will "
-                f"degrade to structured truncation."
+                f"Call gcc_commit again with compressed_summary='<your 2-3 sentence synthesis>'. "
+                f"Current summary to compress:\n\n---\n{current_summary}\n---\n\n"
+                f"Write a concise synthesis capturing key decisions and current direction, "
+                f"then pass it as compressed_summary= in your next gcc_commit call. "
+                f"Alternatively, call gcc_consolidate to compress project memory."
             )
 
         return result

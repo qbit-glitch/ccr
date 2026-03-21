@@ -23,7 +23,7 @@ from mcp.types import ToolAnnotations
 from ccr.ace.playbook import DeltaOperation, FailureLesson, Playbook, parse_delta_operations
 from ccr.context.indexer import RepoIndex
 from ccr.core.memory import MemoryManager
-from ccr.core.types import CCRConfig
+from ccr.core.types import CCRConfig, PlaybookSchema, SchemaMetrics
 from ccr.rlm.repl import CCRRepl
 
 # ---------------------------------------------------------------------------
@@ -43,6 +43,10 @@ _global_playbook_path: str = ""
 _global_failure_lessons_path: str = ""
 _repo_index: RepoIndex | None = None
 _repl: CCRRepl | None = None
+_schema_path: str = ""
+_global_schema_path: str = ""
+_embedding_model: object | None = None  # EmbeddingModel when available
+_embeddings_path: str = ""
 
 mcp = FastMCP(
     "ccr",
@@ -59,6 +63,8 @@ def _init(project_root: str | None = None) -> None:
     """Initialize all subsystems for the given project root."""
     global _project_root, _memory, _playbook, _playbook_path, _failure_lessons_path
     global _global_playbook, _global_playbook_path, _global_failure_lessons_path, _repo_index
+    global _schema_path, _global_schema_path
+    global _embedding_model, _embeddings_path
 
     _project_root = os.path.abspath(project_root or os.getcwd())
     _memory = MemoryManager(_project_root, CCRConfig())
@@ -83,8 +89,19 @@ def _init(project_root: str | None = None) -> None:
     _global_failure_lessons_path = os.path.join(global_ccr, "global_failure_lessons.json")
     _global_playbook = _load_global_playbook()
 
+    # Schema paths (MCE-inspired schema evolution)
+    _schema_path = os.path.join(_project_root, ".ccr", "playbook_schema.json")
+    _global_schema_path = os.path.join(global_ccr, "global_playbook_schema.json")
+
+    # Embeddings path (A-RAG semantic search)
+    _embeddings_path = os.path.join(_project_root, ".ccr", "index_embeddings.json.gz")
+
     # Build repo index
     _repo_index = RepoIndex.build(_project_root)
+
+    # Load cached embeddings if available
+    if os.path.isfile(_embeddings_path):
+        _repo_index.load_embeddings(_embeddings_path)
 
     # Cache index
     try:
@@ -154,6 +171,40 @@ def _save_global_playbook() -> None:
             _global_playbook.save_failure_lessons(_global_failure_lessons_path)
 
 
+def _load_schema(path: str) -> PlaybookSchema:
+    """Load schema from JSON or return default (MCE schema persistence)."""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            return PlaybookSchema.from_dict(data.get("current", {}))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    return PlaybookSchema.default()
+
+
+def _load_schema_history(path: str) -> list[dict]:
+    """Load schema version history from JSON."""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            return data.get("history", [])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    return []
+
+
+def _save_schema(schema: PlaybookSchema, history: list[dict], path: str) -> None:
+    """Save schema + version history to JSON via atomic write."""
+    data = {
+        "current": schema.to_dict(),
+        "history": history,
+        "next_version": schema.version + 1,
+    }
+    _atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
+
+
 def _ensure_global_playbook() -> Playbook:
     if _global_playbook is None:
         _init()
@@ -194,8 +245,10 @@ def gcc_commit(
     why: str,
     files_changed: list[str],
     next_step: str,
+    patterns_learned: list[str] | None = None,
     admission_threshold: float = 0.85,
     rejection_threshold: float = 0.0,
+    compressed_summary: str | None = None,
 ) -> str:
     """Commit progress to project memory.
 
@@ -216,17 +269,37 @@ def gcc_commit(
        - If S(m) <= S(m_conflict) → merge into existing
     6. Otherwise → create new commit
 
+    Rolling summary compression (GCC paper G4 fix):
+    When the rolling summary exceeds 1200 chars, the return value includes a
+    compression prompt. To restore the GCC paper's S_t = f(S_{t-1}, D_t)
+    property, compress the summary and pass it back via compressed_summary on
+    your next gcc_commit call. This two-call pattern mirrors gcc_consolidate's
+    project tier — Claude Code acts as the LLM that compresses the summary.
+
     Args:
+        patterns_learned: Optional list of transferable patterns/skills observed
+            during this task (CER-inspired, arXiv:2506.06698). Abstract and
+            parameterized, e.g., "When adding {feature_type}, update tests +
+            docs + CLAUDE.md together". Patterns are deduped against the existing
+            buffer and tracked across commits. Recurring patterns (3+ commits)
+            are suggested for ACE playbook promotion.
         admission_threshold: Similarity score (0-1) above which FindConflict
             detects a conflict. Default 0.85 per paper §3.3. Set to 1.0 to disable.
         rejection_threshold: Admission score below which commits are rejected.
             Default 0.0 (disabled). Low score = low value = reject.
+        compressed_summary: Optional LLM-compressed rolling summary. When
+            provided, replaces the mechanical rolling summary entirely. Use this
+            to respond to the compression prompt — compress the current summary
+            into a concise paragraph capturing project context, key milestones,
+            and current direction. Max 1500 chars.
     """
     try:
         with _state_lock:
             mem = _ensure_memory()
             return mem.commit(title, what, why, files_changed, next_step,
-                              admission_threshold, rejection_threshold)
+                              patterns_learned,
+                              admission_threshold, rejection_threshold,
+                              compressed_summary)
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -484,6 +557,55 @@ def gcc_summaries(tier: str = "all", count: int = 5) -> str:
     return mem.get_summaries(tier=tier, count=count)
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_patterns(
+    min_occurrences: int = 1,
+    include_promoted: bool = True,
+    search_term: str | None = None,
+) -> str:
+    """Query the CER-inspired pattern buffer.
+
+    Patterns are transferable decision-making skills observed across commits
+    (CER arXiv:2506.06698). They are deduped by word similarity and tracked
+    by occurrence count. Patterns appearing in 3+ commits are suggested for
+    ACE playbook promotion.
+
+    Args:
+        min_occurrences: Minimum occurrence count to include (default 1).
+        include_promoted: Whether to include already-promoted patterns (default True).
+        search_term: Optional keyword filter on pattern text.
+    """
+    with _state_lock:
+        mem = _ensure_memory()
+    result = mem.get_patterns(
+        min_occurrences=min_occurrences,
+        include_promoted=include_promoted,
+        search_term=search_term,
+    )
+
+    if not result["patterns"]:
+        return f"No patterns found (total buffer: {result['total']}, filter: min_occurrences={min_occurrences})."
+
+    lines = [f"# Pattern Buffer ({result['matching']}/{result['total']} shown)"]
+    for p in result["patterns"][:25]:
+        promoted_tag = " [PROMOTED]" if p.get("promoted") else ""
+        lines.append(
+            f"- **[{p['id']}]** ({p['occurrence_count']}x, first: {p['first_seen']}){promoted_tag}\n"
+            f"  {p['text']}\n"
+            f"  Commits: {', '.join(p['commit_ids'])}"
+        )
+
+    # Promotion candidates
+    threshold = mem.config.pattern_promotion_count
+    candidates = [p for p in result["patterns"] if p["occurrence_count"] >= threshold and not p.get("promoted")]
+    if candidates:
+        lines.append(f"\n## Promotion Candidates (>= {threshold} occurrences)")
+        for c in candidates:
+            lines.append(f"- [{c['id']}] \"{c['text'][:100]}\" ({c['occurrence_count']}x)")
+
+    return "\n".join(lines)
+
+
 # ===========================================================================
 # ACE Playbook Tools
 # ===========================================================================
@@ -696,10 +818,15 @@ def ace_prune(scope: str = "project") -> str:
     try:
         with _state_lock:
             pb, save_fn = _resolve_playbook(scope)
+            # Load schema for parameterized thresholds (MCE)
+            sp = _schema_path if scope == "project" else _global_schema_path
+            schema = _load_schema(sp) if sp else PlaybookSchema.default()
             # Evolve failure lessons BEFORE pruning to prevent permanent loss
-            evolved = pb.evolve_from_failures(threshold=1)
-            pruned = pb.prune_problematic(min_harmful=3)
-            budget_pruned = pb.enforce_token_budget(max_chars=80000)
+            evolved = pb.evolve_from_failures(threshold=max(1, schema.evolution_threshold - 2))
+            pruned = pb.prune_problematic(min_harmful=schema.prune_min_harmful)
+            budget_pruned = pb.enforce_token_budget(
+                max_chars=schema.token_budget, decay_rate=schema.decay_rate,
+            )
             save_fn()
         total = len(pruned) + len(budget_pruned)
         parts = []
@@ -820,6 +947,235 @@ def ace_evolve_from_failures(
         return f"Error: {type(e).__name__}: {e}"
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+def ace_evolve_schema(
+    scope: str = "project",
+    apply_proposal: int | None = None,
+    rollback: bool = False,
+) -> str:
+    """Evolve playbook schema via MCE-inspired (1+1)-ES (arXiv:2601.21557).
+
+    Meta-level evolution of playbook STRUCTURE — sections, thresholds,
+    parameters. Computes health metrics, compares to baseline,
+    proposes one improvement per call.
+
+    Three-call pattern:
+      1. No args → evaluate metrics, show proposals
+      2. apply_proposal=N → apply Nth proposal (1-indexed)
+      3. rollback=True → revert to parent schema version
+
+    Args:
+        scope: "project" or "global".
+        apply_proposal: 1-indexed proposal to apply (None = evaluate only).
+        rollback: Revert to parent schema version.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        with _state_lock:
+            pb, save_fn = _resolve_playbook(scope)
+            sp = _schema_path if scope == "project" else _global_schema_path
+            schema = _load_schema(sp) if sp else PlaybookSchema.default()
+            history = _load_schema_history(sp) if sp else []
+
+            if rollback:
+                # Revert to parent schema
+                if schema.parent_version is None:
+                    return "Cannot rollback: no parent schema version exists."
+                parent = None
+                for h in history:
+                    if h.get("version") == schema.parent_version:
+                        parent = PlaybookSchema.from_dict(h)
+                        break
+                if parent is None:
+                    return f"Cannot rollback: parent version {schema.parent_version} not found in history."
+                # Apply parent schema to playbook
+                moved = pb.apply_schema(parent)
+                # Compute new metrics
+                new_metrics = pb.compute_metrics(parent)
+                parent.baseline_metrics = new_metrics
+                # Push current to history, restore parent
+                history.append(schema.to_dict())
+                # Enforce history cap
+                max_hist = 20
+                if len(history) > max_hist:
+                    history = history[-max_hist:]
+                _save_schema(parent, history, sp)
+                save_fn()
+                return (
+                    f"Rolled back to schema v{parent.version}.\n"
+                    f"Moved {moved} bullet(s) between sections.\n"
+                    f"Current health: {new_metrics.overall_health:.3f}"
+                )
+
+            # Compute current metrics
+            metrics = pb.compute_metrics(schema)
+
+            if apply_proposal is not None:
+                # Re-compute proposals to validate index
+                proposals = pb.propose_schema_changes(
+                    schema, metrics,
+                    overflow_threshold=0.5,
+                    min_cluster_size=3,
+                    stop_health_threshold=0.8,
+                    rollback_health_delta=-0.05,
+                )
+                idx = apply_proposal - 1
+                if idx < 0 or idx >= len(proposals):
+                    return f"Invalid proposal index {apply_proposal}. Available: {len(proposals)}."
+                proposal = proposals[idx]
+
+                # Create new schema version
+                new_schema = PlaybookSchema(
+                    version=schema.version + 1,
+                    sections=list(schema.sections),
+                    slug_map=dict(schema.slug_map),
+                    decay_rate=schema.decay_rate,
+                    prune_min_harmful=schema.prune_min_harmful,
+                    evolution_threshold=schema.evolution_threshold,
+                    token_budget=schema.token_budget,
+                    parent_version=schema.version,
+                    change_description=proposal.description,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    baseline_metrics=metrics,
+                )
+
+                # Apply the change
+                ct = proposal.change_type
+                details = proposal.details
+
+                if ct == "ADD_SECTION":
+                    new_name = details["name"]
+                    slug_prefix = details.get("slug_prefix", new_name[:3].lower())
+                    new_schema.sections.append(new_name)
+                    from ccr.ace.playbook import _normalize_section
+                    new_schema.slug_map[_normalize_section(new_name)] = slug_prefix
+                    # Move specified bullets
+                    bullet_ids = set(details.get("bullet_ids", []))
+                    for bullet in pb.bullets:
+                        if bullet.id in bullet_ids:
+                            bullet.section = new_name
+                    pb.apply_schema(new_schema)
+
+                elif ct == "REMOVE_SECTION":
+                    rm_name = details["name"]
+                    if rm_name in new_schema.sections:
+                        new_schema.sections.remove(rm_name)
+                    pb.apply_schema(new_schema)
+
+                elif ct == "ADJUST_DECAY":
+                    new_schema.decay_rate = details["new_rate"]
+
+                elif ct == "ADJUST_PRUNING":
+                    new_schema.prune_min_harmful = details["new_min_harmful"]
+
+                elif ct == "ADJUST_EVOLUTION":
+                    new_schema.evolution_threshold = details["new_threshold"]
+
+                elif ct == "ADJUST_BUDGET":
+                    new_schema.token_budget = details["new_budget"]
+
+                elif ct == "REBALANCE":
+                    moves = details.get("moves", [])
+                    for move in moves:
+                        b = pb.get_bullet(move["bullet_id"])
+                        if b:
+                            b.section = move["to"]
+
+                elif ct == "ROLLBACK":
+                    # Handled above, shouldn't reach here
+                    pass
+
+                # Push old schema to history
+                history.append(schema.to_dict())
+                max_hist = 20
+                if len(history) > max_hist:
+                    history = history[-max_hist:]
+
+                _save_schema(new_schema, history, sp)
+                save_fn()
+
+                new_metrics = pb.compute_metrics(new_schema)
+                delta = new_metrics.overall_health - metrics.overall_health
+                return (
+                    f"Applied {ct} → schema v{new_schema.version}.\n"
+                    f"{proposal.description}\n"
+                    f"Health: {metrics.overall_health:.3f} → {new_metrics.overall_health:.3f} "
+                    f"(Δ{delta:+.3f})"
+                )
+
+            # Evaluation mode: compute proposals
+            proposals = pb.propose_schema_changes(
+                schema, metrics,
+                overflow_threshold=0.5,
+                min_cluster_size=3,
+                stop_health_threshold=0.8,
+                rollback_health_delta=-0.05,
+            )
+
+            parts = [
+                f"# Schema Health Report (v{schema.version})",
+                f"",
+                f"| Metric | Value |",
+                f"|--------|-------|",
+                f"| Section Balance | {metrics.section_balance:.3f} |",
+                f"| Utilization Rate | {metrics.utilization_rate:.3f} |",
+                f"| Harmful Ratio | {metrics.harmful_ratio:.3f} |",
+                f"| Unused Ratio | {metrics.unused_ratio:.3f} |",
+                f"| Decay Impact | {metrics.decay_impact:.3f} |",
+                f"| **Overall Health** | **{metrics.overall_health:.3f}** |",
+                f"| Total Bullets | {metrics.total_bullets} |",
+                f"| Total Sections | {metrics.total_sections} |",
+            ]
+
+            if metrics.empty_sections:
+                parts.append(f"| Empty Sections | {', '.join(metrics.empty_sections)} |")
+            if metrics.overflow_sections:
+                parts.append(f"| Overflow Sections | {', '.join(metrics.overflow_sections)} |")
+
+            # Baseline comparison
+            if schema.baseline_metrics:
+                bl = schema.baseline_metrics
+                delta = metrics.overall_health - bl.overall_health
+                parts.extend([
+                    f"",
+                    f"## Baseline Comparison (v{schema.version} adopted at {bl.overall_health:.3f})",
+                    f"Health delta: {delta:+.3f}",
+                ])
+
+            # Schema parameters
+            parts.extend([
+                f"",
+                f"## Schema Parameters",
+                f"- Decay rate: {schema.decay_rate}",
+                f"- Prune min harmful: {schema.prune_min_harmful}",
+                f"- Evolution threshold: {schema.evolution_threshold}",
+                f"- Token budget: {schema.token_budget}",
+                f"- Sections: {len(schema.sections)}",
+            ])
+
+            # Proposals
+            if proposals:
+                parts.extend([f"", f"## Proposals"])
+                for i, p in enumerate(proposals, 1):
+                    parts.append(
+                        f"  {i}. **{p.change_type}** (confidence: {p.confidence:.2f})\n"
+                        f"     {p.description}"
+                    )
+                parts.append(
+                    f"\nCall `ace_evolve_schema(apply_proposal=N)` to apply, "
+                    f"or `ace_evolve_schema(rollback=True)` to revert."
+                )
+            else:
+                parts.append(f"\n## No proposals — playbook schema is healthy.")
+
+            return "\n".join(parts)
+    except ValueError:
+        raise
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+
 # ===========================================================================
 # RLM Sandbox Tools
 # ===========================================================================
@@ -828,6 +1184,11 @@ def ace_evolve_from_failures(
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def rlm_init(task_prompt: str) -> str:
     """Initialize a sandboxed Python REPL for structured problem-solving.
+
+    Provides the REPL execution component from the RLM paper (arXiv:2512.24601).
+    Note: The paper's autonomous generate-execute loop (Algorithm 1) is NOT active
+    in MCP mode — Claude Code drives the iteration loop manually via rlm_execute
+    calls. This is the REPL substrate only, not the full RLM system.
 
     Sets up a REPL with these variables and tools pre-loaded:
         - task_prompt: Your problem statement (string)
@@ -882,8 +1243,37 @@ def rlm_init(task_prompt: str) -> str:
         return f"Error: {type(e).__name__}: {e}"
 
 
+def _summarize_stdout(stdout: str, threshold: int = 1000) -> str:
+    """Summarize long stdout per RLM paper Section 3 ('Metadata-only stdout').
+
+    If stdout exceeds *threshold* chars, replace with a metadata summary
+    showing line/char counts plus the first and last 5 lines.  Short output
+    (at or below the threshold) is returned unchanged.
+
+    This enforces the paper's principle that stdout should carry metadata
+    (lengths, counts, type info) rather than full content, saving tokens.
+    """
+    if len(stdout) <= threshold:
+        return stdout
+
+    lines = stdout.splitlines()
+    line_count = len(lines)
+    char_count = len(stdout)
+
+    head = "\n".join(lines[:5])
+    tail = "\n".join(lines[-5:]) if line_count > 10 else ""
+
+    parts = [f"[stdout truncated: {line_count} lines, {char_count} chars]"]
+    parts.append(head)
+    if tail:
+        parts.append("...")
+        parts.append(tail)
+
+    return "\n".join(parts)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def rlm_execute(code: str) -> str:
+def rlm_execute(code: str, metadata_only: bool = True) -> str:
     """Execute Python code in the sandboxed REPL.
 
     The REPL persists variables across calls. Use it to:
@@ -892,9 +1282,14 @@ def rlm_execute(code: str) -> str:
         - Build answers incrementally across multiple execute calls
 
     Stdout is captured and returned. Variables persist between calls.
+    By default, long stdout is summarized to metadata per the RLM paper
+    (Section 3, 'Metadata-only stdout') to save tokens.
 
     Args:
         code: Python code to execute.
+        metadata_only: If True (default), stdout exceeding 1000 chars is
+            replaced with a metadata summary (line count, char count, first/last
+            5 lines). Set to False to return full stdout regardless of length.
     """
     try:
         with _state_lock:
@@ -906,12 +1301,10 @@ def rlm_execute(code: str) -> str:
 
         parts = []
         if result.stdout.strip():
-            # Metadata-only: show length + preview (RLM paper pattern)
             stdout = result.stdout.strip()
-            if len(stdout) > 500:
-                parts.append(f"stdout ({len(stdout)} chars): {stdout[:500]}...")
-            else:
-                parts.append(f"stdout: {stdout}")
+            if metadata_only:
+                stdout = _summarize_stdout(stdout)
+            parts.append(f"stdout: {stdout}")
 
         if result.error:
             parts.append(f"error: {result.error}")
@@ -982,9 +1375,12 @@ def index_build() -> str:
     Scans the project directory for source files, extracts symbols (classes,
     functions) and imports per file. The index enables search_repo and
     get_file in the RLM sandbox.
+
+    If onnxruntime + tokenizers are installed, also computes dense embeddings
+    for semantic search (A-RAG §3.1). Otherwise, BM25 fallback is available.
     """
     try:
-        global _repo_index
+        global _repo_index, _embedding_model
         with _state_lock:  # H2: protect global state mutation
             _repo_index = RepoIndex.build(_project_root)
 
@@ -996,7 +1392,26 @@ def index_build() -> str:
             except Exception:
                 pass
 
-        return _repo_index.get_summary()
+        # Semantic: compute embeddings if available (A-RAG §3.1)
+        emb_status = ""
+        try:
+            from ccr.context.embeddings import SEMANTIC_AVAILABLE, get_embedding_model
+
+            if SEMANTIC_AVAILABLE:
+                model = get_embedding_model()
+                if model is not None:
+                    count = _repo_index.build_embeddings(model)
+                    _repo_index.save_embeddings(_embeddings_path)
+                    _embedding_model = model
+                    emb_status = f"\nEmbeddings: {count} files ({model.MODEL_NAME})"
+            else:
+                emb_status = (
+                    "\nEmbeddings: unavailable (install onnxruntime + tokenizers for semantic search)"
+                )
+        except Exception as e:
+            emb_status = f"\nEmbeddings: skipped ({e})"
+
+        return _repo_index.get_summary() + emb_status
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -1004,22 +1419,49 @@ def index_build() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def index_search(query: str, top_k: int = 10) -> str:
+def index_search(query: str, mode: str = "hybrid", top_k: int = 10) -> str:
     """Search the repo index for files matching a query.
 
-    Searches file paths, symbol names, and content. Returns ranked results
-    with path, language, symbols, and relevance score.
+    Three search modes:
+      - "keyword": Exact substring matching on paths, symbols, content (fast).
+        Inspired by A-RAG §3.2 keyword_search, but uses substring matching
+        not the paper's frequency*length scoring (Eq 1).
+      - "semantic": Meaning-based search via ONNX dense embeddings
+        (A-RAG §3.2 Eq 3 inspired) or BM25 fallback (CCR's own zero-dep
+        alternative — BM25 is not from the A-RAG paper).
+      - "hybrid": Combines keyword + semantic scores via weighted score fusion
+        (default, best results). This is CCR's own design — A-RAG uses
+        agent-driven tool selection, not mechanical score fusion.
 
     Args:
-        query: Search term (file name, symbol, or content keyword).
+        query: Search term or natural language description.
+        mode: "keyword", "semantic", or "hybrid" (default).
         top_k: Maximum results to return (default 10).
     """
+    if mode not in ("keyword", "semantic", "hybrid"):
+        return f"Error: invalid mode '{mode}'. Use 'keyword', 'semantic', or 'hybrid'."
+
     top_k = max(1, min(top_k, 100))  # M3: bound top_k to prevent excessive results
     idx = _ensure_index()
-    results = idx.search(query)[:top_k]
+
+    suffix = ""
+    if mode == "keyword":
+        results = idx.search(query)[:top_k]
+    elif mode == "semantic":
+        if _embedding_model is not None and idx._embeddings:
+            results = idx.semantic_search(query, _embedding_model, top_k=top_k)
+        else:
+            results = idx.bm25_search(query, top_k=top_k)
+            suffix = " (BM25 fallback)"
+    else:  # hybrid
+        results = idx.hybrid_search(query, model=_embedding_model, top_k=top_k)
+        if _embedding_model is None or not idx._embeddings:
+            suffix = " (BM25 fallback)"
+
     if not results:
-        return f"No files matching '{query}'."
-    lines = []
+        return f"No files matching '{query}' ({mode} mode)."
+
+    lines = [f"# {mode} search{suffix}"]
     for r in results:
         syms = ", ".join(r["symbols"][:5]) if r["symbols"] else ""
         lines.append(
