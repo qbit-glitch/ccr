@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from ccr.context.embeddings import get_embedding_model, load_embeddings, save_embeddings
 from ccr.core.types import CCRConfig, CommitLink
 
 # --- Templates (from open-gcc bootstrap.ts) ---
@@ -267,8 +268,10 @@ class MemoryManager:
         why: str,
         files_changed: list[str],
         next_step: str,
+        patterns_learned: list[str] | None = None,
         admission_threshold: float = 0.85,
         rejection_threshold: float = 0.0,
+        compressed_summary: str | None = None,
     ) -> str:
         """Create a structured commit on the active branch.
 
@@ -282,10 +285,10 @@ class MemoryManager:
         2. Compute similarity — max recency-weighted Jaccard to existing commits
         3. If S(m) < rejection_threshold → Reject (low-value, per Alg. 1 line 11)
         4. FindConflict: if similarity >= admission_threshold → conflict found
-        5. If conflict AND S(m) > S(m_conflict) → Create new (new outranks existing,
-           per Alg. 1 line 6: both coexist)
-        6. If conflict AND S(m) <= S(m_conflict) → Merge into conflict target
-           (per Alg. 1 line 7: fold new into existing)
+        5. If conflict AND S(m) > S(m_conflict) → REPLACE old with Merge(m, m_conflict)
+           (per Alg. 1 lines 6-7: new outranks, so merge replaces old)
+        6. If conflict AND S(m) <= S(m_conflict) → ADD new alongside existing
+           (per Alg. 1 lines 8-9: existing outranks, both coexist)
         7. No conflict → Create new commit
 
         Args:
@@ -318,35 +321,37 @@ class MemoryManager:
                 ))
                 return f"[REJECTED] {title} (score={score['score']:.2f}, below threshold {rejection_threshold:.2f})"
 
-            # Step 4-5: FindConflict + Merge (Alg. 1 lines 4-7)
+            # Step 4-6: FindConflict + Score comparison (Alg. 1 lines 4-9)
             # similarity >= admission_threshold → conflict detected (paper: sim > 0.85)
             if score["similarity"] >= admission_threshold and score["conflict_id"]:
-                # Step 6: Score comparison (Alg. 1 line 6: S(m) > S(m_conflict))
-                # Compare new commit's score against the conflicting commit's score.
-                # If new outranks existing → create new (both coexist per Alg. 1 line 9).
-                # If existing outranks new → merge new into existing (Alg. 1 line 7).
+                # Score comparison (Alg. 1 lines 6-9):
+                # If S(m) > S(m_conflict) → REPLACE old with Merge(m, m_conflict)
+                #   (new is more valuable, replaces old via merge — Alg. 1 lines 6-7)
+                # If S(m) <= S(m_conflict) → ADD new alongside existing
+                #   (existing is more valuable, new simply coexists — Alg. 1 lines 8-9)
                 new_score = score["score"]
                 conflict_score = score.get("conflict_score", 0.0)
                 if new_score > conflict_score:
-                    pass  # Fall through: new is more valuable, add alongside existing
-                else:
-                    # Merge: existing outranks new → fold new into conflict target
+                    # Replace: new outranks old → merge new into conflict target
                     merged_id = self._merge_into_last_commit(
                         branch, score["conflict_id"],
                         title, what, why, files_changed, next_step,
+                        patterns_learned,
                     )
-                    self._update_rolling_summary(branch, what, why, next_step)
+                    self._update_rolling_summary(branch, what, why, next_step, compressed_summary)
                     self._update_current_focus(title, next_step)
 
                     self._append_log(branch, self._format_ota_log(
                         "commit-merge", f"{merged_id}: +{title}", "OK",
                         observation=f"Admission control: sim={score['similarity']:.2f}, S(m)={new_score:.2f} vs S(m')={conflict_score:.2f}",
-                        thought=f"S(m) <= S(m_conflict): merging into {merged_id}",
-                        action=f"Updated {merged_id} with new info",
+                        thought=f"S(m) > S(m_conflict): replacing {merged_id} with merged version",
+                        action=f"Replaced {merged_id} with merged info",
                     ))
 
                     self._git_commit(f"ccr: +{title} (merged into {merged_id})")
                     return f"[{merged_id}+] {title} (merged, sim={score['similarity']:.2f})"
+                else:
+                    pass  # Fall through: existing is more valuable, add new alongside
 
         # --- Normal commit path ---
         commit_id = self._get_next_commit_id(branch)
@@ -361,12 +366,17 @@ class MemoryManager:
             )
             admission_score_value = score["score"]
 
+        patterns_str = ""
+        if patterns_learned:
+            patterns_str = f"**Patterns**: {' | '.join(patterns_learned)}\n"
+
         entry = (
             f"## [{commit_id}] {now} | branch:{branch} | {title}\n"
             f"**What**: {what}\n"
             f"**Why**: {why}\n"
             f"**Files**: {files_str}\n"
             f"**Next**: {next_step}\n"
+            f"{patterns_str}"
             f"**Score**: {admission_score_value:.2f}\n\n---\n\n"
         )
 
@@ -378,7 +388,7 @@ class MemoryManager:
         self._prepend_commit(branch, entry)
 
         # GCC paper: regenerate rolling summary S_t = f(S_{t-1}, D_t)
-        self._update_rolling_summary(branch, what, why, next_step)
+        self._update_rolling_summary(branch, what, why, next_step, compressed_summary)
 
         if branch == "main":
             self._update_main_milestones(now, branch, title)
@@ -406,10 +416,50 @@ class MemoryManager:
         except Exception:
             pass  # Linking is supplementary — never fail the commit
 
+        # CER-inspired pattern buffer management (arXiv:2506.06698 §3.1)
+        promotion_suggestions: list[dict] = []
+        if patterns_learned:
+            try:
+                promotion_suggestions = self._process_patterns(
+                    commit_id, patterns_learned, now,
+                )
+            except Exception:
+                pass  # Pattern management is supplementary — never fail the commit
+
         # TiMem §3.2.2: Check if session summary should be generated
         self._maybe_generate_session_summary(branch)
 
-        return f"[{commit_id}] {title} (branch: {branch})"
+        result = f"[{commit_id}] {title} (branch: {branch})"
+        if promotion_suggestions:
+            result += (
+                f"\n\n**Pattern promotion suggestions** "
+                f"(appeared in {self.config.pattern_promotion_count}+ commits):"
+            )
+            for ps in promotion_suggestions:
+                result += (
+                    f"\n  - \"{ps['text']}\" "
+                    f"(seen in {ps['count']} commits: {', '.join(ps['commit_ids'])})"
+                )
+            result += "\n\nConsider calling ace_apply_delta with ADD to promote these to the playbook."
+
+        # GCC paper G4: Check if rolling summary needs LLM compression
+        # When summary exceeds threshold, suggest Claude Code compress it
+        # via the two-call pattern (same as gcc_consolidate project tier).
+        # Threshold is 1200 chars — fires BEFORE structured truncation (1500)
+        # kicks in, giving Claude Code a chance to compress proactively.
+        summary_compression_threshold = 1200
+        current_summary = self._get_rolling_summary(branch)
+        if len(current_summary) > summary_compression_threshold and compressed_summary is None:
+            result += (
+                f"\n\n\u26a0\ufe0f Rolling summary is getting long ({len(current_summary)} chars). "
+                f"To preserve summary quality (GCC paper S_t = f(S_{{t-1}}, D_t)), "
+                f"call gcc_commit with compressed_summary= containing a concise "
+                f"compression of the current rolling summary, or call gcc_consolidate "
+                f"to compress project memory. Without compression, the summary will "
+                f"degrade to structured truncation."
+            )
+
+        return result
 
     # --- Admission Control (A-MAC inspired) ---
 
@@ -466,6 +516,14 @@ class MemoryManager:
             else:
                 data["files"] = []
 
+            # CER patterns (backward compatible — empty list if absent)
+            patterns_match = re.search(r"\*\*Patterns\*\*:\s*(.*)", part)
+            if patterns_match:
+                raw_patterns = patterns_match.group(1).strip()
+                data["patterns"] = [p.strip() for p in raw_patterns.split("|") if p.strip()]
+            else:
+                data["patterns"] = []
+
             results.append(data)
         return results
 
@@ -521,6 +579,51 @@ class MemoryManager:
 
     def _get_links_path(self) -> str:
         return os.path.join(self.ccr_root, "commit_links.json")
+
+    def _get_commit_embeddings_path(self) -> str:
+        return os.path.join(self.ccr_root, "commit_embeddings.json.gz")
+
+    def _embed_commit(self, commit_id: str, text: str):
+        """Embed commit text and persist to cache. Returns vector or None.
+
+        Appends to .ccr/commit_embeddings.json.gz (capped at
+        link_scan_window * 2 entries, oldest evicted). Returns the computed
+        (384,) float32 L2-normalized vector so the caller can reuse it
+        without a second inference pass. Returns None if ONNX unavailable.
+        """
+        model = get_embedding_model()
+        if model is None:
+            return None
+        import numpy as np  # soft dep -- only reachable when ONNX available
+        try:
+            vec = model.embed_query(text)
+            cache = load_embeddings(self._get_commit_embeddings_path())
+            cache[commit_id] = vec.tolist()
+            cap = self.config.link_scan_window * 2
+            if len(cache) > cap:
+                for old_id in sorted(cache.keys())[: len(cache) - cap]:
+                    del cache[old_id]
+            save_embeddings(cache, self._get_commit_embeddings_path())
+            return vec
+        except Exception:
+            return None
+
+    def _load_commit_embeddings(self, commit_ids: list) -> dict:
+        """Load cached embeddings for given commit IDs as numpy arrays.
+
+        Returns dict[str, np.ndarray] with only IDs present in cache.
+        Silently omits missing IDs. Returns empty dict on any error.
+        """
+        try:
+            import numpy as np  # soft dep
+            raw = load_embeddings(self._get_commit_embeddings_path())
+            return {
+                cid: np.array(raw[cid], dtype=np.float32)
+                for cid in commit_ids
+                if cid in raw
+            }
+        except Exception:
+            return {}
 
     def _load_links(self) -> dict:
         """Load the commit link graph from JSON. Returns default if missing/corrupt."""
@@ -779,14 +882,18 @@ class MemoryManager:
     @staticmethod
     def _parse_commit_block(text: str) -> dict:
         """Parse a single commit block (Markdown) into a dict with title/what/why."""
-        result: dict[str, str] = {}
+        result: dict[str, Any] = {}
         title_match = re.search(r"\[C\d{3,}\]\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*\|\s*branch:[\w-]+\s*\|\s*(.*)", text)
         if title_match:
             result["title"] = title_match.group(1).strip()
         for field in ("What", "Why", "Files", "Next"):
-            m = re.search(rf"\*\*{field}\*\*:\s*(.*?)(?=\n\*\*(?:What|Why|Files|Next|Score|OTA)\*\*|\n##|\Z)", text, re.DOTALL)
+            m = re.search(rf"\*\*{field}\*\*:\s*(.*?)(?=\n\*\*(?:What|Why|Files|Next|Patterns|Score|OTA)\*\*|\n##|\Z)", text, re.DOTALL)
             if m:
                 result[field.lower()] = m.group(1).strip()
+        # CER patterns (backward compatible)
+        patterns_m = re.search(r"\*\*Patterns\*\*:\s*(.*)", text)
+        if patterns_m:
+            result["patterns"] = [p.strip() for p in patterns_m.group(1).strip().split("|") if p.strip()]
         return result
 
     def _format_links_for_context(self, commit_id: str, links: dict[str, list[dict]]) -> str:
@@ -809,6 +916,183 @@ class MemoryManager:
                     parts.append(f"{tgt} (score: {e.get('score', 0):.2f})")
             lines.append(f"- **{lt.capitalize()}**: {', '.join(parts)}")
         return "\n".join(lines)
+
+    # --- CER-Inspired Pattern Buffer (arXiv:2506.06698 §3.1) ---
+
+    def _get_patterns_path(self) -> str:
+        return os.path.join(self.ccr_root, "patterns.json")
+
+    def _load_patterns(self) -> dict:
+        """Load pattern buffer from JSON. Returns default if missing/corrupt."""
+        path = self._get_patterns_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+        if not raw:
+            return {"version": 1, "patterns": {}, "next_id": 1}
+        try:
+            data = json.loads(raw)
+            if not isinstance(data.get("patterns"), dict):
+                return {"version": 1, "patterns": {}, "next_id": 1}
+            return data
+        except (json.JSONDecodeError, TypeError):
+            return {"version": 1, "patterns": {}, "next_id": 1}
+
+    def _save_patterns(self, data: dict) -> None:
+        """Atomically save the pattern buffer."""
+        path = self._get_patterns_path()
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        with self._locks[path], self._file_lock(path):
+            self._write_file_unlocked(path, content)
+
+    def _find_matching_pattern(self, data: dict, new_text: str) -> str | None:
+        """Find existing pattern matching new_text via word Jaccard >= threshold.
+
+        CER §3.1: existing buffer shown to distiller to avoid repetition.
+        Returns matching pattern ID or None.
+        """
+        new_words = {w.lower() for w in new_text.split()
+                     if w.lower() not in self._STOP_WORDS and len(w) > 2}
+        if len(new_words) < 2:
+            return None
+
+        best_id = None
+        best_sim = 0.0
+
+        for pid, entry in data.get("patterns", {}).items():
+            existing_words = {w.lower() for w in entry["text"].split()
+                              if w.lower() not in self._STOP_WORDS and len(w) > 2}
+            if len(existing_words) < 2:
+                continue
+            sim = self._jaccard(new_words, existing_words)
+            if sim >= self.config.pattern_dedup_threshold and sim > best_sim:
+                best_sim = sim
+                best_id = pid
+
+        return best_id
+
+    def _process_patterns(
+        self,
+        commit_id: str,
+        patterns: list[str],
+        timestamp: str,
+    ) -> list[dict]:
+        """Process new patterns: dedup, store, track occurrences, suggest promotions.
+
+        CER §3.1 Dynamic Experience Buffer: new skills are deduped against existing
+        buffer (existing experiences shown to distiller to avoid repetition).
+
+        Returns list of promotion suggestion dicts for patterns that crossed
+        the promotion threshold.
+        """
+        path = self._get_patterns_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+            if not raw:
+                data: dict = {"version": 1, "patterns": {}, "next_id": 1}
+            else:
+                try:
+                    data = json.loads(raw)
+                    if not isinstance(data.get("patterns"), dict):
+                        data = {"version": 1, "patterns": {}, "next_id": 1}
+                except (json.JSONDecodeError, TypeError):
+                    data = {"version": 1, "patterns": {}, "next_id": 1}
+
+            promotion_suggestions: list[dict] = []
+
+            for pattern_text in patterns:
+                pattern_text = pattern_text.strip()
+                if not pattern_text:
+                    continue
+
+                # Dedup: find existing pattern with word Jaccard >= threshold
+                matched_id = self._find_matching_pattern(data, pattern_text)
+
+                if matched_id:
+                    # Update existing pattern's occurrence
+                    entry = data["patterns"][matched_id]
+                    if commit_id not in entry["commit_ids"]:
+                        entry["commit_ids"].append(commit_id)
+                        entry["occurrence_count"] = len(entry["commit_ids"])
+
+                    # Check promotion threshold
+                    if (entry["occurrence_count"] >= self.config.pattern_promotion_count
+                            and not entry.get("promoted", False)):
+                        promotion_suggestions.append({
+                            "pattern_id": matched_id,
+                            "text": entry["text"],
+                            "count": entry["occurrence_count"],
+                            "commit_ids": entry["commit_ids"],
+                        })
+                else:
+                    # New pattern — add to buffer
+                    pid = f"P{data['next_id']:03d}"
+                    data["next_id"] = data["next_id"] + 1
+                    data["patterns"][pid] = {
+                        "text": pattern_text,
+                        "first_seen": commit_id,
+                        "commit_ids": [commit_id],
+                        "occurrence_count": 1,
+                        "created_at": timestamp,
+                        "promoted": False,
+                    }
+
+            # Buffer size enforcement (CER §3.1 Dynamic Buffer)
+            self._enforce_pattern_buffer_size(data)
+
+            content = json.dumps(data, indent=2, ensure_ascii=False)
+            self._write_file_unlocked(path, content)
+
+        return promotion_suggestions
+
+    def _enforce_pattern_buffer_size(self, data: dict) -> None:
+        """Evict lowest-value patterns if buffer exceeds max size."""
+        patterns = data.get("patterns", {})
+        max_size = self.config.pattern_max_buffer_size
+        if len(patterns) <= max_size:
+            return
+
+        # Sort by (occurrence_count ASC, created_at ASC) — evict least frequent + oldest
+        sorted_ids = sorted(
+            patterns.keys(),
+            key=lambda pid: (
+                patterns[pid].get("occurrence_count", 1),
+                patterns[pid].get("created_at", ""),
+            ),
+        )
+
+        # Evict from the front (lowest value) until within budget
+        evict_count = len(patterns) - max_size
+        for pid in sorted_ids[:evict_count]:
+            del patterns[pid]
+
+    def get_patterns(
+        self,
+        min_occurrences: int = 1,
+        include_promoted: bool = True,
+        search_term: str | None = None,
+    ) -> dict:
+        """Query the pattern buffer. Returns dict for MCP tool formatting."""
+        data = self._load_patterns()
+        results = []
+
+        for pid, entry in data.get("patterns", {}).items():
+            if entry.get("occurrence_count", 1) < min_occurrences:
+                continue
+            if not include_promoted and entry.get("promoted", False):
+                continue
+            if search_term:
+                if search_term.lower() not in entry["text"].lower():
+                    continue
+            results.append({"id": pid, **entry})
+
+        # Sort by occurrence_count DESC, then by created_at DESC
+        results.sort(key=lambda x: (-x.get("occurrence_count", 1), x.get("created_at", "")))
+
+        return {
+            "total": len(data.get("patterns", {})),
+            "matching": len(results),
+            "patterns": results,
+        }
 
     # --- Commit Type Classification (A-MAC §3.2 Factor 5: Type Prior T(m)) ---
 
@@ -915,9 +1199,11 @@ class MemoryManager:
             sim(m, m') = 0.50 · Jaccard(files) + 0.50 · Jaccard(keywords)
             Word Jaccard substitutes for Sentence-BERT cosine since CCR
             has no embedding model. Lower discriminative power but zero cost.
-            Recency-modulated: effective_sim = raw_sim · R_conflict(m')
-            where R_conflict = exp(−0.01 · hours_since_m'). Old conflicts
-            are dampened per Eq. 4 (conflicts from 3 days ago are weaker).
+
+            Two similarity signals (separated per paper):
+            - Raw sim: pure content similarity, used for Novelty N(m) = 1 - max_sim
+            - Effective sim: raw_sim · R_conflict(m'), used for FindConflict
+              threshold checking only. Old conflicts are dampened per Eq. 4.
 
         Weight rationale (per Table 2 ablation — T is most impactful, ΔF1=-0.107):
             w_T = 0.50: Type Prior dominates — most impactful factor per ablation.
@@ -928,8 +1214,8 @@ class MemoryManager:
 
         Returns dict with:
             score: float — S(m) ∈ [0,1], higher = more valuable (paper Eq. 1)
-            similarity: float — max recency-weighted sim to any existing commit
-            novelty: float — N(m) = 1 - similarity (Eq. 3)
+            similarity: float — max recency-weighted sim (for FindConflict threshold)
+            novelty: float — N(m) = 1 - max_raw_sim (Eq. 3, pure content, no recency)
             conflict_id: str|None — most similar commit ID (FindConflict target)
             conflict_recency: float — R of the conflicting commit (Eq. 4)
             commit_type: str — classified type of the new commit
@@ -968,7 +1254,8 @@ class MemoryManager:
         new_files = {f.strip().lower() for f in files_changed if f.strip()}
         new_words = self._extract_keywords(f"{title} {what} {why}")
 
-        best_similarity = 0.0
+        best_similarity = 0.0       # Recency-modulated sim (for FindConflict threshold)
+        best_raw_similarity = 0.0   # Pure content sim (for Novelty N(m) per Eq. 3)
         best_file_sim = 0.0
         best_keyword_sim = 0.0
         best_conflict_id = None
@@ -984,14 +1271,21 @@ class MemoryManager:
             )
             keyword_sim = self._jaccard(new_words, old_words)
 
-            # Raw content similarity
+            # Raw content similarity (pure, no recency — used for Novelty per Eq. 3)
             raw_sim = 0.50 * file_sim + 0.50 * keyword_sim
+
+            # Track best raw similarity across all commits for Novelty computation
+            if raw_sim > best_raw_similarity:
+                best_raw_similarity = raw_sim
 
             # Recency of existing commit (Eq. 4: λ=0.01/hour, half-life ~69 hours)
             hours_since = self._hours_since_commit(commit.get("timestamp", ""))
             conflict_recency = math.exp(-0.01 * hours_since) if hours_since >= 0 else 0.0
 
-            # Recency-modulated similarity: old conflicts are dampened
+            # Recency-modulated similarity for FindConflict threshold checking.
+            # Old conflicts are dampened — a stale duplicate is less of a conflict.
+            # NOTE: This is used ONLY for FindConflict (whether a conflict exists),
+            # NOT for Novelty N(m). The paper's Eq. 3 uses pure content similarity.
             effective_sim = raw_sim * conflict_recency
 
             if effective_sim > best_similarity:
@@ -1020,8 +1314,11 @@ class MemoryManager:
                 # Recompute S(m') with current R(m') per Eq. 1
                 best_conflict_score = 0.50 * conflict_tp + 0.35 * conflict_novelty + 0.15 * conflict_recency
 
-        # Novelty N(m) = 1 - max_similarity (Eq. 3)
-        novelty = 1.0 - best_similarity
+        # Novelty N(m) = 1 - max_similarity (Eq. 3, pure content similarity)
+        # Uses best_raw_similarity (no recency modulation) to separate Novelty
+        # from Recency as the paper intends. Recency modulation is only used
+        # for FindConflict threshold checking (whether a conflict exists).
+        novelty = 1.0 - best_raw_similarity
 
         # Recency R(m) per Eq. 4: for new commits being created now, R=1.0
         # But R is properly included per Eq. 1 so S(m_conflict) can be
@@ -1086,6 +1383,7 @@ class MemoryManager:
         why: str,
         files_changed: list[str],
         next_step: str,
+        patterns_learned: list[str] | None = None,
     ) -> str:
         """Merge new commit data into the most recent commit (admission control).
 
@@ -1163,6 +1461,23 @@ class MemoryManager:
                     f"{files_match_re.group(1)}{', '.join(all_files)}",
                 )
 
+            # Union patterns (CER-inspired)
+            if patterns_learned:
+                patterns_match_re = re.search(r"(\*\*Patterns\*\*:\s*)(.*)", new_block)
+                if patterns_match_re:
+                    old_patterns = [p.strip() for p in patterns_match_re.group(2).split("|") if p.strip()]
+                    merged_patterns = list(dict.fromkeys(old_patterns + patterns_learned))
+                    new_block = new_block.replace(
+                        patterns_match_re.group(0),
+                        f"{patterns_match_re.group(1)}{' | '.join(merged_patterns)}",
+                    )
+                else:
+                    # Insert patterns line before **Next** or **Score**
+                    insert_match = re.search(r"(\*\*(?:Next|Score)\*\*:)", new_block)
+                    if insert_match:
+                        insert = f"**Patterns**: {' | '.join(patterns_learned)}\n"
+                        new_block = new_block[:insert_match.start()] + insert + new_block[insert_match.start():]
+
             # Replace Next with newer value
             next_match = re.search(r"(\*\*Next\*\*:\s*)(.*)", new_block)
             if next_match:
@@ -1193,6 +1508,7 @@ class MemoryManager:
 
     def _update_rolling_summary(
         self, branch: str, what: str, why: str, next_step: str,
+        compressed_summary: str | None = None,
     ) -> None:
         """Regenerate rolling summary: S_t = f(S_{t-1}, D_t).
 
@@ -1201,14 +1517,31 @@ class MemoryManager:
         a progressively refined chain that captures the full branch history
         in a compact form — no need to re-read all individual commits.
 
-        When a sub_client is available, uses LLM to compress the summary
-        (per GCC paper section 2.2). Falls back to concatenation otherwise.
+        Three strategies in priority order:
+        1. If compressed_summary is provided (by Claude Code via two-call pattern),
+           use it directly — this restores the GCC paper's LLM-compressed S_t.
+        2. If sub_client is available, use LLM to compress (legacy sub-model path).
+        3. Fallback: concatenation with structured truncation that preserves the
+           first sentence (project context) and last 3 entries, instead of blind
+           tail truncation.
+
+        Args:
+            compressed_summary: Optional LLM-compressed summary provided by the
+                caller (e.g., Claude Code responding to the compression prompt).
+                When provided, replaces the entire rolling summary.
         """
+        # Strategy 1: Caller-provided compressed summary (two-call pattern)
+        # This is how MCP mode restores the GCC paper's S_t = f(S_{t-1}, D_t)
+        # property — Claude Code IS the LLM that compresses the summary.
+        if compressed_summary is not None:
+            self._write_rolling_summary(branch, compressed_summary.strip()[:1500])
+            return
+
         previous_summary = self._get_rolling_summary(branch)
         new_contribution = f"{what} (because: {why}). Next: {next_step}"
 
+        # Strategy 2: Sub-client LLM compression (legacy, not used in MCP mode)
         if self.sub_client is not None:
-            # LLM-regenerated summary (per GCC paper section 2.2)
             try:
                 prompt = (
                     f"Compress this branch progress into a concise summary (max 300 words):\n\n"
@@ -1219,24 +1552,82 @@ class MemoryManager:
                 messages = [{"role": "user", "content": prompt}]
                 new_summary = self.sub_client.completion(messages)
                 if new_summary and len(new_summary.strip()) > 10:
-                    # Use LLM summary
                     self._write_rolling_summary(branch, new_summary.strip()[:1500])
                     return
             except Exception:
-                pass  # Fall through to concatenation
+                pass  # Fall through to mechanical fallback
 
-        # Fallback: concatenation
+        # Strategy 3: Mechanical concatenation with structured truncation
         if previous_summary:
             new_summary = f"{previous_summary}; {new_contribution}"
         else:
             new_summary = new_contribution
 
-        # Cap rolling summary length to stay compact
+        # Cap rolling summary length with structured truncation
         if len(new_summary) > 1500:
-            # Keep the most recent ~1200 chars + ellipsis for older context
-            new_summary = "..." + new_summary[-1200:]
+            new_summary = self._structured_truncate_summary(new_summary)
 
         self._write_rolling_summary(branch, new_summary)
+
+    @staticmethod
+    def _structured_truncate_summary(summary: str, max_chars: int = 1500) -> str:
+        """Structured truncation preserving context and recency.
+
+        Instead of blind "..." + last_1200_chars (lossy FIFO), this keeps:
+        1. The FIRST sentence — captures project context / initial direction
+        2. The LAST 3 semicolon-delimited entries — most recent work in full
+        3. For older entries in between, only the first clause (before any
+           parenthetical or period) — compressed but not lost
+
+        This is still mechanical (no LLM) but preserves significantly more
+        structure than tail truncation. For true S_t = f(S_{t-1}, D_t),
+        the caller should provide compressed_summary via the two-call pattern.
+        """
+        if len(summary) <= max_chars:
+            return summary
+
+        # Split on semicolons (the delimiter used by concatenation)
+        entries = [e.strip() for e in summary.split(";") if e.strip()]
+
+        if len(entries) <= 3:
+            # Too few entries to structure — fall back to tail truncation
+            return "..." + summary[-(max_chars - 3):]
+
+        # Keep first entry (project context) and last 3 entries in full
+        first_entry = entries[0]
+        last_three = entries[-3:]
+        middle_entries = entries[1:-3]
+
+        # Compress middle entries: keep only first clause
+        compressed_middle = []
+        for entry in middle_entries:
+            # Take text before first parenthetical or period, whichever comes first
+            cut = len(entry)
+            paren_pos = entry.find(" (")
+            period_pos = entry.find(". ")
+            if paren_pos > 0:
+                cut = min(cut, paren_pos)
+            if period_pos > 0:
+                cut = min(cut, period_pos)
+            compressed = entry[:cut].rstrip(" ,;.")
+            if compressed:
+                compressed_middle.append(compressed)
+
+        # Reassemble: first + compressed middle + last 3
+        parts = [first_entry] + compressed_middle + last_three
+        result = "; ".join(parts)
+
+        # If still too long, progressively drop compressed middle entries
+        while len(result) > max_chars and compressed_middle:
+            compressed_middle.pop(0)
+            parts = [first_entry] + compressed_middle + last_three
+            result = "; ".join(parts)
+
+        # Final safety: if still over budget, hard truncate (shouldn't happen often)
+        if len(result) > max_chars:
+            result = "..." + result[-(max_chars - 3):]
+
+        return result
 
     def _write_rolling_summary(self, branch: str, summary: str) -> None:
         """Write the rolling summary into the commits.md file."""
@@ -1294,7 +1685,7 @@ class MemoryManager:
             main_summary = self._get_rolling_summary("main")
             merged = f"{main_summary}; [From {branch_name}]: {branch_summary}" if main_summary else f"[From {branch_name}]: {branch_summary}"
             if len(merged) > 1500:
-                merged = "..." + merged[-1200:]
+                merged = self._structured_truncate_summary(merged)
             self._write_rolling_summary("main", merged)
 
         # Copy branch log to main with provenance (per GCC paper: H_{t+1} = H_t union H_t^(b))
@@ -1396,6 +1787,26 @@ class MemoryManager:
             recent = self._read_commits_window(branch, offset, count)
             if recent:
                 parts.append(f"# Recent Commits ({branch}, offset={offset})\n{recent}")
+
+            # CER pattern buffer: show high-occurrence patterns (arXiv:2506.06698)
+            try:
+                pattern_data = self._load_patterns()
+                recurring = [
+                    (pid, entry) for pid, entry in pattern_data.get("patterns", {}).items()
+                    if entry.get("occurrence_count", 1) >= 2
+                ]
+                if recurring:
+                    recurring.sort(key=lambda x: -x[1]["occurrence_count"])
+                    pattern_lines = ["# Recurring Patterns"]
+                    for pid, entry in recurring[:10]:
+                        promoted_tag = " [promoted]" if entry.get("promoted") else ""
+                        pattern_lines.append(
+                            f"- [{pid}] ({entry['occurrence_count']}x){promoted_tag} "
+                            f"{entry['text'][:150]}"
+                        )
+                    parts.append("\n".join(pattern_lines))
+            except Exception:
+                pass  # Pattern display is supplementary
 
         if level >= 3:
             # Level 3: branch summary + phase summary

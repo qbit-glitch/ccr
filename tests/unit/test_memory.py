@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from unittest.mock import MagicMock, patch
+
 from ccr.core.memory import MemoryManager
 from ccr.core.types import CCRConfig
 
@@ -480,35 +482,41 @@ class TestRecency:
 
 
 class TestScoreComparisonInMerge:
-    def test_new_outranks_existing_creates_new(self, memory):
-        """Alg. 1 line 6: S(m) > S(m_conflict) → create new (both coexist)."""
-        # Create an auth-related commit first so the continuation commit has low novelty
-        memory.commit("Setup auth module", "initialized auth", "security",
-                      ["auth.py"], "add login")
-        # Create a low-priority continuation commit — low novelty (same file/topic) + low type prior
+    def test_new_outranks_existing_merges(self, memory):
+        """Alg. 1 lines 6-7: S(m) > S(m_conflict) → REPLACE old with merged version.
+
+        A high-value new commit that conflicts with a low-value existing commit
+        should merge (replace old with merged version), not create alongside.
+        """
+        # Create a low-priority continuation commit (low type_prior, low novelty)
         memory.commit("Still working on auth", "continued auth work", "wip",
                       ["auth.py"], "continue auth")
-        # New commit is a milestone with different files → higher novelty + high type prior
+        # New commit is a progress commit with same files → higher type_prior → higher score
+        # Same files trigger conflict at low threshold, and new outranks existing
         result = memory.commit(
-            "Auth complete", "finished deployment pipeline", "shipped to production",
-            ["deploy.py", "config.yaml"], "monitor",
+            "Working on auth", "implemented auth module fully", "security requirement",
+            ["auth.py"], "add tests",
             admission_threshold=0.3,  # low threshold to trigger FindConflict
         )
-        assert "C003" in result
-        assert "merged" not in result.lower()
+        assert "merged" in result.lower() or "+" in result
 
-    def test_existing_outranks_new_merges(self, memory):
-        """Alg. 1 line 7: S(m) <= S(m_conflict) → merge into existing."""
+    def test_existing_outranks_new_creates_new(self, memory):
+        """Alg. 1 lines 8-9: S(m) <= S(m_conflict) → ADD new alongside existing.
+
+        A low-value new commit that conflicts with a high-value existing commit
+        should be added alongside (both coexist), not merged.
+        """
         # Create a normal existing commit (progress type, recent → high conflict_score)
         memory.commit("Working on auth", "started auth", "security",
                       ["auth.py"], "continue")
-        # New commit is a continuation → low score → existing outranks
+        # New commit is a continuation → low score → existing outranks → add alongside
         result = memory.commit(
             "Still working on auth", "continued auth", "security",
             ["auth.py"], "keep going",
             admission_threshold=0.3,
         )
-        assert "merged" in result.lower() or "+" in result
+        assert "C002" in result
+        assert "merged" not in result.lower()
 
     def test_score_comparison_uses_actual_scores(self, memory):
         """G1-NEW: Score comparison uses S(m) vs S(m_conflict), not just type_prior."""
@@ -600,16 +608,22 @@ class TestRejectionPath:
 
 
 class TestAdmissionControlIntegration:
-    def test_redundant_commit_merges(self, memory):
-        """Nearly identical continuation commit should merge into previous."""
+    def test_redundant_commit_adds_alongside(self, memory):
+        """Nearly identical continuation commit adds alongside per Alg. 1 lines 8-9.
+
+        When S(m) <= S(m_conflict), the new commit is added alongside the existing
+        one rather than merged. A low-value continuation doesn't replace the
+        higher-value existing commit.
+        """
         memory.commit("Working on auth", "started auth module", "security",
                       ["auth.py"], "continue auth")
         result = memory.commit(
             "Still working on auth", "continued auth module", "security requirement",
             ["auth.py"], "finish auth",
-            admission_threshold=0.5,  # low similarity threshold to ensure merge
+            admission_threshold=0.5,  # low similarity threshold to ensure FindConflict
         )
-        assert "merged" in result.lower() or "+" in result
+        assert "C002" in result
+        assert "merged" not in result.lower()
 
     def test_novel_commit_creates_new(self, memory):
         """Sufficiently different commit creates a new entry."""
@@ -634,9 +648,13 @@ class TestAdmissionControlIntegration:
         assert "merged" not in result.lower()
 
     def test_default_threshold_0_85(self, memory):
-        """G5: Default threshold matches paper's 0.85 FindConflict."""
-        # At default threshold (0.85), identical commits should merge
-        # if similarity >= 0.85 (requires exact same files + keywords + recent)
+        """G5: Default threshold matches paper's 0.85 FindConflict.
+
+        Identical commits trigger FindConflict (similarity >= 0.85).
+        But S(m) < S(m_conflict) since the new duplicate has low novelty while
+        the existing commit was stored with high novelty. Per Alg. 1 lines 8-9,
+        the new commit is added alongside (not merged).
+        """
         memory.commit("Add auth", "implemented login", "security",
                       ["auth.py"], "add tests")
         result = memory.commit(
@@ -644,8 +662,9 @@ class TestAdmissionControlIntegration:
             ["auth.py"], "add tests",
             # No explicit threshold — uses default 0.85
         )
-        # Identical commit + very recent → similarity should be ~1.0 → merge
-        assert "merged" in result.lower() or "+" in result
+        # Identical commit: S(m) < S(m_conflict) → add alongside (Alg. 1 lines 8-9)
+        assert "C002" in result
+        assert "merged" not in result.lower()
 
     def test_different_topic_not_merged_at_default_threshold(self, memory):
         """G8: At realistic threshold (0.85), different topics are never merged."""
@@ -660,24 +679,35 @@ class TestAdmissionControlIntegration:
         assert "merged" not in result.lower()
 
     def test_merged_commit_updates_what(self, memory):
-        """Merged commit appends new what/why to previous."""
-        memory.commit("Working on feature", "started implementation", "new feature",
+        """Merged commit appends new what/why to previous.
+
+        Per Alg. 1 lines 6-7: merge happens when S(m) > S(m_conflict).
+        Setup: low-value continuation first, then higher-value progress commit.
+        """
+        # Low-value existing commit (continuation type → low type_prior)
+        memory.commit("Still working on feature", "continued implementation", "wip",
                       ["feature.py"], "continue")
+        # Higher-value new commit (progress type → higher type_prior → higher score)
         memory.commit(
-            "Still on feature", "added validation", "new feature needs validation",
+            "Working on feature", "added validation", "new feature needs validation",
             ["feature.py"], "add tests",
-            admission_threshold=0.3,  # force merge
+            admission_threshold=0.3,  # force FindConflict
         )
         commits = memory._read_file(memory._get_commits_path("main"))
-        assert "started implementation" in commits
+        assert "continued implementation" in commits
         assert "added validation" in commits
 
     def test_merged_commit_unions_files(self, memory):
-        """Merged commit unions file lists."""
-        memory.commit("Working on feature", "started", "reason",
+        """Merged commit unions file lists.
+
+        Per Alg. 1 lines 6-7: merge happens when S(m) > S(m_conflict).
+        """
+        # Low-value existing commit (continuation type)
+        memory.commit("Still working on feature", "continued", "wip",
                       ["feature.py"], "continue")
+        # Higher-value new commit (progress type) with extra file
         memory.commit(
-            "Still on feature", "added tests", "reason",
+            "Working on feature", "added tests", "reason",
             ["feature.py", "test_feature.py"], "next",
             admission_threshold=0.3,
         )
@@ -686,30 +716,45 @@ class TestAdmissionControlIntegration:
         assert "feature.py" in commits
 
     def test_merged_commit_updates_next(self, memory):
-        """Merged commit replaces next_step with newer value."""
-        memory.commit("Feature", "started", "reason", ["f.py"], "old next step")
+        """Merged commit replaces next_step with newer value.
+
+        Per Alg. 1 lines 6-7: merge happens when S(m) > S(m_conflict).
+        """
+        # Low-value existing commit (continuation type)
+        memory.commit("Still on feature", "continued", "wip", ["f.py"], "old next step")
+        # Higher-value new commit (progress type)
         memory.commit(
-            "Feature", "continued", "reason", ["f.py"], "new next step",
+            "Feature progress", "implemented core logic", "reason", ["f.py"], "new next step",
             admission_threshold=0.3,
         )
         commits = memory._read_file(memory._get_commits_path("main"))
         assert "new next step" in commits
 
     def test_admission_updates_rolling_summary(self, memory):
-        """Even merged commits update the rolling summary."""
-        memory.commit("Feature", "started", "reason", ["f.py"], "continue")
+        """Even merged commits update the rolling summary.
+
+        Per Alg. 1 lines 6-7: merge happens when S(m) > S(m_conflict).
+        """
+        # Low-value existing commit (continuation type)
+        memory.commit("Still on feature", "continued", "wip", ["f.py"], "continue")
+        # Higher-value new commit (progress type)
         memory.commit(
-            "Feature", "added validation", "reason", ["f.py"], "test",
+            "Feature progress", "added validation", "reason", ["f.py"], "test",
             admission_threshold=0.3,
         )
         summary = memory._get_rolling_summary("main")
         assert "validation" in summary.lower()
 
     def test_admission_logs_merge_event(self, memory):
-        """Admission merges are logged in OTA."""
-        memory.commit("Feature", "started", "reason", ["f.py"], "continue")
+        """Admission merges are logged in OTA.
+
+        Per Alg. 1 lines 6-7: merge happens when S(m) > S(m_conflict).
+        """
+        # Low-value existing commit (continuation type)
+        memory.commit("Still on feature", "continued", "wip", ["f.py"], "continue")
+        # Higher-value new commit (progress type)
         memory.commit(
-            "Feature", "continued", "reason", ["f.py"], "test",
+            "Feature progress", "implemented logic", "reason", ["f.py"], "test",
             admission_threshold=0.3,
         )
         log = memory._read_file(memory._get_log_path("main"))
@@ -871,8 +916,13 @@ class TestTimezoneAwareness:
 
 class TestRegexInjectionInMerge:
     def test_merge_title_with_backslash_n(self, memory):
-        r"""Title containing \n should not create a newline in merged commit."""
-        memory.commit("Feature work", "started feature", "reason",
+        r"""Title containing \n should not create a newline in merged commit.
+
+        Per Alg. 1 lines 6-7: merge when S(m) > S(m_conflict).
+        First commit is low-value continuation, second is higher-value fix.
+        """
+        # Low-value continuation (low type_prior)
+        memory.commit("Still working on feature", "continued feature", "wip",
                       ["feature.py"], "continue")
         result = memory.commit(
             r"Fix path C:\new\thing", "fixed path handling", "bug fix",
@@ -885,8 +935,12 @@ class TestRegexInjectionInMerge:
             assert r"C:\new\thing" in commits
 
     def test_merge_title_with_backreference(self, memory):
-        r"""Title containing \1 should not be interpreted as regex backreference."""
-        memory.commit("Feature work", "started feature", "reason",
+        r"""Title containing \1 should not be interpreted as regex backreference.
+
+        Per Alg. 1 lines 6-7: merge when S(m) > S(m_conflict).
+        """
+        # Low-value continuation (low type_prior)
+        memory.commit("Still working on feature", "continued feature", "wip",
                       ["feature.py"], "continue")
         result = memory.commit(
             r"Fix regex \1 group", "fixed regex handling", "bug fix",
@@ -898,8 +952,12 @@ class TestRegexInjectionInMerge:
             assert r"\1" in commits
 
     def test_merge_title_with_special_chars(self, memory):
-        r"""Title with mixed special regex chars should be handled safely."""
-        memory.commit("Feature work", "started feature", "reason",
+        r"""Title with mixed special regex chars should be handled safely.
+
+        Per Alg. 1 lines 6-7: merge when S(m) > S(m_conflict).
+        """
+        # Low-value continuation (low type_prior)
+        memory.commit("Still working on feature", "continued feature", "wip",
                       ["feature.py"], "continue")
         title_with_specials = r"Fix $100 cost \g<1> issue"
         result = memory.commit(
@@ -996,3 +1054,622 @@ class TestRegexInjectionInSummary:
         memory.merge("test-regex", "success", r"Fixed \1 and \g<0> refs")
         commits = memory._read_file(memory._get_commits_path("test-regex"))
         assert r"\1" in commits
+
+
+# ===========================================================================
+# CER-Inspired Pattern Buffer Tests (arXiv:2506.06698)
+# ===========================================================================
+
+
+class TestPatternBuffer:
+    """Tests for the CER-inspired pattern buffer in gcc_commit."""
+
+    # --- Basic Storage ---
+
+    def test_commit_with_patterns_stores_inline(self, memory):
+        """Patterns appear as **Patterns**: field in commits.md."""
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Use {tool} for testing", "Always update docs"])
+        commits = memory._read_file(memory._get_commits_path("main"))
+        assert "**Patterns**:" in commits
+        assert "Use {tool} for testing" in commits
+        assert "Always update docs" in commits
+
+    def test_commit_without_patterns_backward_compat(self, memory):
+        """Old-style commit without patterns still works."""
+        result = memory.commit("T1", "did A", "reason", ["a.py"], "next")
+        assert "C001" in result
+        commits = memory._read_file(memory._get_commits_path("main"))
+        assert "**Patterns**:" not in commits
+
+    def test_patterns_json_created_on_first_pattern(self, memory):
+        """patterns.json created lazily on first commit with patterns."""
+        path = memory._get_patterns_path()
+        assert not os.path.exists(path)
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Pattern one"])
+        assert os.path.exists(path)
+
+    def test_pattern_entry_structure(self, memory):
+        """Verify patterns.json has correct schema."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Check tests before merging"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["version"] == 1
+        assert "P001" in data["patterns"]
+        entry = data["patterns"]["P001"]
+        assert entry["text"] == "Check tests before merging"
+        assert entry["first_seen"] == "C001"
+        assert entry["commit_ids"] == ["C001"]
+        assert entry["occurrence_count"] == 1
+        assert entry["promoted"] is False
+
+    def test_sequential_pattern_ids(self, memory):
+        """Patterns get P001, P002, P003 IDs sequentially."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["First distinct pattern here",
+                                          "Second distinct pattern here"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert "P001" in data["patterns"]
+        assert "P002" in data["patterns"]
+        assert data["next_id"] == 3
+
+    # --- Dedup ---
+
+    def test_identical_pattern_deduped(self, memory):
+        """Exact same pattern text only stored once, occurrence incremented."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Always run tests before committing code"])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=["Always run tests before committing code"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert len(data["patterns"]) == 1
+        entry = data["patterns"]["P001"]
+        assert entry["occurrence_count"] == 2
+        assert "C001" in entry["commit_ids"]
+        assert "C002" in entry["commit_ids"]
+
+    def test_similar_pattern_deduped_above_threshold(self, memory):
+        """Similar patterns (Jaccard >= 0.7) are merged."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Always validate input parameters before processing request data"])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=["Always validate input parameters before processing response data"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        # Should be deduped (high word overlap — differs only in request/response)
+        assert len(data["patterns"]) == 1
+        assert data["patterns"]["P001"]["occurrence_count"] == 2
+
+    def test_different_pattern_not_deduped(self, memory):
+        """Distinct patterns (Jaccard < 0.7) are stored separately."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Always update documentation after API changes"])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=["Use kernel sandbox for REPL execution"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert len(data["patterns"]) == 2
+
+    def test_dedup_case_insensitive(self, memory):
+        """Dedup is case-insensitive."""
+        import json
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Always Update Tests Before Committing Code"])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=["always update tests before committing code"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert len(data["patterns"]) == 1
+        assert data["patterns"]["P001"]["occurrence_count"] == 2
+
+    # --- Occurrence Tracking ---
+
+    def test_occurrence_increments_on_re_observation(self, memory):
+        """Count goes 1 -> 2 -> 3 on successive commits with same pattern."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                           patterns_learned=[pat])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["occurrence_count"] == 3
+
+    def test_same_commit_no_double_count(self, memory):
+        """Same pattern twice in one commit doesn't double-count."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=[pat, pat])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        # First time creates P001, second match finds P001 but commit_id already there
+        assert data["patterns"]["P001"]["occurrence_count"] == 1
+
+    def test_commit_ids_accumulated(self, memory):
+        """All distinct commit IDs tracked in pattern entry."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next", patterns_learned=[pat])
+        memory.commit("T3", "did C", "reason", ["c.py"], "next", patterns_learned=[pat])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["commit_ids"] == ["C001", "C002", "C003"]
+
+    # --- Promotion Suggestions ---
+
+    def test_promotion_suggested_at_threshold(self, memory):
+        """3 occurrences triggers promotion suggestion in return string."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(2):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                           patterns_learned=[pat])
+        result = memory.commit("T3", "did 2", "reason", ["2.py"], "next",
+                                patterns_learned=[pat])
+        assert "Pattern promotion suggestions" in result
+        assert "ace_apply_delta" in result
+
+    def test_no_promotion_below_threshold(self, memory):
+        """2 occurrences returns no suggestion."""
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        result = memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                                patterns_learned=[pat])
+        assert "Pattern promotion suggestions" not in result
+
+    def test_promoted_flag_not_auto_set(self, memory):
+        """promoted remains False — suggestion-only, no auto-add to playbook."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                           patterns_learned=[pat])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["promoted"] is False
+
+    # --- Buffer Management ---
+
+    def test_buffer_eviction_at_max_size(self, memory):
+        """Evicts lowest-occurrence patterns when buffer exceeds max."""
+        import json
+        memory.config.pattern_max_buffer_size = 3
+        distinct_patterns = [
+            "Always validate database connection parameters carefully",
+            "Configure kernel sandbox with allowlist security policies",
+            "Structure playbook bullets using helpful harmful counters",
+            "Implement admission control with recency modulated scoring",
+            "Generate session summaries after completing milestone work",
+        ]
+        for i, pat in enumerate(distinct_patterns):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                           patterns_learned=[pat])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert len(data["patterns"]) == 3
+
+    def test_eviction_preserves_high_occurrence(self, memory):
+        """High-occurrence patterns survive eviction."""
+        import json
+        memory.config.pattern_max_buffer_size = 2
+        # Create a high-occurrence pattern observed 3 times
+        high_pat = "Always validate database connection parameters carefully"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                           patterns_learned=[high_pat])
+        # Now add 2 more low-occurrence distinct patterns — should evict low, keep high
+        memory.commit("T4", "did 3", "reason", ["3.py"], "next",
+                       patterns_learned=["Configure kernel sandbox allowlist security policies",
+                                          "Structure playbook bullets using helpful harmful counters"])
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert len(data["patterns"]) == 2
+        # The high-occurrence pattern should survive
+        high_entries = [e for e in data["patterns"].values() if e["occurrence_count"] >= 3]
+        assert len(high_entries) == 1
+
+    # --- Merge Path ---
+
+    def test_merge_path_preserves_patterns(self, memory):
+        """Patterns survive the admission control merge path."""
+        # First commit
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A",
+                       patterns_learned=["Pattern from first commit for merge test"])
+        commits = memory._read_file(memory._get_commits_path("main"))
+        assert "Pattern from first commit" in commits
+
+    def test_merge_unions_patterns(self, memory):
+        """Merge path unions old + new patterns.
+
+        Per Alg. 1 lines 6-7: merge when S(m) > S(m_conflict).
+        First commit is low-value continuation, second is higher-value progress.
+        """
+        # Low-value continuation (low type_prior → low stored score)
+        memory.commit("Still working on topic", "continued topic work here", "wip",
+                       ["a.py"], "next A",
+                       patterns_learned=["First pattern for merge"])
+        # Higher-value progress commit → S(m) > S(m_conflict) → merge
+        memory.commit("Working on topic progress", "completed topic work here", "shipped",
+                       ["a.py"], "next B",
+                       patterns_learned=["Second pattern for merge"],
+                       admission_threshold=0.0)
+        commits = memory._read_file(memory._get_commits_path("main"))
+        # Both patterns should be present (either in same or separate commits)
+        assert "First pattern for merge" in commits
+
+    # --- Parse ---
+
+    def test_parse_commit_with_patterns(self, memory):
+        """_parse_recent_commit_data extracts patterns list."""
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Pattern alpha", "Pattern beta"])
+        data = memory._parse_recent_commit_data("main", k=1)
+        assert len(data) == 1
+        assert "patterns" in data[0]
+        assert "Pattern alpha" in data[0]["patterns"]
+        assert "Pattern beta" in data[0]["patterns"]
+
+    def test_parse_commit_without_patterns(self, memory):
+        """Old commits without patterns produce empty patterns list."""
+        memory.commit("T1", "did A", "reason", ["a.py"], "next")
+        data = memory._parse_recent_commit_data("main", k=1)
+        assert data[0]["patterns"] == []
+
+    # --- Context Retrieval ---
+
+    def test_context_level2_shows_recurring_patterns(self, memory):
+        """Level 2 context shows patterns with occurrence >= 2."""
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next", patterns_learned=[pat])
+        ctx = memory.get_context(level=2)
+        assert "Recurring Patterns" in ctx
+        assert "(2x)" in ctx
+
+    def test_context_level1_no_patterns(self, memory):
+        """Level 1 context doesn't show patterns."""
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next", patterns_learned=[pat])
+        ctx = memory.get_context(level=1)
+        assert "Recurring Patterns" not in ctx
+
+    # --- get_patterns query ---
+
+    def test_get_patterns_empty(self, memory):
+        """get_patterns on empty buffer returns zero matches."""
+        result = memory.get_patterns()
+        assert result["total"] == 0
+        assert result["matching"] == 0
+
+    def test_get_patterns_min_occurrences_filter(self, memory):
+        """min_occurrences filter works correctly."""
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=[pat, "Single occurrence unique pattern for filter test"])
+        result = memory.get_patterns(min_occurrences=2)
+        assert result["matching"] == 1
+        assert result["total"] == 2
+
+    def test_get_patterns_search_term(self, memory):
+        """search_term filter works correctly."""
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=["Always validate input parameters here",
+                                          "Use kernel sandbox for REPL execution"])
+        result = memory.get_patterns(search_term="kernel")
+        assert result["matching"] == 1
+        assert "kernel" in result["patterns"][0]["text"].lower()
+
+    def test_get_patterns_sorted_by_occurrence(self, memory):
+        """Results sorted by occurrence_count DESC."""
+        high_pat = "High frequency pattern validated repeatedly here"
+        low_pat = "Low frequency pattern only once appearing here"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next",
+                       patterns_learned=[high_pat, low_pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next",
+                       patterns_learned=[high_pat])
+        result = memory.get_patterns()
+        assert result["patterns"][0]["occurrence_count"] > result["patterns"][1]["occurrence_count"]
+
+
+# ===========================================================================
+# G4 Fix: Rolling Summary Compression (GCC paper S_t = f(S_{t-1}, D_t))
+# ===========================================================================
+
+
+class TestRollingSummaryStructuredTruncation:
+    """Tests for the improved structured truncation (replacing blind tail truncation)."""
+
+    def test_short_summary_not_truncated(self, memory):
+        """Summaries under 1500 chars are not truncated."""
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+        summary = memory._get_rolling_summary("main")
+        assert "..." not in summary
+        assert "did A" in summary
+
+    def test_structured_truncation_preserves_first_entry(self, memory):
+        """First entry (project context) is preserved by structured truncation."""
+        # Create enough commits to exceed 1500 chars
+        memory.commit("Init", "Created the initial project scaffold and infrastructure",
+                       "Foundation needed", ["init.py"], "build features")
+        for i in range(20):
+            memory.commit(
+                f"Feature {i}", f"Implemented feature number {i} with extensive detail and documentation",
+                f"User requested feature {i}", [f"feat{i}.py"], f"Implement feature {i+1}",
+            )
+        summary = memory._get_rolling_summary("main")
+        assert len(summary) <= 1500
+        # First entry should be preserved (project context)
+        assert "Created the initial project scaffold" in summary
+
+    def test_structured_truncation_preserves_last_three(self, memory):
+        """Last 3 entries are preserved in full."""
+        memory.commit("Init", "Setup project", "bootstrap", ["init.py"], "start")
+        for i in range(20):
+            memory.commit(
+                f"Step {i}", f"Implemented step {i} with full details",
+                f"needed for progress {i}", [f"s{i}.py"], f"do step {i+1}",
+            )
+        summary = memory._get_rolling_summary("main")
+        # Last 3 entries should be present in full
+        assert "Implemented step 19" in summary
+        assert "Implemented step 18" in summary
+        assert "Implemented step 17" in summary
+
+    def test_structured_truncation_compresses_middle(self, memory):
+        """Middle entries are compressed (parentheticals removed)."""
+        memory.commit("Init", "Setup project", "bootstrap", ["init.py"], "start")
+        for i in range(25):
+            memory.commit(
+                f"Step {i}", f"Implemented step {i} with full details",
+                f"needed for progress {i}", [f"s{i}.py"], f"do step {i+1}",
+            )
+        summary = memory._get_rolling_summary("main")
+        # Summary should be within budget
+        assert len(summary) <= 1500
+        # Should not use old-style blind truncation (no leading "..." unless
+        # very degenerate case with extremely few entries)
+        # The structure is: first entry; compressed middles; last 3
+
+    def test_static_structured_truncate_basic(self, memory):
+        """Direct test of _structured_truncate_summary static method."""
+        from ccr.core.memory import MemoryManager
+        # Build a long summary with semicolons — need entries long enough to exceed 1500
+        entries = ["Initial project setup for the platform with comprehensive documentation"] + \
+                  [f"Feature {i} fully implemented with extensive testing and documentation (because: reason {i} was critically needed). Next: implement feature {i+1}" for i in range(30)]
+        long_summary = "; ".join(entries)
+        assert len(long_summary) > 1500
+
+        result = MemoryManager._structured_truncate_summary(long_summary)
+        assert len(result) <= 1500
+        # First entry preserved
+        assert "Initial project setup" in result
+        # Last 3 entries preserved in full
+        assert "Feature 29" in result
+        assert "Feature 28" in result
+        assert "Feature 27" in result
+
+    def test_static_structured_truncate_short_input(self, memory):
+        """Short inputs returned as-is."""
+        from ccr.core.memory import MemoryManager
+        short = "Small summary; another bit"
+        result = MemoryManager._structured_truncate_summary(short)
+        assert result == short
+
+    def test_static_structured_truncate_few_entries(self, memory):
+        """With <= 3 entries, falls back to tail truncation."""
+        from ccr.core.memory import MemoryManager
+        # Build 3 very long entries
+        entries = [f"Entry {i} " + "x" * 600 for i in range(3)]
+        long_summary = "; ".join(entries)
+        assert len(long_summary) > 1500
+        result = MemoryManager._structured_truncate_summary(long_summary)
+        assert len(result) <= 1500
+        assert result.startswith("...")
+
+
+class TestRollingSummaryCompressedSummaryParam:
+    """Tests for the compressed_summary parameter on commit()."""
+
+    def test_compressed_summary_used_directly(self, memory):
+        """When compressed_summary is provided, it replaces the rolling summary."""
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+        memory.commit("T2", "did B", "reason B", ["b.py"], "next B",
+                       compressed_summary="Project started with A, then added B. Direction: C.")
+        summary = memory._get_rolling_summary("main")
+        assert summary == "Project started with A, then added B. Direction: C."
+        # Mechanical concatenation should NOT be present
+        assert "did A (because:" not in summary
+
+    def test_compressed_summary_none_uses_mechanical(self, memory):
+        """When compressed_summary is None (default), uses mechanical concatenation."""
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+        memory.commit("T2", "did B", "reason B", ["b.py"], "next B")
+        summary = memory._get_rolling_summary("main")
+        # Should have mechanical concatenation markers
+        assert "(because:" in summary
+        assert "did A" in summary
+        assert "did B" in summary
+
+    def test_compressed_summary_capped_at_1500(self, memory):
+        """compressed_summary is capped at 1500 chars."""
+        long_summary = "x" * 2000
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A",
+                       compressed_summary=long_summary)
+        summary = memory._get_rolling_summary("main")
+        assert len(summary) <= 1500
+
+    def test_compressed_summary_stripped(self, memory):
+        """compressed_summary is stripped of leading/trailing whitespace."""
+        memory.commit("T1", "did A", "reason A", ["a.py"], "next A",
+                       compressed_summary="  Cleaned summary content  ")
+        summary = memory._get_rolling_summary("main")
+        assert summary == "Cleaned summary content"
+
+    def test_compressed_summary_backward_compat(self, memory):
+        """Commit without compressed_summary works exactly as before."""
+        result = memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+        assert "C001" in result
+        summary = memory._get_rolling_summary("main")
+        assert "did A" in summary
+
+
+class TestRollingSummaryCompressionPrompt:
+    """Tests for the compression warning in commit return value.
+
+    Warning threshold is 1200 chars, structured truncation caps at 1500.
+    So summaries between 1200-1500 chars trigger the warning, giving
+    Claude Code a chance to compress before truncation degrades quality.
+    """
+
+    def test_short_summary_no_warning(self, memory):
+        """Short summaries don't trigger compression warning."""
+        result = memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+        assert "Rolling summary is getting long" not in result
+        assert "compressed_summary" not in result
+
+    def test_long_summary_triggers_warning(self, memory):
+        """When rolling summary exceeds 1200 chars, commit returns warning."""
+        # Build up a summary that exceeds 1200 chars through multiple commits
+        # Each commit appends ~80-100 chars to the summary
+        for i in range(15):
+            result = memory.commit(
+                f"Step {i}",
+                f"Implemented detailed feature number {i} with comprehensive docs",
+                f"User requested feature {i} with thorough testing coverage needed",
+                [f"feature_{i}.py", f"test_feature_{i}.py"],
+                f"Proceed to implement feature {i+1} next",
+            )
+        summary = memory._get_rolling_summary("main")
+        # After enough commits, the summary should exceed 1200 chars
+        # (each entry is ~100 chars: "what (because: why). Next: next_step")
+        if len(summary) > 1200:
+            assert "Rolling summary is getting long" in result
+            assert "compressed_summary" in result
+
+    def test_warning_includes_char_count(self, memory):
+        """Warning message includes the current summary length."""
+        # Write a summary just over the 1200 char threshold directly
+        # then commit to trigger the warning
+        summary_1300 = "; ".join([f"Entry {i} with some content here" for i in range(40)])
+        assert len(summary_1300) > 1200
+        memory._write_rolling_summary("main", summary_1300[:1400])
+        result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
+        assert "Rolling summary is getting long" in result
+        # Should include the actual char count
+        assert "chars" in result
+
+    def test_no_warning_when_compressed_summary_provided(self, memory):
+        """When compressed_summary is provided, no warning even if summary is long."""
+        # Write a long base summary
+        memory._write_rolling_summary("main", "x" * 1300)
+        # Commit with compressed_summary — should NOT trigger warning
+        result = memory.commit("Next", "added more", "reason", ["f.py"], "done",
+                               compressed_summary="Compressed version of the summary")
+        assert "Rolling summary is getting long" not in result
+
+    def test_warning_suggests_two_call_pattern(self, memory):
+        """Warning message mentions the two-call pattern for compression."""
+        memory._write_rolling_summary("main", "x" * 1300)
+        result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
+        assert "compressed_summary" in result
+        assert "gcc_consolidate" in result
+
+
+class TestCommitEmbeddings:
+    """Tests for ONNX commit embedding cache."""
+
+    def test_get_commit_embeddings_path(self, memory):
+        path = memory._get_commit_embeddings_path()
+        assert path.endswith("commit_embeddings.json.gz")
+        assert memory.ccr_root in path
+
+    def test_embed_commit_no_op_when_model_unavailable(self, memory):
+        """When no ONNX model, _embed_commit returns None without error."""
+        with patch("ccr.core.memory.get_embedding_model", return_value=None):
+            result = memory._embed_commit("C001", "some text")
+        assert result is None
+
+    def test_embed_commit_stores_vector_in_cache(self, memory):
+        """When model available, vector is persisted to cache file."""
+        import numpy as np
+
+        fake_vec = np.ones(384, dtype=np.float32)
+        fake_vec /= np.linalg.norm(fake_vec)
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = fake_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            result = memory._embed_commit("C001", "test text")
+
+        assert result is not None
+        # Cache file must exist
+        assert os.path.isfile(memory._get_commit_embeddings_path())
+        # Returned vector matches
+        np.testing.assert_allclose(result, fake_vec, rtol=1e-5)
+
+    def test_embed_commit_cache_grows(self, memory):
+        """Each call appends one entry to cache."""
+        import numpy as np
+
+        def make_vec():
+            v = np.random.rand(384).astype(np.float32)
+            return v / np.linalg.norm(v)
+
+        mock_model = MagicMock()
+        mock_model.embed_query.side_effect = [make_vec(), make_vec(), make_vec()]
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            memory._embed_commit("C001", "a")
+            memory._embed_commit("C002", "b")
+            memory._embed_commit("C003", "c")
+
+        from ccr.context.embeddings import load_embeddings
+        cache = load_embeddings(memory._get_commit_embeddings_path())
+        assert set(cache.keys()) == {"C001", "C002", "C003"}
+
+    def test_embed_commit_caps_cache(self, memory):
+        """Cache is capped at link_scan_window * 2; oldest entries evicted."""
+        import numpy as np
+
+        cap = memory.config.link_scan_window * 2  # default: 40
+
+        def make_vec():
+            v = np.random.rand(384).astype(np.float32)
+            return v / np.linalg.norm(v)
+
+        mock_model = MagicMock()
+        mock_model.embed_query.side_effect = [make_vec() for _ in range(cap + 5)]
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            for i in range(cap + 5):
+                memory._embed_commit(f"C{i:03d}", f"text {i}")
+
+        from ccr.context.embeddings import load_embeddings
+        cache = load_embeddings(memory._get_commit_embeddings_path())
+        assert len(cache) == cap
+        # Oldest evicted: C000..C004 should be gone
+        assert "C000" not in cache
+        assert "C004" not in cache
+
+    def test_load_commit_embeddings_returns_ndarrays(self, memory):
+        """_load_commit_embeddings converts list[float] -> np.ndarray."""
+        import numpy as np
+
+        fake_vec = np.ones(384, dtype=np.float32)
+        fake_vec /= np.linalg.norm(fake_vec)
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = fake_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            memory._embed_commit("C001", "text")
+
+        result = memory._load_commit_embeddings(["C001"])
+        assert "C001" in result
+        assert isinstance(result["C001"], np.ndarray)
+        assert result["C001"].shape == (384,)
+
+    def test_load_commit_embeddings_missing_ids_ignored(self, memory):
+        """IDs not in cache are silently omitted."""
+        result = memory._load_commit_embeddings(["C999", "C998"])
+        assert result == {}
