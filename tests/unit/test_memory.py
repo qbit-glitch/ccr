@@ -1581,6 +1581,7 @@ class TestRollingSummaryCompressionPrompt:
         summary = "x" * 1200 + " important context here"
         memory._write_rolling_summary("main", summary)
         result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
+        assert "Rolling summary is getting long" in result
         assert "important context here" in result
         # Should show the summary between delimiters
         assert "---" in result
