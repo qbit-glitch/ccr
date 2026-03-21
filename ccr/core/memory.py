@@ -779,6 +779,10 @@ class MemoryManager:
 
         links: list[CommitLink] = []
 
+        # Hoist embedding load outside the per-commit loop: one gzip read for all recent
+        # commits instead of N reads (O(1) I/O vs O(N) I/O per commit() call).
+        all_cached = self._load_commit_embeddings([c.get("id", "") for c in recent if c.get("id")])
+
         for commit in recent:
             cid = commit.get("id", "")
             if not cid or cid == commit_id:
@@ -818,10 +822,16 @@ class MemoryManager:
 
             # 4. Semantic links (only if no other link type to this target)
             if not has_typed_link:
-                cached = self._load_commit_embeddings([cid])
-                if new_vec is not None and cid in cached:
-                    # Dense cosine: dot product of L2-normalized vectors
-                    score = float(cached[cid] @ new_vec)
+                if new_vec is not None and cid in all_cached:
+                    cached_vec = all_cached[cid]
+                    if cached_vec.shape == new_vec.shape:
+                        # Dense cosine: dot product of L2-normalized vectors
+                        score = float(cached_vec @ new_vec)
+                    else:
+                        # Shape mismatch (stale cache from different model dim) — fall back
+                        old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
+                        old_keywords = self._extract_keywords(old_text)
+                        score = self._jaccard(new_keywords, old_keywords)
                 else:
                     old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
                     old_keywords = self._extract_keywords(old_text)
