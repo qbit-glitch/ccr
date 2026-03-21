@@ -583,7 +583,7 @@ class MemoryManager:
     def _get_commit_embeddings_path(self) -> str:
         return os.path.join(self.ccr_root, "commit_embeddings.json.gz")
 
-    def _embed_commit(self, commit_id: str, text: str):
+    def _embed_commit(self, commit_id: str, text: str) -> "np.ndarray | None":
         """Embed commit text and persist to cache. Returns vector or None.
 
         Appends to .ccr/commit_embeddings.json.gz (capped at
