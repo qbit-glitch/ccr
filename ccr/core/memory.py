@@ -407,9 +407,15 @@ class MemoryManager:
         self._git_commit(f"ccr: {title}")
 
         # Heuristic commit cross-linking (A-MEM/MAGMA inspired taxonomy)
+        # _embed_commit is called here (normal path only) and its vector is
+        # passed to _compute_links to avoid a second inference pass.
         try:
+            new_vec = self._embed_commit(
+                commit_id, f"{title} {what} {why} {next_step}"
+            )
             commit_links = self._compute_links(
                 branch, commit_id, title, what, why, files_changed, next_step,
+                new_vec=new_vec,
             )
             if commit_links:
                 self._update_links(commit_id, commit_links)
@@ -733,6 +739,7 @@ class MemoryManager:
         why: str,
         files_changed: list[str],
         next_step: str,
+        new_vec=None,  # (384,) float32 L2-normalized ndarray, or None
     ) -> list[CommitLink]:
         """Compute heuristic cross-links for a new commit against recent history.
 
@@ -747,8 +754,8 @@ class MemoryManager:
            existing commits (cf. MAGMA causal graph which uses LLM inference
            for implicit causality — we only detect explicit references)
         3. Supersession links: replacement language + C### (heuristic, no paper analog)
-        4. Semantic links: word Jaccard > threshold (cf. MAGMA semantic graph
-           which uses dense vector cosine similarity — we use bag-of-words)
+        4. Semantic links: dense cosine similarity when ONNX embedding available
+           for both commits; word Jaccard fallback otherwise (per-commit fallback).
 
         MAGMA's temporal graph (immutable chronological chain) is implicit in
         sequential commit IDs and not stored as explicit links.
@@ -811,12 +818,17 @@ class MemoryManager:
 
             # 4. Semantic links (only if no other link type to this target)
             if not has_typed_link:
-                old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
-                old_keywords = self._extract_keywords(old_text)
-                kw_sim = self._jaccard(new_keywords, old_keywords)
-                if kw_sim > self.config.link_semantic_threshold:
+                cached = self._load_commit_embeddings([cid])
+                if new_vec is not None and cid in cached:
+                    # Dense cosine: dot product of L2-normalized vectors
+                    score = float(cached[cid] @ new_vec)
+                else:
+                    old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
+                    old_keywords = self._extract_keywords(old_text)
+                    score = self._jaccard(new_keywords, old_keywords)
+                if score > self.config.link_semantic_threshold:
                     links.append(CommitLink(
-                        target=cid, link_type="semantic", score=round(kw_sim, 3),
+                        target=cid, link_type="semantic", score=round(score, 3),
                     ))
 
         return links

@@ -1676,3 +1676,167 @@ class TestCommitEmbeddings:
         """IDs not in cache are silently omitted."""
         result = memory._load_commit_embeddings(["C999", "C998"])
         assert result == {}
+
+    def test_compute_links_uses_cosine_when_vec_available(self, memory):
+        """When new_vec provided and old embedding cached, cosine used for semantic link."""
+        import numpy as np
+
+        # Commit C001 — store its embedding in cache
+        vec_old = np.zeros(384, dtype=np.float32)
+        vec_old[0] = 1.0  # unit vector in dim 0
+
+        from ccr.context.embeddings import save_embeddings
+        cache = {"C001": vec_old.tolist()}
+        save_embeddings(cache, memory._get_commit_embeddings_path())
+
+        # Parse a fake C001 in recent commits
+        with patch.object(memory, "_parse_recent_commit_data") as mock_recent:
+            mock_recent.return_value = [{
+                "id": "C001", "title": "old", "what": "old work", "why": "old reason",
+                "files": [], "next_step": "old next",
+            }]
+
+            # new_vec similar to vec_old — dot product ~1.0 (above default threshold)
+            vec_new = np.zeros(384, dtype=np.float32)
+            vec_new[0] = 1.0
+
+            links = memory._compute_links(
+                "main", "C002", "similar title", "similar work", "similar reason",
+                [], "next", new_vec=vec_new,
+            )
+
+        semantic_links = [l for l in links if l.link_type == "semantic"]
+        assert len(semantic_links) == 1
+        assert semantic_links[0].score > 0.9  # cosine of near-identical vectors
+
+    def test_compute_links_falls_back_to_jaccard_when_no_vec(self, memory):
+        """When new_vec=None, semantic link uses Jaccard (existing behavior)."""
+        with patch.object(memory, "_parse_recent_commit_data") as mock_recent:
+            mock_recent.return_value = [{
+                "id": "C001", "title": "unique rare keyword zebra",
+                "what": "zebra keyword work", "why": "zebra reason",
+                "files": [], "next_step": "next",
+            }]
+            links = memory._compute_links(
+                "main", "C002", "unique rare keyword zebra",
+                "zebra keyword work", "zebra reason", [], "next", new_vec=None,
+            )
+        semantic_links = [l for l in links if l.link_type == "semantic"]
+        assert len(semantic_links) == 1  # Jaccard high for identical rare keywords
+
+    def test_commit_calls_embed_commit_and_passes_vec_to_compute_links(self, memory):
+        """commit() embeds and passes new_vec to _compute_links (no double embed)."""
+        import numpy as np
+
+        fake_vec = np.ones(384, dtype=np.float32)
+        fake_vec /= np.linalg.norm(fake_vec)
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = fake_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            with patch.object(memory, "_compute_links", wraps=memory._compute_links) as mock_cl:
+                memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
+
+        # embed_query called exactly once (in _embed_commit; NOT again in _compute_links)
+        assert mock_model.embed_query.call_count == 1
+        # _compute_links received new_vec as keyword argument
+        _, kwargs = mock_cl.call_args
+        assert kwargs.get("new_vec") is not None
+
+    def test_embed_commit_not_called_on_amac_merge_path(self, memory):
+        """When A-MAC takes the merge path (new_score > conflict_score -> early return),
+        _embed_commit is not called -- it lives after the merge return point in commit().
+
+        Key: raw_sim = 0.50*file_sim + 0.50*kw_sim. Same files -> file_sim=1 but
+        novelty suppressed (raw_sim>=0.5 -> new_score ~= conflict_score -> tie -> fall-through).
+        Fix: drive conflict via keyword overlap only, use DIFFERENT files so file_sim=0.
+
+        stored_score=0.05 short-circuits to conflict_novelty=0.5 (memory.py line ~1265):
+          conflict_score = 0.50*0.5 + 0.35*0.5 + 0.15*1.0 = 0.575
+          Greek-letter keywords: overlap=9/union=11 -> kw_sim~=0.818
+          raw_sim(new) = 0.50*0 + 0.50*0.818 = 0.409  (file_sim=0, different files)
+          novelty(new) = 1 - 0.409 = 0.591
+          new_score = 0.50*0.5 + 0.35*0.591 + 0.15*1.0 = 0.607 > 0.575 -> merge
+        """
+        import numpy as np
+        import re as _re
+
+        fake_vec = np.ones(384, dtype=np.float32)
+        fake_vec /= np.linalg.norm(fake_vec)
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = fake_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            # First commit -- keyword-rich with rare Greek letters, file "f.py"
+            memory.commit(
+                "alpha beta gamma delta epsilon sigma",
+                "alpha beta gamma work", "delta epsilon sigma reason",
+                ["f.py"], "alpha next",
+                admission_threshold=0.3,
+            )
+            count_after_first = mock_model.embed_query.call_count
+            assert count_after_first == 1
+
+            # Lower C001's stored score to 0.05 -> conflict_score=0.575 via short-circuit.
+            # Score is written as "**Score**: 1.00" (:.2f format, memory.py line ~379),
+            # so use regex replace to match any stored score value.
+            path = memory._get_commits_path("main")
+            content = memory._read_file(path)
+            content = _re.sub(r'\*\*Score\*\*: [\d.]+', '**Score**: 0.05', content)
+            memory._write_file(path, content)
+
+            # Second commit: overlapping keywords (kw_sim~=0.818) but different file "g.py"
+            # -> file_sim=0, novelty=0.591, new_score=0.607 > conflict_score=0.575 -> merge
+            memory.commit(
+                "alpha beta gamma delta epsilon sigma zeta eta",
+                "alpha beta gamma zeta work", "delta epsilon sigma eta reason",
+                ["g.py"], "zeta eta next",
+                admission_threshold=0.3,
+            )
+
+        # Merge path early return: _embed_commit was not reached
+        assert mock_model.embed_query.call_count == count_after_first
+
+    def test_compute_links_per_commit_mixed_fallback(self, memory):
+        """In one _compute_links call: commit with cached embedding uses cosine,
+        commit without cached embedding uses Jaccard -- both in the same scan."""
+        import numpy as np
+        from ccr.context.embeddings import save_embeddings
+
+        # C001 has a cached embedding (unit vector in dim 0)
+        vec_old = np.zeros(384, dtype=np.float32)
+        vec_old[0] = 1.0
+        save_embeddings({"C001": vec_old.tolist()}, memory._get_commit_embeddings_path())
+
+        # C002 has NO cached embedding
+
+        with patch.object(memory, "_parse_recent_commit_data") as mock_recent:
+            mock_recent.return_value = [
+                # C001: has embedding, will use cosine
+                {"id": "C001", "title": "alpha beta gamma", "what": "alpha work",
+                 "why": "alpha reason", "files": []},
+                # C002: no embedding, will fall back to Jaccard
+                # Use rare keywords that match new commit text -> Jaccard fires
+                {"id": "C002", "title": "unique zebra quux xyzzy",
+                 "what": "zebra quux xyzzy", "why": "xyzzy reason", "files": []},
+            ]
+
+            # new_vec is a unit vector in dim 0 -- cosine with C001 ~= 1.0
+            vec_new = np.zeros(384, dtype=np.float32)
+            vec_new[0] = 1.0
+
+            links = memory._compute_links(
+                "main", "C003",
+                "unique zebra quux xyzzy alpha beta gamma",
+                "zebra quux xyzzy alpha work", "alpha reason",
+                [], "next", new_vec=vec_new,
+            )
+
+        # C001: cosine similarity ~1.0 -> semantic link
+        # C002: Jaccard on rare matching keywords -> semantic link
+        semantic_links = {l.target: l for l in links if l.link_type == "semantic"}
+        assert "C001" in semantic_links, "C001 should link via cosine"
+        assert "C002" in semantic_links, "C002 should link via Jaccard fallback"
+        # C001 cosine score should be very high
+        assert semantic_links["C001"].score > 0.9
