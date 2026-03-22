@@ -1174,6 +1174,36 @@ class MemoryManager:
 
         return suggestions[:5]
 
+    def mark_pattern_promoted_by_content(self, text: str) -> int:
+        """Mark patterns matching `text` as promoted (CER buffer management).
+
+        Called after ace_apply_delta ADD to close the loop: if the user added
+        a bullet matching a pending pattern, that pattern is now promoted.
+
+        Returns: number of patterns marked promoted.
+        """
+        path = self._get_patterns_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+            if not raw:
+                return 0
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return 0
+
+            matched_id = self._find_matching_pattern(data, text)
+            if matched_id is None:
+                return 0
+
+            entry = data["patterns"][matched_id]
+            if entry.get("promoted", False):
+                return 0  # Already promoted
+
+            entry["promoted"] = True
+            self._write_file_unlocked(path, json.dumps(data, indent=2))
+            return 1
+
     def get_patterns(
         self,
         min_occurrences: int = 1,

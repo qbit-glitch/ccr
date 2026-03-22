@@ -235,6 +235,45 @@ class TestACEApplyDelta:
         with open(playbook_path) as f:
             assert "Persisted" in f.read()
 
+    def test_ace_apply_delta_add_marks_pattern_promoted(self):
+        """ADD with content matching a buffered pattern marks it promoted."""
+        pat = "Always validate input parameters before processing data request"
+        # Build pattern to threshold
+        for i in range(3):
+            gcc_commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                       patterns_learned=[pat])
+
+        # Now ADD a bullet with matching content
+        result = ace_apply_delta([
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": pat}
+        ])
+        assert "Applied 1" in result
+        assert "Marked 1 pattern(s) as promoted" in result
+
+        # Verify the pattern is actually promoted in the buffer
+        mem = mcp_mod._memory
+        assert mem is not None
+        patterns_path = mem._get_patterns_path()
+        with open(patterns_path) as f:
+            data = json.load(f)
+        assert data["patterns"]["P001"]["promoted"] is True
+
+    def test_ace_apply_delta_add_no_match_no_promotion_note(self):
+        """ADD with content that doesn't match any pattern produces no promotion note."""
+        pat = "Always validate input parameters before processing data request"
+        # Build a pattern in the buffer
+        for i in range(3):
+            gcc_commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                       patterns_learned=[pat])
+
+        # ADD a bullet with completely unrelated content
+        result = ace_apply_delta([
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS",
+             "content": "Database indexing optimization techniques for large datasets"}
+        ])
+        assert "Applied 1" in result
+        assert "Marked" not in result
+
 
 class TestACEUpdateCounters:
     def test_update_helpful(self):

@@ -2115,6 +2115,70 @@ class TestScanPendingPromotions:
 
 
 # ===========================================================================
+# Tests for mark_pattern_promoted_by_content
+# ===========================================================================
+
+
+class TestMarkPatternPromotedByContent:
+    """Tests for CER buffer close-the-loop: mark_pattern_promoted_by_content."""
+
+    def test_mark_pattern_promoted_by_content_marks_match(self, memory):
+        """Matching pattern is marked promoted=True, returns 1."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+
+        result = memory.mark_pattern_promoted_by_content(pat)
+        assert result == 1
+
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["promoted"] is True
+
+    def test_mark_pattern_promoted_already_promoted(self, memory):
+        """Already-promoted pattern returns 0 and is not double-promoted."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+
+        # First promotion
+        result1 = memory.mark_pattern_promoted_by_content(pat)
+        assert result1 == 1
+
+        # Second call on same content — already promoted
+        result2 = memory.mark_pattern_promoted_by_content(pat)
+        assert result2 == 0
+
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["promoted"] is True
+
+    def test_mark_pattern_promoted_no_match(self, memory):
+        """Content that doesn't match any pattern returns 0."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+
+        result = memory.mark_pattern_promoted_by_content(
+            "Completely unrelated text about database indexing optimization"
+        )
+        assert result == 0
+
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["promoted"] is False
+
+    def test_mark_pattern_promoted_empty_buffer(self, memory):
+        """Empty pattern buffer returns 0 without error."""
+        # No patterns committed — patterns.json doesn't exist yet
+        result = memory.mark_pattern_promoted_by_content(
+            "Always validate input parameters before processing data"
+        )
+        assert result == 0
+
+
+# ===========================================================================
 # Tests for ONNX re-ranking in get_linked_commits()
 # ===========================================================================
 

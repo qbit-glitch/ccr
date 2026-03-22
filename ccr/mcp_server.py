@@ -681,7 +681,22 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> str:
             ops = parse_delta_operations({"operations": operations})
             applied = pb.apply_delta(ops)
             save_fn()
-            return f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
+
+        # Mark matching patterns as promoted (CER buffer close-the-loop)
+        promoted_count = 0
+        with _state_lock:
+            mem = _ensure_memory()
+        for op in ops:
+            if op.op_type == "ADD" and op.content:
+                try:
+                    promoted_count += mem.mark_pattern_promoted_by_content(op.content)
+                except Exception:
+                    pass  # Never fail the delta apply
+
+        result = f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
+        if promoted_count:
+            result += f" Marked {promoted_count} pattern(s) as promoted in CER buffer."
+        return result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
