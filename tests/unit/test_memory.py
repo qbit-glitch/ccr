@@ -2332,3 +2332,61 @@ class TestGetLinkedCommitsONNXRerank:
         # C003 falls back to its stored heuristic score (0.7)
         assert "embedding_score" in by_id["C003"]
         assert abs(by_id["C003"]["embedding_score"] - 0.7) < 1e-5
+
+
+# ===========================================================================
+# Tests for embedding_score in gcc_context level 5 follow_links output
+# ===========================================================================
+
+
+class TestContextFollowLinksEmbeddingScore:
+    """Tests for embedding_score display in get_context(level=5, follow_links=True)."""
+
+    def test_follow_links_includes_embedding_score(self, memory):
+        """When get_linked_commits returns embedding_score, it appears in L5 output."""
+        memory.commit("Source commit", "did X", "why X", ["x.py"], "next X")
+        linked_result = [
+            {
+                "id": "C002",
+                "title": "Linked commit",
+                "link_type": "semantic",
+                "what": "did Y",
+                "embedding_score": 0.92,
+            }
+        ]
+        with patch.object(memory, "get_linked_commits", return_value=linked_result):
+            ctx = memory.get_context(level=5, commit_id="C001", follow_links=True)
+
+        assert "[emb: 0.920]" in ctx
+
+    def test_follow_links_no_embedding_score_when_absent(self, memory):
+        """When get_linked_commits result has no embedding_score, tag is omitted."""
+        memory.commit("Source commit", "did X", "why X", ["x.py"], "next X")
+        linked_result = [
+            {
+                "id": "C002",
+                "title": "Linked commit",
+                "link_type": "semantic",
+                "what": "did Y",
+            }
+        ]
+        with patch.object(memory, "get_linked_commits", return_value=linked_result):
+            ctx = memory.get_context(level=5, commit_id="C001", follow_links=True)
+
+        assert "[emb:" not in ctx
+
+    def test_format_links_for_context_semantic_shows_embedding_score(self, memory):
+        """_format_links_for_context shows 'emb:' tag for semantic links with embedding_score."""
+        links = {
+            "entity": [],
+            "causal": [],
+            "supersession": [],
+            "semantic": [
+                {"target": "C005", "score": 0.5, "embedding_score": 0.875},
+            ],
+        }
+        output = memory._format_links_for_context("C001", links)
+
+        assert "emb: 0.88" in output
+        # Must NOT fall back to the raw score label when embedding_score is present
+        assert "score: 0.50" not in output

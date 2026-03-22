@@ -988,8 +988,11 @@ class MemoryManager:
                 elif lt in ("causal", "supersession"):
                     snippet = e.get("snippet", "")
                     parts.append(f'{tgt} ("{snippet}")' if snippet else tgt)
-                else:
-                    parts.append(f"{tgt} (score: {e.get('score', 0):.2f})")
+                else:  # semantic
+                    emb = e.get("embedding_score")
+                    score_val = emb if emb is not None else e.get("score", 0.0)
+                    tag = "emb" if emb is not None else "score"
+                    parts.append(f"{tgt} ({tag}: {score_val:.2f})")
             lines.append(f"- **{lt.capitalize()}**: {', '.join(parts)}")
         return "\n".join(lines)
 
@@ -1937,7 +1940,9 @@ class MemoryManager:
             offset: Scroll position for commit window (0 = most recent)
             log_window: Number of recent OTA log entries to include (0 = none)
             metadata_segment: Metadata key to include (e.g. "file_tree", "dependencies")
-            follow_links: If True and level >= 5, include linked commit summaries (BFS 1-hop)
+            follow_links: If True and level >= 5, include linked commit summaries (BFS 1-hop).
+                When ONNX embeddings are available, each linked commit entry includes an
+                ``embedding_score`` tag (e.g. ``[emb: 0.920]``) showing dense cosine similarity.
         """
         branch = branch or self.get_active_branch()
         parts = []
@@ -2035,8 +2040,9 @@ class MemoryManager:
                     if follow_links:
                         linked = self.get_linked_commits(commit_id, max_hops=1)
                         for lc in linked[:5]:
+                            emb_tag = f" [emb: {lc['embedding_score']:.3f}]" if "embedding_score" in lc else ""
                             parts.append(
-                                f"## Linked: [{lc['id']}] {lc.get('title', '')} ({lc['link_type']})\n"
+                                f"## Linked: [{lc['id']}] {lc.get('title', '')} ({lc['link_type']}){emb_tag}\n"
                                 f"**What**: {lc.get('what', '')}"
                             )
             elif search_term:
