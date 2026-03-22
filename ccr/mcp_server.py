@@ -440,7 +440,10 @@ def gcc_links(
                 detail = f" | shared: {', '.join(e['shared_files'])}"
             elif lt in ("causal", "supersession") and e.get("snippet"):
                 detail = f' | "{e["snippet"]}"'
-            lines.append(f"- **[{e['id']}]**{hop_tag} {title}{detail}")
+            score_tag = ""
+            if "embedding_score" in e:
+                score_tag = f" [emb: {e['embedding_score']:.3f}]"
+            lines.append(f"- **[{e['id']}]**{hop_tag}{score_tag} {title}{detail}")
             if what:
                 lines.append(f"  {what}")
     return "\n".join(lines)
