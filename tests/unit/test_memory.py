@@ -1852,3 +1852,263 @@ class TestCommitEmbeddings:
         assert "C002" in semantic_links, "C002 should link via Jaccard fallback"
         # C001 cosine score should be very high
         assert semantic_links["C001"].score > 0.9
+
+
+# ===========================================================================
+# Task 2: Auto-trigger rolling summary compression (_mechanical_compress_summary)
+# ===========================================================================
+
+
+class TestMechanicalCompressSummary:
+    """Tests for the _mechanical_compress_summary static method (Strategy 2.5)."""
+
+    def test_short_summary_unchanged(self, memory):
+        """Summaries with <= 4 segments are returned unchanged."""
+        from ccr.core.memory import MemoryManager
+        short = "First entry; Second entry; Third entry"
+        result = MemoryManager._mechanical_compress_summary(short)
+        assert result == short
+
+    def test_exactly_four_segments_unchanged(self, memory):
+        """Exactly 4 segments boundary — returned unchanged."""
+        from ccr.core.memory import MemoryManager
+        s = "Seg one; Seg two; Seg three; Seg four"
+        result = MemoryManager._mechanical_compress_summary(s)
+        assert result == s
+
+    def test_keeps_first_segment(self, memory):
+        """First segment (project context anchor) is always preserved."""
+        from ccr.core.memory import MemoryManager
+        segments = ["CCR is a zero-LLM MCP server for persistent memory"] + \
+                   [f"Added feature {i} with detailed implementation notes" for i in range(10)]
+        summary = "; ".join(segments)
+        result = MemoryManager._mechanical_compress_summary(summary)
+        assert "CCR is a zero-LLM MCP server" in result
+
+    def test_keeps_last_three_segments(self, memory):
+        """Last 3 segments (most recent contributions) are always preserved."""
+        from ccr.core.memory import MemoryManager
+        segments = ["Initial anchor context segment here"] + \
+                   [f"Middle work on item {i}" for i in range(10)] + \
+                   ["Last segment A details", "Last segment B details", "Last segment C details"]
+        summary = "; ".join(segments)
+        result = MemoryManager._mechanical_compress_summary(summary)
+        assert "Last segment A details" in result
+        assert "Last segment B details" in result
+        assert "Last segment C details" in result
+
+    def test_drops_middle_segments(self, memory):
+        """Middle segments (not first, not last 3) are dropped."""
+        from ccr.core.memory import MemoryManager
+        segments = ["First anchor"] + \
+                   [f"Middle segment number {i} with content" for i in range(8)] + \
+                   ["Last A", "Last B", "Last C"]
+        summary = "; ".join(segments)
+        result = MemoryManager._mechanical_compress_summary(summary)
+        # Middle segments should be absent
+        for i in range(1, 7):  # Middle segments (not last 3)
+            assert f"Middle segment number {i} with content" not in result
+
+    def test_result_well_under_900_chars_typical(self, memory):
+        """Typical compressed result (first + last 3) is well under 900 chars."""
+        from ccr.core.memory import MemoryManager
+        anchor = "CCR project initial setup with comprehensive documentation and infrastructure"
+        segments = [anchor] + \
+                   [f"Feature {i} fully implemented with extensive tests, documentation, and review" for i in range(20)]
+        summary = "; ".join(segments)
+        assert len(summary) > 1200  # Long enough to be a real scenario
+        result = MemoryManager._mechanical_compress_summary(summary)
+        assert len(result) <= 900
+
+    def test_fallback_truncation_when_result_still_too_long(self, memory):
+        """If first + last 3 still exceed 900 chars, tail-truncate at 900."""
+        from ccr.core.memory import MemoryManager
+        # Create a very long first segment + long last 3
+        long_anchor = "A" * 300
+        long_segments = [long_anchor] + \
+                        [f"middle{i}" for i in range(5)] + \
+                        ["B" * 300, "C" * 300, "D" * 300]
+        summary = "; ".join(long_segments)
+        result = MemoryManager._mechanical_compress_summary(summary)
+        assert len(result) <= 900
+        assert result.startswith("...")
+
+    def test_strategy_2_5_fires_when_previous_summary_over_1200(self, memory):
+        """Strategy 2.5 auto-compresses previous_summary > 1200 chars before concat."""
+        # Write a long summary (> 1200 chars) directly
+        long_segments = ["CCR initial anchor context providing project foundation"] + \
+                        [f"work item {i} fully completed with extensive implementation details and thorough documentation" for i in range(20)]
+        long_summary = "; ".join(long_segments)
+        assert len(long_summary) > 1200
+        memory._write_rolling_summary("main", long_summary)
+
+        # Now commit without compressed_summary — Strategy 2.5 should auto-compress
+        memory.commit("New commit", "added something new", "reason", ["f.py"], "next")
+        result_summary = memory._get_rolling_summary("main")
+
+        # The final summary must be under 1400 chars (auto-compress + new entry appended)
+        assert len(result_summary) < 1400
+
+    def test_many_commits_without_compressed_summary_stays_bounded(self, memory):
+        """After many commits with no compressed_summary, summary stays under 1400 chars."""
+        for i in range(30):
+            memory.commit(
+                f"Feature {i}",
+                f"Implemented detailed feature {i} with comprehensive tests and documentation",
+                f"User requested feature {i} as part of milestone {i // 5}",
+                [f"feature_{i}.py", f"test_feature_{i}.py"],
+                f"Implement feature {i + 1} next",
+            )
+        summary = memory._get_rolling_summary("main")
+        assert len(summary) < 1400
+
+    def test_compressed_summary_param_still_takes_priority(self, memory):
+        """When compressed_summary is provided, auto-compression is bypassed entirely."""
+        long_segments = ["anchor"] + [f"item {i}" for i in range(20)]
+        memory._write_rolling_summary("main", "; ".join(long_segments))
+
+        memory.commit(
+            "New commit", "added work", "reason", ["f.py"], "next",
+            compressed_summary="Manually compressed: CCR built features 0-19. Next: feature 20.",
+        )
+        summary = memory._get_rolling_summary("main")
+        assert summary == "Manually compressed: CCR built features 0-19. Next: feature 20."
+
+
+# ===========================================================================
+# Task 4: Auto-suggest ACE promotion from pending patterns (_scan_pending_promotions)
+# ===========================================================================
+
+
+class TestScanPendingPromotions:
+    """Tests for _scan_pending_promotions() and the fallback auto-scan in commit()."""
+
+    def test_empty_buffer_returns_empty(self, memory):
+        """Returns empty list when patterns.json is absent."""
+        result = memory._scan_pending_promotions()
+        assert result == []
+
+    def test_below_threshold_not_returned(self, memory):
+        """Patterns below promotion_count threshold are not returned."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        # Only 2 occurrences, threshold is 3
+        memory.commit("T1", "did A", "reason", ["a.py"], "next", patterns_learned=[pat])
+        memory.commit("T2", "did B", "reason", ["b.py"], "next", patterns_learned=[pat])
+        result = memory._scan_pending_promotions()
+        assert result == []
+
+    def test_at_threshold_returned(self, memory):
+        """Pattern at exactly pattern_promotion_count is returned."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):  # exactly threshold (3)
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        result = memory._scan_pending_promotions()
+        assert len(result) == 1
+        assert result[0]["text"] == pat
+        assert result[0]["count"] == 3
+
+    def test_above_threshold_returned(self, memory):
+        """Pattern above threshold (more than 3 occurrences) is returned."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(5):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        result = memory._scan_pending_promotions()
+        assert len(result) == 1
+        assert result[0]["count"] == 5
+
+    def test_promoted_patterns_excluded(self, memory):
+        """Patterns with promoted=True are NOT returned."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        # Manually mark pattern as promoted
+        path = memory._get_patterns_path()
+        data = json.loads(memory._read_file(path))
+        data["patterns"]["P001"]["promoted"] = True
+        memory._write_file(path, json.dumps(data, indent=2))
+        result = memory._scan_pending_promotions()
+        assert result == []
+
+    def test_caps_at_five(self, memory):
+        """Returns at most 5 patterns even if more are pending."""
+        # Create 8 distinct patterns each with 3+ occurrences
+        patterns = [
+            f"Pattern {i} with distinct words for testing promotion threshold logic here"
+            for i in range(8)
+        ]
+        for pat in patterns:
+            for j in range(3):
+                memory.commit(f"T{j}", f"did {j}", "reason", [f"{j}.py"], "next",
+                              patterns_learned=[pat])
+        result = memory._scan_pending_promotions()
+        assert len(result) <= 5
+
+    def test_does_not_mark_promoted(self, memory):
+        """_scan_pending_promotions must NOT set promoted=True."""
+        import json
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        memory._scan_pending_promotions()  # Call it
+        data = json.loads(memory._read_file(memory._get_patterns_path()))
+        assert data["patterns"]["P001"]["promoted"] is False
+
+    def test_result_shape_matches_process_patterns(self, memory):
+        """Return dicts have pattern_id, text, count, commit_ids keys."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        result = memory._scan_pending_promotions()
+        assert len(result) == 1
+        entry = result[0]
+        assert "pattern_id" in entry
+        assert "text" in entry
+        assert "count" in entry
+        assert "commit_ids" in entry
+
+    def test_sorted_by_count_desc(self, memory):
+        """Results are sorted by occurrence count descending."""
+        pat_high = "High frequency pattern for testing promotion here"
+        pat_low = "Low frequency pattern appearing only rarely here"
+        # pat_high: 5 occurrences; pat_low: 3 occurrences
+        for i in range(5):
+            memory.commit(f"H{i}", f"did {i}", "reason", [f"h{i}.py"], "next",
+                          patterns_learned=[pat_high])
+        for i in range(3):
+            memory.commit(f"L{i}", f"did {i}", "reason", [f"l{i}.py"], "next",
+                          patterns_learned=[pat_low])
+        result = memory._scan_pending_promotions()
+        assert len(result) == 2
+        assert result[0]["count"] >= result[1]["count"]
+
+    def test_commit_without_patterns_surfaces_pending(self, memory):
+        """A commit() with no patterns_learned auto-scans and suggests pending patterns."""
+        pat = "Always validate input parameters before processing data"
+        # Build pattern to threshold via earlier commits
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        # Now commit with NO patterns_learned — should still surface the suggestion
+        result = memory.commit("No patterns commit", "added something", "reason", ["f.py"], "next")
+        assert "Pattern promotion suggestions" in result
+        assert "ace_apply_delta" in result
+
+    def test_no_duplicate_suggestions_when_patterns_learned_fires(self, memory):
+        """When patterns_learned fires, _scan_pending_promotions is NOT called (short-circuit)."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(3):
+            memory.commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                          patterns_learned=[pat])
+        # Commit WITH patterns_learned — should get suggestions from _process_patterns,
+        # not a double-set from both paths
+        result = memory.commit("With patterns", "added work", "reason", ["g.py"], "next",
+                               patterns_learned=[pat])
+        # Should contain promotion suggestion exactly once (not duplicated)
+        assert result.count("Pattern promotion suggestions") == 1

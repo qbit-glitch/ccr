@@ -388,6 +388,10 @@ class MemoryManager:
         self._prepend_commit(branch, entry)
 
         # GCC paper: regenerate rolling summary S_t = f(S_{t-1}, D_t)
+        # Capture pre-update summary length for the compression warning (G4).
+        # Strategy 2.5 may auto-compress the summary during _update_rolling_summary(),
+        # so reading after the call would miss the original length.
+        _pre_update_summary_len = len(self._get_rolling_summary(branch))
         self._update_rolling_summary(branch, what, why, next_step, compressed_summary)
 
         if branch == "main":
@@ -432,6 +436,14 @@ class MemoryManager:
             except Exception:
                 pass  # Pattern management is supplementary — never fail the commit
 
+        if not promotion_suggestions:
+            # Auto-scan: surface patterns that crossed threshold without new patterns_learned.
+            # Even commits with no patterns_learned will bubble up ready-to-promote patterns.
+            try:
+                promotion_suggestions = self._scan_pending_promotions()
+            except Exception:
+                pass  # Pattern scanning is supplementary — never fail the commit
+
         # TiMem §3.2.2: Check if session summary should be generated
         self._maybe_generate_session_summary(branch)
 
@@ -448,16 +460,16 @@ class MemoryManager:
                 )
             result += "\n\nConsider calling ace_apply_delta with ADD to promote these to the playbook."
 
-        # GCC paper G4: Check if rolling summary needs LLM compression
-        # When summary exceeds threshold, suggest Claude Code compress it
-        # via the two-call pattern (same as gcc_consolidate project tier).
-        # Threshold is 1200 chars — fires BEFORE structured truncation (1500)
-        # kicks in, giving Claude Code a chance to compress proactively.
+        # GCC paper G4: Check if rolling summary needs LLM compression.
+        # Strategy 2.5 auto-compressed the summary if it exceeded 1200 chars, so the
+        # warning now fires based on the PRE-UPDATE length to remain a "could do better"
+        # hint (LLM compression is always higher quality than mechanical compression).
+        # The current (post-update) summary is shown so Claude Code can act immediately.
         summary_compression_threshold = 1200
-        current_summary = self._get_rolling_summary(branch)
-        if len(current_summary) > summary_compression_threshold and compressed_summary is None:
+        if _pre_update_summary_len > summary_compression_threshold and compressed_summary is None:
+            current_summary = self._get_rolling_summary(branch)
             result += (
-                f"\n\n\u26a0\ufe0f Rolling summary is getting long ({len(current_summary)} chars). "
+                f"\n\n\u26a0\ufe0f Rolling summary is getting long ({_pre_update_summary_len} chars). "
                 f"Call gcc_commit again with compressed_summary='<your 2-3 sentence synthesis>'. "
                 f"Current summary to compress:\n\n---\n{current_summary}\n---\n\n"
                 f"Write a concise synthesis capturing key decisions and current direction, "
@@ -1093,6 +1105,39 @@ class MemoryManager:
         for pid in sorted_ids[:evict_count]:
             del patterns[pid]
 
+    def _scan_pending_promotions(self) -> list[dict]:
+        """Scan the pattern buffer for patterns that crossed the promotion threshold.
+
+        CER §3.1 (CCR extension): surfaces ready-to-promote patterns even when no
+        new patterns_learned are passed to commit(). This ensures promotable patterns
+        are not silently ignored when the caller omits patterns_learned.
+
+        Returns a list of promotion suggestion dicts (same shape as _process_patterns):
+            {pattern_id, text, count, commit_ids}
+
+        Capped at 5 results to avoid flooding the commit response.
+        Does NOT mark patterns as promoted — that only happens when the user
+        explicitly calls ace_apply_delta.
+        """
+        data = self._load_patterns()
+        threshold = self.config.pattern_promotion_count
+
+        suggestions: list[dict] = []
+        for pid, entry in data.get("patterns", {}).items():
+            if (entry.get("occurrence_count", 0) >= threshold
+                    and not entry.get("promoted", False)):
+                suggestions.append({
+                    "pattern_id": pid,
+                    "text": entry["text"],
+                    "count": entry["occurrence_count"],
+                    "commit_ids": entry.get("commit_ids", []),
+                })
+
+        # Sort by occurrence_count DESC for deterministic ordering
+        suggestions.sort(key=lambda x: -x["count"])
+
+        return suggestions[:5]
+
     def get_patterns(
         self,
         min_occurrences: int = 1,
@@ -1585,6 +1630,16 @@ class MemoryManager:
             except Exception:
                 pass  # Fall through to mechanical fallback
 
+        # Strategy 2.5: Mechanical auto-compression when previous_summary is long
+        # Fires before concatenation to prevent unbounded growth even when Claude Code
+        # ignores the compression warning. The warning still fires (as a "could do better"
+        # hint), but now it is not mandatory — auto-compression provides a safety net.
+        if previous_summary and len(previous_summary) > 1200:
+            try:
+                previous_summary = self._mechanical_compress_summary(previous_summary)
+            except Exception:
+                pass  # Fall through with original previous_summary on any error
+
         # Strategy 3: Mechanical concatenation with structured truncation
         if previous_summary:
             new_summary = f"{previous_summary}; {new_contribution}"
@@ -1596,6 +1651,42 @@ class MemoryManager:
             new_summary = self._structured_truncate_summary(new_summary)
 
         self._write_rolling_summary(branch, new_summary)
+
+    @staticmethod
+    def _mechanical_compress_summary(summary: str) -> str:
+        """Mechanically compress a long rolling summary by keeping anchor + tail.
+
+        Used in Strategy 2.5 of _update_rolling_summary() as a safety net when
+        the previous_summary exceeds 1200 chars and no compressed_summary was
+        provided by the caller.
+
+        Algorithm:
+        1. Split on "; " delimiter (the concatenation separator)
+        2. Keep the first segment (project context anchor)
+        3. Keep the last 3 segments (most recent contributions)
+        4. Join with "; " — result is typically well under 900 chars
+        5. If still > 900 chars, fall back to tail-truncation at 900
+
+        This is intentionally lossy for middle segments — the full LLM-compressed
+        summary (via compressed_summary= parameter) is always preferred.
+        """
+        segments = [s.strip() for s in summary.split("; ") if s.strip()]
+
+        if len(segments) <= 4:
+            # Not enough segments to meaningfully compress — just return as-is
+            # (structured truncation in Strategy 3 will handle length enforcement)
+            return summary
+
+        # Keep first (anchor) + last 3 (most recent)
+        first = segments[0]
+        last_three = segments[-3:]
+        compressed = "; ".join([first] + last_three)
+
+        # Safety cap at 900 chars
+        if len(compressed) > 900:
+            compressed = "..." + compressed[-897:]
+
+        return compressed
 
     @staticmethod
     def _structured_truncate_summary(summary: str, max_chars: int = 1500) -> str:
