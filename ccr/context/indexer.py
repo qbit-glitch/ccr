@@ -1,18 +1,24 @@
 """Repo indexer — builds an in-memory index of the entire codebase.
 
 Zero LLM tokens. Pure filesystem + regex. Loaded into REPL as a variable.
+Semantic search via optional ONNX embeddings (A-RAG §3.2) or BM25 fallback (CCR's own zero-dep alternative).
 """
 
 from __future__ import annotations
 
 import fnmatch
 import json
+import math
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ccr.context.embeddings import EmbeddingModel
 
 # Symbol extraction patterns per language
 SYMBOL_PATTERNS: dict[str, list[re.Pattern]] = {
@@ -90,13 +96,36 @@ class FileEntry:
 
 
 class RepoIndex:
-    """In-memory index of a repository. Serializable to JSON for REPL loading."""
+    """In-memory index of a repository. Serializable to JSON for REPL loading.
+
+    Supports three search modes:
+      - keyword: Exact substring matching on paths, symbols, content
+        (inspired by A-RAG §3.2, but uses substring matching not frequency*length scoring)
+      - semantic: Dense embedding cosine via ONNX (A-RAG §3.2 Eq 3 inspired)
+        or BM25 zero-dep fallback (CCR's own, not from A-RAG)
+      - hybrid: Combines keyword + semantic scores
+        (CCR's own design — A-RAG uses agent-driven tool selection, not score fusion)
+    """
+
+    # BM25 stop words — common English + Python noise terms
+    _BM25_STOP_WORDS: frozenset[str] = frozenset({
+        "the", "a", "an", "is", "are", "was", "were", "be", "been",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "could", "should", "may", "might", "can", "shall",
+        "in", "on", "at", "to", "for", "of", "with", "by", "from",
+        "and", "or", "not", "but", "if", "then", "else", "so",
+        "this", "that", "it", "its", "self", "none", "true", "false",
+        "import", "return", "def", "class",
+    })
 
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
         self.files: dict[str, FileEntry] = {}
         self._built_at: float | None = None
         self._mtime_sig: str = ""
+        # Semantic search state
+        self._embeddings: dict[str, list[float]] = {}
+        self._bm25_cache: dict | None = None
 
     @classmethod
     def build(
@@ -216,6 +245,286 @@ class RepoIndex:
     def get_file(self, rel_path: str) -> str | None:
         entry = self.files.get(rel_path)
         return entry._content if entry else None
+
+    # --- Semantic search ---
+
+    @staticmethod
+    def _tokenize_simple(text: str) -> list[str]:
+        """Simple word tokenizer for BM25. Lowercases, filters stops."""
+        return [
+            w for w in re.findall(r"\w{2,}", text.lower())
+            if w not in RepoIndex._BM25_STOP_WORDS
+        ]
+
+    @staticmethod
+    def _file_summary(entry: FileEntry) -> str:
+        """Generate embeddable summary for a file (A-RAG §3.1 adaptation).
+
+        Combines path, symbols, and opening lines into a compact
+        representation suitable for embedding (< 256 tokens).
+        """
+        parts = [entry.rel_path]
+        if entry.symbols:
+            parts.append(" ".join(entry.symbols[:20]))
+        if entry._content:
+            first_lines = "\n".join(entry._content.split("\n")[:10])
+            parts.append(first_lines)
+        return "\n".join(parts)
+
+    def _build_bm25_cache(self) -> dict:
+        """Pre-compute BM25 data structures from indexed file content.
+
+        Computed lazily on first semantic search to avoid cost for
+        keyword-only users. Cached in self._bm25_cache.
+        """
+        doc_term_counts: dict[str, Counter] = {}
+        doc_lengths: dict[str, int] = {}
+        doc_freqs: Counter = Counter()
+        total_length = 0
+
+        for rel, entry in self.files.items():
+            if not entry._content:
+                continue
+            terms = self._tokenize_simple(entry._content)
+            doc_term_counts[rel] = Counter(terms)
+            doc_lengths[rel] = len(terms)
+            total_length += len(terms)
+            for term in set(terms):
+                doc_freqs[term] += 1
+
+        n = len(doc_term_counts)
+        avg_doc_len = total_length / n if n > 0 else 0.0
+
+        return {
+            "doc_term_counts": doc_term_counts,
+            "doc_lengths": doc_lengths,
+            "doc_freqs": doc_freqs,
+            "avg_doc_len": avg_doc_len,
+            "N": n,
+        }
+
+    def bm25_search(
+        self, query: str, top_k: int = 10, file_glob: str = "**/*"
+    ) -> list[dict]:
+        """BM25 scoring against file content. Zero external deps.
+
+        Uses Okapi BM25 formula (k1=1.5, b=0.75).
+        CCR's own zero-dep fallback for semantic search when ONNX is unavailable.
+        Not from the A-RAG paper (arXiv:2602.03442), which does not mention BM25.
+        """
+        if self._bm25_cache is None:
+            self._bm25_cache = self._build_bm25_cache()
+
+        cache = self._bm25_cache
+        query_terms = self._tokenize_simple(query)
+        if not query_terms:
+            return []
+
+        n = cache["N"]
+        if n == 0:
+            return []
+
+        avg_dl = cache["avg_doc_len"]
+        df = cache["doc_freqs"]
+        k1, b = 1.5, 0.75
+
+        # Pre-compute IDF for query terms
+        idf: dict[str, float] = {}
+        for term in query_terms:
+            d = df.get(term, 0)
+            idf[term] = math.log((n - d + 0.5) / (d + 0.5) + 1)
+
+        results = []
+        for rel, tf_counter in cache["doc_term_counts"].items():
+            if file_glob != "**/*" and not fnmatch.fnmatch(rel, file_glob):
+                continue
+
+            score = 0.0
+            dl = cache["doc_lengths"][rel]
+            for term in query_terms:
+                tf = tf_counter.get(term, 0)
+                if tf == 0:
+                    continue
+                numerator = tf * (k1 + 1)
+                denominator = tf + k1 * (1 - b + b * dl / avg_dl)
+                score += idf.get(term, 0) * numerator / denominator
+
+            if score > 0:
+                entry = self.files[rel]
+                results.append({
+                    "path": rel,
+                    "score": round(score, 4),
+                    "language": entry.language,
+                    "symbols": entry.symbols[:10],
+                    "size": entry.size_bytes,
+                    "lines": entry.line_count,
+                })
+
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:top_k]
+
+    def build_embeddings(self, model: EmbeddingModel) -> int:
+        """Compute embeddings for all indexed files. Returns count.
+
+        A-RAG §3.1: builds dense representations for semantic search.
+        """
+        summaries = []
+        paths = []
+        for rel, entry in self.files.items():
+            if not entry._content:
+                continue
+            summaries.append(self._file_summary(entry))
+            paths.append(rel)
+
+        if not summaries:
+            return 0
+
+        # Batch embed (batch_size=64 for memory efficiency)
+        batch_size = 64
+        all_embeddings = []
+        for i in range(0, len(summaries), batch_size):
+            batch = summaries[i : i + batch_size]
+            vecs = model.embed_batch(batch)
+            all_embeddings.append(vecs)
+
+        import numpy as np
+
+        combined = np.vstack(all_embeddings)
+        self._embeddings = {
+            paths[i]: combined[i].tolist() for i in range(len(paths))
+        }
+        return len(self._embeddings)
+
+    def semantic_search(
+        self,
+        query: str,
+        model: EmbeddingModel,
+        top_k: int = 10,
+        file_glob: str = "**/*",
+    ) -> list[dict]:
+        """Dense embedding cosine similarity search (A-RAG §3.2, Eq 3)."""
+        if not self._embeddings:
+            return []
+
+        import numpy as np
+
+        query_vec = model.embed_query(query)
+
+        # Build doc matrix from stored embeddings
+        paths = []
+        vecs = []
+        for rel, emb in self._embeddings.items():
+            if file_glob != "**/*" and not fnmatch.fnmatch(rel, file_glob):
+                continue
+            paths.append(rel)
+            vecs.append(emb)
+
+        if not vecs:
+            return []
+
+        doc_matrix = np.array(vecs, dtype=np.float32)
+        scores = model.cosine_similarity(query_vec, doc_matrix)
+
+        # Build results
+        indexed = sorted(enumerate(scores), key=lambda x: -x[1])
+        results = []
+        for idx, score in indexed[:top_k]:
+            if score <= 0:
+                continue
+            rel = paths[idx]
+            entry = self.files[rel]
+            results.append({
+                "path": rel,
+                "score": round(float(score), 4),
+                "language": entry.language,
+                "symbols": entry.symbols[:10],
+                "size": entry.size_bytes,
+                "lines": entry.line_count,
+            })
+
+        return results
+
+    def hybrid_search(
+        self,
+        query: str,
+        model: "EmbeddingModel | None" = None,
+        top_k: int = 10,
+        file_glob: str = "**/*",
+        keyword_weight: float = 0.3,
+        semantic_weight: float = 0.7,
+    ) -> list[dict]:
+        """Combine keyword + semantic scores (CCR's own score-fusion design).
+
+        Normalizes both score types to [0,1] and combines with weights.
+        Uses ONNX embeddings if model + embeddings available, else BM25.
+
+        Note: A-RAG (arXiv:2602.03442) uses agent-driven tool selection
+        (the agent chooses keyword_search vs semantic_search per step).
+        This mechanical score fusion is CCR's own approach.
+        """
+        # Keyword scores
+        kw_results = self.search(query, file_glob=file_glob)
+        max_kw = 9.0  # path(3) + symbol(5) + content(1)
+        kw_scores: dict[str, float] = {
+            r["path"]: r["score"] / max_kw for r in kw_results
+        }
+
+        # Semantic scores
+        sem_scores: dict[str, float] = {}
+        if model is not None and self._embeddings:
+            sem_results = self.semantic_search(
+                query, model, top_k=100, file_glob=file_glob
+            )
+            for r in sem_results:
+                sem_scores[r["path"]] = r["score"]
+        else:
+            # BM25 fallback — normalize by max score
+            bm25_results = self.bm25_search(query, top_k=100, file_glob=file_glob)
+            if bm25_results:
+                max_bm25 = bm25_results[0]["score"]
+                if max_bm25 > 0:
+                    for r in bm25_results:
+                        sem_scores[r["path"]] = r["score"] / max_bm25
+
+        # Combine
+        all_paths = set(kw_scores.keys()) | set(sem_scores.keys())
+        combined: list[dict] = []
+        for path in all_paths:
+            kw = kw_scores.get(path, 0.0)
+            sem = sem_scores.get(path, 0.0)
+            final = keyword_weight * kw + semantic_weight * sem
+            if final <= 0:
+                continue
+            entry = self.files.get(path)
+            if entry is None:
+                continue
+            combined.append({
+                "path": path,
+                "score": round(final, 4),
+                "language": entry.language,
+                "symbols": entry.symbols[:10],
+                "size": entry.size_bytes,
+                "lines": entry.line_count,
+            })
+
+        combined.sort(key=lambda r: r["score"], reverse=True)
+        return combined[:top_k]
+
+    def save_embeddings(self, path: str) -> None:
+        """Save embeddings to gzip-compressed JSON."""
+        from ccr.context.embeddings import save_embeddings
+
+        save_embeddings(self._embeddings, path)
+
+    def load_embeddings(self, path: str) -> bool:
+        """Load pre-computed embeddings. Returns True if loaded."""
+        from ccr.context.embeddings import load_embeddings
+
+        loaded = load_embeddings(path)
+        if loaded:
+            self._embeddings = loaded
+            return True
+        return False
 
     def to_json(self) -> str:
         """Serialize to JSON for REPL loading. Excludes file contents for efficiency."""

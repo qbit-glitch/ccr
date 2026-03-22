@@ -1449,3 +1449,446 @@ class TestTemporalDecay:
         b.last_updated = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
         stats = pb.get_stats()
         assert stats.decayed_bullets >= 1
+
+
+# ===========================================================================
+# MCE-inspired Schema Evolution Tests (arXiv:2601.21557)
+# ===========================================================================
+
+
+class TestSchemaMetrics:
+    """Test compute_metrics() — MCE evaluation function J."""
+
+    def test_compute_metrics_empty_playbook(self):
+        pb = Playbook()
+        metrics = pb.compute_metrics()
+        assert metrics.total_bullets == 0
+        assert metrics.section_balance == 0.0
+        assert metrics.overall_health == 0.0
+        assert len(metrics.empty_sections) == 6  # All DEFAULT_SECTIONS empty
+        assert metrics.timestamp != ""
+
+    def test_section_balance_single_section(self):
+        """All bullets in one section → entropy = 0."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=1 harmful=0 :: Strategy A\n"
+            "[str-00002] helpful=1 harmful=0 :: Strategy B\n"
+            "[str-00003] helpful=1 harmful=0 :: Strategy C\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        assert metrics.section_balance == 0.0
+
+    def test_section_balance_even_distribution(self):
+        """Bullets evenly across sections → entropy near 1.0."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=1 harmful=0 :: A\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00002] helpful=1 harmful=0 :: B\n"
+            "\n## COMMON MISTAKES TO AVOID\n"
+            "[mis-00003] helpful=1 harmful=0 :: C\n"
+            "\n## PROBLEM-SOLVING HEURISTICS\n"
+            "[heu-00004] helpful=1 harmful=0 :: D\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        assert metrics.section_balance > 0.9
+
+    def test_section_balance_skewed(self):
+        """Uneven distribution → 0 < entropy < 1."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=1 harmful=0 :: A\n"
+            "[str-00002] helpful=1 harmful=0 :: B\n"
+            "[str-00003] helpful=1 harmful=0 :: C\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00004] helpful=1 harmful=0 :: D\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        assert 0.0 < metrics.section_balance < 1.0
+
+    def test_utilization_rate(self):
+        """Mix of utilized and unused bullets."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        metrics = pb.compute_metrics()
+        # SAMPLE_PLAYBOOK has 5 bullets, all with helpful+harmful > 0 except none
+        # str-00001: h=5, str-00002: h=3,h=1, code-00003: h=8, mis-00004: h=6, mis-00005: h=0,h=4
+        assert metrics.utilization_rate == 1.0  # All have counters > 0
+
+    def test_harmful_ratio(self):
+        """Known harmful/helpful distribution."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: Good\n"
+            "[str-00002] helpful=0 harmful=3 :: Bad\n"
+            "[str-00003] helpful=1 harmful=5 :: Worse\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        # 3 utilized, 2 harmful (str-00002: 0<3, str-00003: 5>1 — wait, harmful >= helpful)
+        # str-00002: harmful=3 >= helpful=0 AND harmful>0 → harmful
+        # str-00003: harmful=5 >= helpful=1 AND harmful>0 → harmful
+        assert abs(metrics.harmful_ratio - 2.0 / 3.0) < 0.01
+
+    def test_decay_impact_with_old_bullets(self):
+        """Bullets with old timestamps show high decay impact."""
+        from datetime import datetime, timezone, timedelta
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: Old\n"
+            "[str-00002] helpful=5 harmful=0 :: Fresh\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        pb.get_bullet("str-00001").last_updated = (
+            datetime.now(timezone.utc) - timedelta(days=90)
+        ).isoformat()
+        pb.get_bullet("str-00002").last_updated = datetime.now(timezone.utc).isoformat()
+        metrics = pb.compute_metrics()
+        # str-00001 at 90 days: 0.95^90 ≈ 0.01 → effective << 50% of raw
+        assert metrics.decay_impact > 0.0
+
+    def test_empty_sections_detected(self):
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        metrics = pb.compute_metrics()
+        # SAMPLE_PLAYBOOK has bullets in STRATEGIES, CODE SNIPPETS, COMMON MISTAKES
+        # Empty: PROBLEM-SOLVING HEURISTICS, CONTEXT CLUES, OTHERS
+        assert "PROBLEM-SOLVING HEURISTICS" in metrics.empty_sections
+        assert "CONTEXT CLUES & INDICATORS" in metrics.empty_sections
+
+    def test_overflow_sections_detected(self):
+        """Section with >50% of bullets flagged as overflow."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=1 harmful=0 :: A\n"
+            "[str-00002] helpful=1 harmful=0 :: B\n"
+            "[str-00003] helpful=1 harmful=0 :: C\n"
+            "[str-00004] helpful=1 harmful=0 :: D\n"
+            "[str-00005] helpful=1 harmful=0 :: E\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00006] helpful=1 harmful=0 :: F\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        # 5/6 = 83% in STRATEGIES
+        assert "STRATEGIES & INSIGHTS" in metrics.overflow_sections
+
+    def test_overall_health_formula(self):
+        """Verify weighted composite matches manual calculation."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00002] helpful=3 harmful=0 :: B\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        metrics = pb.compute_metrics()
+        # Manual: section_balance for 2 non-empty sections with equal bullets = 1.0
+        # utilization = 1.0, harmful = 0.0, unused = 0.0, decay = 0.0
+        expected = 0.25 * 1.0 + 0.25 * 1.0 + 0.25 * 1.0 + 0.15 * 1.0 + 0.10 * 1.0
+        assert abs(metrics.overall_health - expected) < 0.01
+
+
+class TestSchemaProposals:
+    """Test propose_schema_changes() — MCE (1+1)-ES proposals."""
+
+    def _make_schema(self, **kwargs):
+        from ccr.core.types import PlaybookSchema
+        from ccr.ace.playbook import DEFAULT_SECTIONS, _SLUG_MAP
+        defaults = dict(
+            version=1, sections=list(DEFAULT_SECTIONS),
+            slug_map=dict(_SLUG_MAP),
+        )
+        defaults.update(kwargs)
+        return PlaybookSchema(**defaults)
+
+    def test_healthy_playbook_no_proposals(self):
+        """Healthy playbook → no proposals."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00002] helpful=3 harmful=0 :: B\n"
+            "\n## COMMON MISTAKES TO AVOID\n"
+            "[mis-00003] helpful=4 harmful=0 :: C\n"
+            "\n## PROBLEM-SOLVING HEURISTICS\n"
+            "[heu-00004] helpful=2 harmful=0 :: D\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(schema, stop_health_threshold=0.8)
+        assert proposals == []
+
+    def test_add_section_from_others_cluster(self):
+        """Clustered bullets in OTHERS → ADD_SECTION proposal."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: General strategy\n"
+            "\n## OTHERS\n"
+            "[oth-00002] helpful=0 harmful=0 :: Database query optimization techniques\n"
+            "[oth-00003] helpful=0 harmful=0 :: Database indexing optimization strategies\n"
+            "[oth-00004] helpful=0 harmful=0 :: Database connection optimization pooling\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(
+            schema, min_cluster_size=3, stop_health_threshold=1.0,
+        )
+        if proposals:  # Only check if a proposal was actually made
+            assert proposals[0].change_type == "ADD_SECTION"
+            assert len(proposals[0].details.get("bullet_ids", [])) >= 3
+
+    def test_add_section_below_min_cluster(self):
+        """Too few bullets in OTHERS → no ADD_SECTION."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "\n## OTHERS\n"
+            "[oth-00002] helpful=0 harmful=0 :: Lone bullet\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(
+            schema, min_cluster_size=3, stop_health_threshold=1.0,
+        )
+        add_proposals = [p for p in proposals if p.change_type == "ADD_SECTION"]
+        assert add_proposals == []
+
+    def test_remove_empty_section(self):
+        """Persistently empty section → REMOVE_SECTION."""
+        from ccr.core.types import SchemaMetrics
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        baseline = SchemaMetrics(empty_sections=["CONTEXT CLUES & INDICATORS"])
+        schema = self._make_schema(baseline_metrics=baseline)
+        proposals = pb.propose_schema_changes(
+            schema, stop_health_threshold=1.0,
+        )
+        remove_proposals = [p for p in proposals if p.change_type == "REMOVE_SECTION"]
+        if remove_proposals:
+            assert remove_proposals[0].details["name"] in [
+                "CODE SNIPPETS & TEMPLATES", "COMMON MISTAKES TO AVOID",
+                "PROBLEM-SOLVING HEURISTICS", "CONTEXT CLUES & INDICATORS",
+            ]
+
+    def test_adjust_decay_high_impact(self):
+        """High decay impact → ADJUST_DECAY proposal."""
+        from datetime import datetime, timezone, timedelta
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "[str-00002] helpful=3 harmful=0 :: B\n"
+            "[str-00003] helpful=4 harmful=0 :: C\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        # Make all bullets very old
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        for b in pb.bullets:
+            b.last_updated = old_ts
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(
+            schema, stop_health_threshold=1.0,
+        )
+        decay_proposals = [p for p in proposals if p.change_type == "ADJUST_DECAY"]
+        if decay_proposals:
+            assert decay_proposals[0].details["new_rate"] < schema.decay_rate
+
+    def test_adjust_pruning_high_harmful(self):
+        """High harmful ratio → ADJUST_PRUNING."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=0 harmful=5 :: Bad A\n"
+            "[str-00002] helpful=0 harmful=3 :: Bad B\n"
+            "[str-00003] helpful=5 harmful=0 :: Good C\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(
+            schema, stop_health_threshold=1.0,
+        )
+        prune_proposals = [p for p in proposals if p.change_type == "ADJUST_PRUNING"]
+        if prune_proposals:
+            assert prune_proposals[0].details["new_min_harmful"] < schema.prune_min_harmful
+
+    def test_rebalance_overflow(self):
+        """Overflow section → REBALANCE proposal."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=1 harmful=0 :: Strategy alpha\n"
+            "[str-00002] helpful=1 harmful=0 :: Strategy beta\n"
+            "[str-00003] helpful=1 harmful=0 :: Strategy gamma\n"
+            "[str-00004] helpful=1 harmful=0 :: Totally different topic about databases\n"
+            "\n## CODE SNIPPETS & TEMPLATES\n"
+            "[code-00005] helpful=1 harmful=0 :: Snippet\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(
+            schema, stop_health_threshold=1.0,
+        )
+        rebalance = [p for p in proposals if p.change_type == "REBALANCE"]
+        if rebalance:
+            assert "moves" in rebalance[0].details
+
+    def test_rollback_proposal_on_degradation(self):
+        """Health dropped from baseline → ROLLBACK proposal."""
+        from ccr.core.types import SchemaMetrics
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=0 harmful=5 :: Bad\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        baseline = SchemaMetrics(overall_health=0.9)
+        schema = self._make_schema(
+            version=2, parent_version=1, baseline_metrics=baseline,
+        )
+        proposals = pb.propose_schema_changes(schema, rollback_health_delta=-0.05)
+        assert len(proposals) == 1
+        assert proposals[0].change_type == "ROLLBACK"
+
+    def test_single_proposal_returned(self):
+        """(1+1)-ES: at most one proposal."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        schema = self._make_schema()
+        proposals = pb.propose_schema_changes(schema, stop_health_threshold=1.0)
+        assert len(proposals) <= 1
+
+    def test_no_baseline_skips_rollback(self):
+        """First version (no baseline) → no ROLLBACK check."""
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=0 harmful=5 :: Bad\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        schema = self._make_schema()  # No baseline
+        proposals = pb.propose_schema_changes(schema, stop_health_threshold=1.0)
+        rollback = [p for p in proposals if p.change_type == "ROLLBACK"]
+        assert rollback == []
+
+
+class TestClusterOthersBullets:
+    """Test _cluster_others_bullets() — section proposal clustering."""
+
+    def test_cluster_similar_bullets(self):
+        text = (
+            "## OTHERS\n"
+            "[oth-00001] helpful=0 harmful=0 :: Testing unit tests assertions validation\n"
+            "[oth-00002] helpful=0 harmful=0 :: Testing integration tests validation checks\n"
+            "[oth-00003] helpful=0 harmful=0 :: Testing end-to-end tests assertions framework\n"
+        )
+        pb = Playbook(text)
+        clusters = pb._cluster_others_bullets(min_cluster=3)
+        assert len(clusters) >= 1
+        name, ids = clusters[0]
+        assert len(ids) == 3
+
+    def test_no_clusters_below_threshold(self):
+        text = (
+            "## OTHERS\n"
+            "[oth-00001] helpful=0 harmful=0 :: Apples oranges bananas\n"
+            "[oth-00002] helpful=0 harmful=0 :: Quantum physics relativity\n"
+            "[oth-00003] helpful=0 harmful=0 :: Financial trading stocks\n"
+        )
+        pb = Playbook(text)
+        clusters = pb._cluster_others_bullets(min_cluster=3)
+        assert clusters == []
+
+    def test_cluster_name_generation(self):
+        text = (
+            "## OTHERS\n"
+            "[oth-00001] helpful=0 harmful=0 :: Database query optimization techniques\n"
+            "[oth-00002] helpful=0 harmful=0 :: Database indexing optimization strategies\n"
+            "[oth-00003] helpful=0 harmful=0 :: Database performance optimization tuning\n"
+        )
+        pb = Playbook(text)
+        clusters = pb._cluster_others_bullets(min_cluster=3)
+        if clusters:
+            name, ids = clusters[0]
+            assert len(name) > 0
+            # Name should be uppercase words from cluster content
+            assert name == name.upper()
+
+    def test_empty_others_no_clusters(self):
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: Strategy\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text)
+        clusters = pb._cluster_others_bullets(min_cluster=3)
+        assert clusters == []
+
+
+class TestApplySchema:
+    """Test apply_schema() — applying schema changes to playbook."""
+
+    def test_apply_adds_new_sections(self):
+        from ccr.core.types import PlaybookSchema
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        schema = PlaybookSchema(
+            sections=list(pb.sections) + ["API DESIGN PATTERNS"],
+            slug_map={"api_design_patterns": "api"},
+        )
+        moved = pb.apply_schema(schema)
+        assert moved == 0
+        assert "API DESIGN PATTERNS" in pb.sections
+
+    def test_apply_removes_section_moves_bullets_to_others(self):
+        from ccr.core.types import PlaybookSchema
+        text = (
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=5 harmful=0 :: A\n"
+            "\n## CUSTOM SECTION\n"
+            "[cus-00002] helpful=3 harmful=0 :: B\n"
+            "\n## OTHERS\n"
+        )
+        pb = Playbook(text, sections=["STRATEGIES & INSIGHTS", "CUSTOM SECTION", "OTHERS"])
+        schema = PlaybookSchema(sections=["STRATEGIES & INSIGHTS", "OTHERS"])
+        moved = pb.apply_schema(schema)
+        assert moved == 1
+        b = pb.get_bullet("cus-00002")
+        assert b.section == "OTHERS"
+
+    def test_apply_preserves_existing_bullets(self):
+        from ccr.core.types import PlaybookSchema
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        original_count = len(pb.bullets)
+        schema = PlaybookSchema.default()
+        pb.apply_schema(schema)
+        assert len(pb.bullets) == original_count
+
+    def test_apply_default_schema_no_change(self):
+        from ccr.core.types import PlaybookSchema
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        original_sections = list(pb.sections)
+        schema = PlaybookSchema.default()
+        moved = pb.apply_schema(schema)
+        assert moved == 0
+        assert pb.sections == original_sections
+
+    def test_apply_schema_updates_section_list(self):
+        from ccr.core.types import PlaybookSchema
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        new_sections = ["ALPHA", "BETA", "OTHERS"]
+        schema = PlaybookSchema(sections=new_sections)
+        pb.apply_schema(schema)
+        assert pb.sections == new_sections

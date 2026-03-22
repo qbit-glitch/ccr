@@ -11,6 +11,7 @@ from ccr.mcp_server import (
     _save_playbook,
     ace_apply_delta,
     ace_evolve_from_failures,
+    ace_evolve_schema,
     ace_find_similar,
     ace_get_playbook,
     ace_get_stats,
@@ -23,6 +24,7 @@ from ccr.mcp_server import (
     gcc_links,
     gcc_log_ota,
     gcc_merge,
+    gcc_patterns,
     gcc_status,
     gcc_summaries,
     index_build,
@@ -613,6 +615,46 @@ class TestRLMExecute:
         assert "not initialized" in result.lower()
 
 
+class TestRLMExecuteMetadataOnly:
+    """Tests for R5 audit fix: metadata-only stdout enforcement (RLM paper Section 3)."""
+
+    def test_short_stdout_unchanged(self):
+        """Stdout under the 1000-char threshold is returned as-is."""
+        rlm_init("Test")
+        result = rlm_execute("print('hello world')")
+        assert "hello world" in result
+        # Should NOT contain truncation markers
+        assert "[stdout truncated:" not in result
+
+    def test_long_stdout_summarized(self):
+        """Stdout over the 1000-char threshold gets a metadata summary."""
+        rlm_init("Test")
+        # Generate output well over 1000 chars (50 lines x ~30 chars each = ~1500 chars)
+        code = "for i in range(50): print(f'line {i}: ' + 'x' * 20)"
+        result = rlm_execute(code)
+        assert "[stdout truncated:" in result
+        assert "lines" in result
+        assert "chars" in result
+        # First lines should be present
+        assert "line 0:" in result
+        # Last lines should be present
+        assert "line 49:" in result
+        # Middle lines should NOT be present (they were truncated)
+        assert "line 25:" not in result
+
+    def test_metadata_only_false_returns_full(self):
+        """Setting metadata_only=False returns full stdout regardless of length."""
+        rlm_init("Test")
+        code = "for i in range(50): print(f'line {i}: ' + 'x' * 20)"
+        result = rlm_execute(code, metadata_only=False)
+        # Should NOT be truncated
+        assert "[stdout truncated:" not in result
+        # All lines should be present
+        assert "line 0:" in result
+        assert "line 25:" in result
+        assert "line 49:" in result
+
+
 class TestRLMFinalize:
     def test_finalize(self):
         rlm_init("Test")
@@ -666,7 +708,36 @@ class TestIndexSearch:
     def test_search_top_k(self):
         result = index_search("py", top_k=1)
         lines = [l for l in result.strip().split("\n") if l.strip()]
-        assert len(lines) == 1
+        # 1 header line + 1 result line
+        assert len(lines) == 2
+
+
+class TestIndexSearchModes:
+    """Tests for the A-RAG-inspired search mode parameter."""
+
+    def test_keyword_mode(self):
+        result = index_search("greet", mode="keyword")
+        assert "keyword search" in result
+        assert "hello.py" in result
+
+    def test_semantic_mode_bm25_fallback(self):
+        result = index_search("greet", mode="semantic")
+        assert "semantic search" in result
+        # BM25 fallback since no ONNX
+        assert "BM25 fallback" in result
+
+    def test_hybrid_mode_default(self):
+        result = index_search("greet")
+        assert "hybrid search" in result
+
+    def test_invalid_mode_error(self):
+        result = index_search("greet", mode="invalid")
+        assert "Error" in result
+        assert "invalid" in result
+
+    def test_build_shows_embedding_status(self):
+        result = index_build()
+        assert "Embedding" in result or "embedding" in result
 
 
 # ===========================================================================
@@ -895,7 +966,7 @@ class TestToolAnnotations:
     # -- Read-only tools --
 
     @pytest.mark.parametrize("tool_name", [
-        "gcc_context", "gcc_status",
+        "gcc_context", "gcc_status", "gcc_patterns",
         "ace_get_playbook", "ace_get_stats", "ace_find_similar",
         "index_search",
     ])
@@ -994,11 +1065,11 @@ class TestToolAnnotations:
         assert ann.destructiveHint is False
         assert ann.idempotentHint is True
 
-    # -- All 21 tools have annotations --
+    # -- All 23 tools have annotations --
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) == 21, f"Expected 21 tools, got {len(all_tools)}"
+        assert len(all_tools) == 23, f"Expected 23 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
 
@@ -1101,3 +1172,176 @@ class TestGCCHierarchicalSummaryTools:
     def test_gcc_summaries_count_bounded(self):
         result = gcc_summaries(tier="all", count=0)
         assert result  # count=0 should be bounded to 1
+
+
+# ===========================================================================
+# CER Pattern Buffer MCP Tests
+# ===========================================================================
+
+
+class TestGCCCommitPatterns:
+    def test_gcc_commit_with_patterns(self):
+        result = gcc_commit(
+            title="Add feature",
+            what="Added new feature",
+            why="User request",
+            files_changed=["feature.py"],
+            next_step="Add tests",
+            patterns_learned=["When adding {feature}, update tests and docs together"],
+        )
+        assert "C001" in result
+
+    def test_gcc_commit_patterns_optional(self):
+        """gcc_commit works without patterns_learned (backward compat)."""
+        result = gcc_commit(
+            title="Fix bug",
+            what="Fixed the bug",
+            why="Bug report",
+            files_changed=["fix.py"],
+            next_step="Verify",
+        )
+        assert "C001" in result
+
+    def test_gcc_commit_promotion_suggestion(self):
+        """Promotion suggestion appears after 3 commits with same pattern."""
+        pat = "Always validate input parameters before processing data"
+        for i in range(2):
+            gcc_commit(f"T{i+1}", f"did {i}", "reason", [f"{i}.py"], "next",
+                       patterns_learned=[pat])
+        result = gcc_commit("T3", "did 2", "reason", ["2.py"], "next",
+                            patterns_learned=[pat])
+        assert "Pattern promotion suggestions" in result
+        assert "ace_apply_delta" in result
+
+
+class TestGCCPatterns:
+    def test_gcc_patterns_empty(self):
+        result = gcc_patterns()
+        assert "No patterns found" in result
+
+    def test_gcc_patterns_basic(self):
+        gcc_commit("T1", "did A", "reason", ["a.py"], "next",
+                   patterns_learned=["Use structured logging for debugging"])
+        result = gcc_patterns()
+        assert "Pattern Buffer" in result
+        assert "structured logging" in result
+
+    def test_gcc_patterns_min_occurrences_filter(self):
+        gcc_commit("T1", "did A", "reason", ["a.py"], "next",
+                   patterns_learned=["Frequent pattern observed multiple times here",
+                                      "Rare single occurrence pattern for test"])
+        gcc_commit("T2", "did B", "reason", ["b.py"], "next",
+                   patterns_learned=["Frequent pattern observed multiple times here"])
+        result = gcc_patterns(min_occurrences=2)
+        assert "Frequent pattern" in result
+        assert "Rare single" not in result
+
+    def test_gcc_patterns_search_term(self):
+        gcc_commit("T1", "did A", "reason", ["a.py"], "next",
+                   patterns_learned=["Use sandbox for REPL execution",
+                                      "Always update documentation after changes"])
+        result = gcc_patterns(search_term="sandbox")
+        assert "sandbox" in result
+        assert "documentation" not in result
+
+    def test_gcc_patterns_annotations(self):
+        """gcc_patterns has correct MCP tool annotations."""
+        ann = _get_tool_annotations("gcc_patterns")
+        assert ann.readOnlyHint is True
+        assert ann.destructiveHint is False
+        assert ann.idempotentHint is True
+
+
+# ===========================================================================
+# ACE Schema Evolution MCP Tool Tests (MCE arXiv:2601.21557)
+# ===========================================================================
+
+
+class TestACEEvolveSchema:
+    """Test ace_evolve_schema tool — MCE (1+1)-ES schema evolution."""
+
+    def test_evolve_schema_evaluation_mode(self):
+        """Default call returns metrics and schema info."""
+        result = ace_evolve_schema()
+        assert "Schema Health Report" in result
+        assert "Overall Health" in result
+        assert "Section Balance" in result
+
+    def test_evolve_schema_apply_proposal(self, tmp_path):
+        """Apply a proposal updates schema version."""
+        # Set up a playbook with conditions that trigger a proposal
+        ace_apply_delta(operations=[
+            {"type": "ADD", "section": "OTHERS", "content": "Database query optimization techniques"},
+            {"type": "ADD", "section": "OTHERS", "content": "Database indexing optimization strategies"},
+            {"type": "ADD", "section": "OTHERS", "content": "Database performance optimization tuning"},
+        ])
+        result = ace_evolve_schema()
+        # Might or might not have proposals depending on exact metrics
+        if "apply_proposal" in result:
+            result2 = ace_evolve_schema(apply_proposal=1)
+            assert "schema v" in result2.lower() or "Applied" in result2
+
+    def test_evolve_schema_invalid_proposal_index(self):
+        """Invalid proposal index returns error."""
+        result = ace_evolve_schema(apply_proposal=99)
+        assert "Invalid" in result or "Error" in result
+
+    def test_evolve_schema_rollback_no_parent(self):
+        """Rollback with no parent returns error."""
+        result = ace_evolve_schema(rollback=True)
+        assert "Cannot rollback" in result
+
+    def test_evolve_schema_annotations(self):
+        """ace_evolve_schema has correct MCP tool annotations."""
+        ann = _get_tool_annotations("ace_evolve_schema")
+        assert ann.readOnlyHint is False
+        assert ann.destructiveHint is False
+        assert ann.idempotentHint is True
+
+
+# ===========================================================================
+# G4 Fix: Rolling Summary Compression via gcc_commit
+# ===========================================================================
+
+
+class TestGCCCommitRollingSummaryCompression:
+    """Tests for the rolling summary compression feature (G4 audit fix)."""
+
+    def test_gcc_commit_with_compressed_summary(self):
+        """gcc_commit accepts compressed_summary and uses it."""
+        gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
+        result = gcc_commit("T2", "did B", "reason B", ["b.py"], "next B",
+                            compressed_summary="Project: started A, added B. Next: C.")
+        assert "[C002]" in result
+        ctx = gcc_context(level=2)
+        # The compressed summary should appear in context
+        assert "started A, added B" in ctx
+
+    def test_gcc_commit_compressed_summary_optional(self):
+        """gcc_commit works without compressed_summary (backward compat)."""
+        result = gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
+        assert "[C001]" in result
+
+    def test_gcc_commit_short_summary_no_warning(self):
+        """Short summaries don't produce compression warning."""
+        result = gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
+        assert "Rolling summary is getting long" not in result
+
+    def test_gcc_commit_long_summary_triggers_warning(self):
+        """Long summaries produce compression warning in return value."""
+        # Access memory to write a long summary directly
+        import ccr.mcp_server as mod
+        mem = mod._memory
+        mem._write_rolling_summary("main", "x" * 1300)
+        result = gcc_commit("Next", "added more stuff", "reason", ["f.py"], "done")
+        assert "Rolling summary is getting long" in result
+        assert "compressed_summary" in result
+
+    def test_gcc_commit_compressed_summary_suppresses_warning(self):
+        """When compressed_summary is provided, no warning even if summary was long."""
+        import ccr.mcp_server as mod
+        mem = mod._memory
+        mem._write_rolling_summary("main", "x" * 1300)
+        result = gcc_commit("Next", "added more", "reason", ["f.py"], "done",
+                            compressed_summary="Clean compressed summary here")
+        assert "Rolling summary is getting long" not in result

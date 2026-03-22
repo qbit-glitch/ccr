@@ -18,6 +18,13 @@ dependencies = [
     "mcp[cli]>=1.0.0",
 ]
 
+[project.optional-dependencies]
+semantic = [
+    "onnxruntime>=1.17.0",
+    "tokenizers>=0.15.0",
+    "numpy>=1.24.0",
+]
+
 [project.scripts]
 ccr = "ccr.cli:cli"
 ccr-mcp = "ccr.mcp_server:main"

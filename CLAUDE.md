@@ -11,6 +11,11 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
 - **Before context gets large**: Commit to avoid losing reasoning state on compaction
 - **When exploring alternatives**: Use `gcc_branch` to isolate experiments, `gcc_merge` when decided
 - **To search past work**: Use `gcc_context(level=5, search_term="...")` to find specific commits
+- **When committing patterns**: Include `patterns_learned` with abstract, reusable patterns you noticed
+  - Good: `"When adding {tool_type}, update annotations + tests + docs together"`
+  - Bad: `"Updated test_mcp_server.py"` (too specific, not transferable)
+- **To query patterns**: Use `gcc_patterns` to see the pattern buffer, filter by occurrences or search
+- **Pattern promotion**: When a pattern appears in 3+ commits, `gcc_commit` suggests promoting it to the ACE playbook via `ace_apply_delta ADD`
 
 ### Self-Evolution (ACE) — Use these to learn from experience
 
@@ -23,6 +28,15 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
   5. Periodically call `ace_find_similar` and MERGE duplicate bullets
   6. Call `ace_prune` to remove strategies that have proven harmful
   7. Call `ace_evolve_from_failures` to generate NEW skills from accumulated failure lessons (triggers when ≥3 harmful bullets have structured lessons)
+  8. Periodically call `ace_evolve_schema` to evaluate playbook health and evolve structure (MCE-inspired)
+
+### Schema Evolution (MCE) — Evolve playbook structure itself
+
+- Call `ace_evolve_schema()` to see health metrics and structural proposals
+- Call `ace_evolve_schema(apply_proposal=N)` to apply a proposed change
+- Call `ace_evolve_schema(rollback=True)` to revert to parent schema version
+- Schema tracks: sections, decay rate, pruning thresholds, token budget, evolution threshold
+- All mechanical (zero LLM calls). You review and decide. Rule-based: one deterministic proposal per call.
 
 ### Problem-Solving (RLM) — Use the sandbox for complex analysis
 
@@ -41,7 +55,7 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
 
 ```
 ccr/
-  mcp_server.py     # MCP server: all 21 tools (GCC + ACE + RLM + Index)
+  mcp_server.py     # MCP server: all 23 tools (GCC + ACE + RLM + Index)
   hooks/
     on_session_start.py  # Injects playbook + context on UserPromptSubmit
     on_session_end.py    # Logs session end OTA
@@ -88,14 +102,17 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ## Key Patterns
 
-- **MCP server**: 21 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
-- **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.60·Novelty + 0.40·TypePrior. Algorithm 1 with S(m) vs S(m_conflict) comparison, recency-modulated FindConflict (sim threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
+- **MCP server**: 23 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
+- **CER-inspired pattern buffer** (arXiv:2506.06698): `gcc_commit` accepts optional `patterns_learned` list of transferable skills. Patterns deduped via word Jaccard (0.7 threshold), tracked in `.ccr/patterns.json` with occurrence counts. Patterns in 3+ commits → suggested for ACE playbook promotion (suggestion-only, not auto-add). Buffer capped at 200 entries with eviction by lowest occurrence. `gcc_patterns` tool queries the buffer. Zero LLM calls.
+- **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.50·TypePrior + 0.35·Novelty + 0.15·Recency. Algorithm 1 with S(m) vs S(m_conflict) comparison, FindConflict with recency-dampened similarity (CCR adaptation; paper uses pure cosine threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
 - **Heuristic commit cross-linking** (A-MEM/MAGMA inspired taxonomy): When `gcc_commit` creates a new entry, scans recent commits for overlap and stores bidirectional cross-links in `.ccr/commit_links.json`. Four link types: entity (file-set Jaccard), causal (regex C### detection), supersession (replacement language), semantic (word Jaccard). `gcc_links` tool traverses via BFS; `gcc_context` level 5 shows links. All mechanical — zero LLM calls.
 - **Two-tier playbook**: Global (`~/.ccr/global_playbook.txt`) + project (`.ccr/playbook.txt`). All ACE tools accept `scope="global"|"project"`. Cross-tier similarity detection via `ace_find_similar(scope="cross")`.
 - **Temporal decay**: Bullet counters decay via `effective_score = raw * 0.95^days`. Unused 30d → 21%, 90d → 1%. `last_updated` persisted in companion JSON. Budget pruning uses effective scores.
 - **Playbook evolution**: ACE playbook with helpful/harmful counters. Claude Code reflects and curates — no sub-model needed.
-- **Structured Failure Lessons** (SkillRL-inspired): When tagging harmful, include a failure_lesson dict explaining why. Lessons accumulate, then `ace_evolve_from_failures` generates NEW skill bullets from prevention principles. Companion data in `.ccr/failure_lessons.json`.
-- **Sandboxed REPL**: RLM-inspired REPL with repo tools (search_repo, get_file, FINAL_VAR). Claude Code drives the iteration loop.
+- **Structured Failure Lessons** (SkillRL-inspired): When tagging harmful, include a failure_lesson dict explaining why. Lessons accumulate, then `ace_evolve_from_failures` copies prevention_principle verbatim as new bullets when harmful count >= 3 (no cross-lesson synthesis, no teacher model). Companion data in `.ccr/failure_lessons.json`.
+- **MCE-inspired schema evolution** (arXiv:2601.21557): Playbook structure (sections, decay rate, pruning thresholds, token budget) is itself evolvable. `ace_evolve_schema` computes health metrics (entropy-normalized section balance, utilization, harmful ratio, decay impact), proposes one structural change per call (rule-based, deterministic — not true (1+1)-ES), tracks schema versions with baseline comparison for rollback. Schema stored in `.ccr/playbook_schema.json`.
+- **Semantic search** (A-RAG-inspired): `index_search` supports three modes — keyword (substring), semantic (ONNX embeddings or BM25 fallback), hybrid (default, combines both). Fallback chain: ONNX dense embeddings → BM25 term frequency → keyword substring. BM25 zero-dep fallback (CCR's own; not from paper). ONNX requires optional `ccr[semantic]` extras. File-level embeddings use path + symbols + first 10 lines per file.
+- **Sandboxed REPL**: RLM-inspired REPL with repo tools (search_repo, get_file, FINAL_VAR). Claude Code drives the iteration loop. Note: MCP mode uses the Algorithm 2 architecture (LLM drives loop) which the paper identifies as less expressive than Algorithm 1 (loop drives LLM). The full Algorithm 1 loop exists in legacy code (rlm/orchestrator.py) but is inactive in MCP mode.
 - **Exception hierarchy**: `CCRError` base with `recoverable` flag.
 - **Shared JSON extraction**: `extract_json_from_llm()` and `extract_json_string()` in `utils/parsing.py`.
 
@@ -103,7 +120,7 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ```bash
 source .venv/bin/activate
-pytest tests/unit/ tests/integration/ -x -q  # Run all tests (815 pass)
+pytest tests/unit/ tests/integration/ -x -q  # Run all tests (1215 pass)
 python -m ccr.mcp_server                     # Start MCP server (stdio)
 ccr init                                     # Init .ccr/ in current dir
 ccr index                                    # Build repo index
@@ -124,30 +141,140 @@ ccr status                                   # Show memory state
 }
 ```
 
-## Research Papers Implemented
+## Research Papers (Implemented or Inspired By)
 
 1. **GCC** (arXiv:2508.00031): Git Context Controller — version-controlled agent memory
-   - COMMIT/BRANCH/MERGE/CONTEXT operations, metadata.yaml, OTA triples, rolling summary
-   - Admission control (A-MAC, arXiv:2603.04549): Correct polarity (higher score = more valuable). 3 of 5 factors: Novelty N(m)=1-max_sim (Eq. 3, word Jaccard proxy for SBERT), Recency R=exp(-0.01·hours) (Eq. 4, λ=0.01/hour, half-life 69h), Type Prior T(m) (§3.2, rule-based 6-type classifier). U(m) and C(m) omitted (require LLM). Recency-modulated FindConflict. Algorithm 1 three-way: admit/merge/reject. Type-prior bypass for structural ops.
+   - COMMIT/BRANCH/MERGE/CONTEXT operations, metadata.yaml, OTA triples, rolling summary. Rolling summary defaults to mechanical concatenation in MCP mode (no sub-model for LLM synthesis); opt-in compressed_summary parameter available.
+   - Admission control (A-MAC, arXiv:2603.04549): Correct polarity (higher score = more valuable). 3 of 5 factors: Novelty N(m)=1-max_sim (Eq. 3, word Jaccard proxy for SBERT), Recency R=exp(-0.01·hours) (Eq. 4, λ=0.01/hour, half-life 69h), Type Prior T(m) (§3.2, rule-based 6-type classifier). U(m) and C(m) omitted (require LLM). FindConflict with recency-dampened similarity (CCR adaptation; paper uses pure cosine threshold 0.85 per §3.3). Algorithm 1 three-way: admit/merge/reject. Type-prior bypass for structural ops.
+   - See "Limitations vs. Paper (A-MAC Admission Control)" below for gaps
 2. **RLM** (arXiv:2512.24601): Recursive Language Models — REPL-based execution
    - Metadata-only stdout, prompt as REPL variable, FINAL_VAR termination
-3. **ACE** (arXiv:2510.04618): Agentic Context Engineering — evolving playbooks
-   - Structured bullets with helpful/harmful counters, grow-and-refine
+3. **ACE** (arXiv:2510.04618): Agentic Context Engineering — inspired by ACE's evolving playbooks
+   - Structured bullets with helpful/harmful counters, mechanical pruning (no LLM agents)
    - Delta operations (ADD/UPDATE/MERGE/REMOVE), deterministic merge
    - Playbook stored at `.ccr/playbook.txt`
-4. **SkillRL** (arXiv:2602.08234): Experience-based skill distillation (failure side)
+   - See "Limitations vs. Paper (ACE Playbook Evolution)" below for gaps
+4. **SkillRL** (arXiv:2602.08234): Inspired by SkillRL's failure-side skill distillation
    - Structured failure lessons: failure_point, flawed_reasoning, counterfactual, prevention_principle
-   - Threshold-triggered evolution: accumulated failures → NEW skill bullets
+   - Threshold-triggered verbatim extraction: when harmful count >= 3, copies prevention_principle as new bullets. No cross-lesson synthesis, no teacher model.
    - Hierarchical scope (general/task_specific), when_to_apply per SkillRL Table 5
    - Idempotent evolution with `evolved` flag, dedup against existing bullets
    - Extended data in `.ccr/failure_lessons.json` (backward-compatible format)
+   - See "Limitations vs. Paper (SkillRL Failure Distillation)" below for gaps
 
-5. **A-MEM** (arXiv:2502.12110) + **MAGMA** (arXiv:2601.03236): Commit cross-linking taxonomy
-   - Bidirectional links inspired by A-MEM's Zettelkasten architecture
+5. **CER** (arXiv:2506.06698): Inspired by CER's transferable pattern extraction
+   - Pattern buffer stores skill strings from gcc_commit. No dynamics (D_i), no trajectory distillation, no VLM retrieval — only the buffer data structure is adapted.
+   - Dynamic Experience Buffer with dedup (existing buffer checked before adding)
+   - CCR adaptation: Claude Code provides patterns at commit time (no VLM distiller)
+   - Word Jaccard dedup (0.7 threshold), occurrence tracking, suggestion-based ACE promotion
+   - See "Limitations vs. Paper (CER Pattern Extraction)" below for gaps
+
+6. **A-MEM** (arXiv:2502.12110) + **MAGMA** (arXiv:2601.03236): Commit cross-linking taxonomy
+   - Bidirectional commit cross-references using file-overlap and regex heuristics. Borrows link-type taxonomy from MAGMA; no A-MEM operations (LLM enrichment, link generation, memory evolution) implemented.
    - Four link types inspired by MAGMA's multi-graph edge taxonomy
-   - See "Limitations vs. Paper" below for what is NOT implemented
+   - See "Limitations vs. Paper (Commit Cross-Linking — A-MEM/MAGMA)" below for what is NOT implemented
 
-## Limitations vs. Paper (Commit Cross-Linking)
+7. **MCE** (arXiv:2601.21557): Meta Context Engineering — inspired by MCE's meta-level evolution
+   - Bi-level optimization: meta-level evolves "skills" (playbook structure), base-level executes
+   - PlaybookSchema versioning: sections, decay rate, pruning thresholds, token budget
+   - Rule-based schema proposals (one per call, deterministic) with baseline comparison. Not true (1+1)-ES — proposals are from hardcoded rules, not stochastic/intelligent mutation.
+   - 8 change types: ADD/REMOVE section, ADJUST_DECAY/PRUNING/EVOLUTION/BUDGET, REBALANCE, ROLLBACK
+   - Entropy-normalized section balance, utilization/harmful/decay metrics, overall health composite
+   - Stop criteria (MCE Appendix D.3.2): no proposals when overall_health ≥ 0.8
+   - Schema history in `.ccr/playbook_schema.json` (backward-compatible: default schema if absent)
+   - See "Limitations vs. Paper (MCE Schema Evolution)" below for gaps
+
+8. **A-RAG** (arXiv:2602.03442): Inspired by A-RAG's hierarchical retrieval interfaces
+   - Three search modes: keyword (§3.2 Eq 1), semantic (§3.2 Eq 3), hybrid
+   - Dense embeddings via all-MiniLM-L6-v2 ONNX (384-dim, optional deps)
+   - BM25 fallback (Okapi BM25, k1=1.5, b=0.75) when ONNX unavailable — CCR's own zero-dep fallback, not from A-RAG paper
+   - File-level summaries (path + symbols + first 10 lines) instead of sentence-level chunks
+   - Claude Code IS the agent — no ReAct loop implementation needed
+   - See "Limitations vs. Paper (A-RAG Semantic Search)" below for gaps
+
+## Limitations vs. Paper (A-RAG Semantic Search)
+
+Semantic search uses **file-level BM25/ONNX** (zero LLM calls). Key gaps vs. paper:
+
+| A-RAG Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| Hierarchical Index (§3.1) | Corpus → 1000-token chunks → sentence embeddings | Files → file-summary embeddings (path+symbols+first lines) |
+| keyword_search (§3.2, Eq 1) | Keyword frequency × length scoring | Substring matching (path=3, symbol=5, content=1) |
+| semantic_search (§3.2, Eq 3) | Sentence-level dense cosine (Qwen3-Embedding-0.6B) | File-level dense cosine (all-MiniLM-L6-v2 ONNX) / BM25 fallback |
+| chunk_read (§3.2) | Full content + context tracker C^read | get_file() in REPL / Read tool (no tracker) |
+| Agent Loop (§3.3, Alg 1) | ReAct with interleaved tool use | Claude Code IS the agent (no implementation needed) |
+| Context Tracker (§3.3) | C^read prevents re-reading same chunks | Not implemented (Claude Code tracks its own context) |
+| Dynamic strategy selection | Agent chooses keyword vs semantic per step | `mode` parameter — user/agent chooses at call time |
+| Snippet extraction (Eq 2) | Sentences containing keywords | Not implemented (full file paths returned) |
+| BM25 fallback | Not in paper | CCR's own zero-dep fallback (not from A-RAG) |
+
+## Limitations vs. Paper (A-MAC Admission Control)
+
+Admission control uses **3 of 5 factors with hand-tuned weights** (zero LLM calls). Key gaps vs. paper:
+
+| A-MAC Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| Utility U(m) (§3.2 Factor 3) | LLM rates future usefulness on 1-5 scale | Not implemented (requires LLM) |
+| Confidence C(m) (§3.2 Factor 4) | ROUGE-L overlap against source turns | Not implemented (requires reference corpus) |
+| Similarity φ(m) (Eq. 3) | Sentence-BERT cosine similarity | Word Jaccard (0.50·file + 0.50·keyword). Lower discriminative power but zero cost |
+| Weight learning (Table 2) | 5-fold cross-validation on dialogue corpora | Hand-tuned: w_T=0.50, w_N=0.35, w_R=0.15 (informed by Table 2 ablation ranking) |
+| Rejection threshold (Alg. 1 line 11) | Score-based threshold learned from data | Configurable parameter, default 0.0 (disabled) |
+| Type Prior taxonomy (§3.2 Factor 5) | Classifies dialogue acts (question, instruction, etc.) | Classifies developer actions (progress, refactor, fix, etc.) — different domain |
+
+## Limitations vs. Paper (ACE Playbook Evolution)
+
+Playbook management uses **mechanical delta operations** driven by Claude Code (zero LLM agents). Key gaps vs. paper:
+
+| ACE Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| Generator agent (§3.1) | LLM generates candidate bullets from task trajectory | Not implemented — Claude Code manually adds bullets via `ace_apply_delta ADD` |
+| Reflector agent (§3.2) | LLM evaluates bullet quality and relevance | Not implemented — Claude Code manually reviews via `ace_get_playbook` |
+| Curator agent (§3.3) | LLM prunes/merges/refines bullet library | Mechanical pruning by harmful ratio + temporal decay. No LLM-driven refinement |
+| Automatic trajectory analysis | Task execution trace → bullet extraction | No automatic extraction. Claude Code must explicitly provide insights |
+| Grow-and-refine loop (§4) | Iterative Generator→Reflector→Curator pipeline | Approximated by manual `ace_update_counters` + `ace_prune` + `ace_find_similar` |
+| Bullet quality scoring | LLM-assessed relevance and specificity | Counter-based: helpful/harmful tallies with temporal decay |
+
+## Limitations vs. Paper (SkillRL Failure Distillation)
+
+Failure-side skill learning uses **threshold-triggered verbatim extraction** (zero LLM calls). Key gaps vs. paper:
+
+| SkillRL Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| Teacher model M_T (§3.1) | LLM analyzes full trajectory to identify failure points | Manual tagging — Claude Code provides `failure_lesson` dict at counter-update time |
+| GRPO RL training (§3.2, Eq. 2-4) | Group Relative Policy Optimization on skill-conditioned policy | Not implemented (N/A — no trainable model in MCP architecture) |
+| Cross-lesson synthesis (§3.3) | LLM synthesizes general skill from multiple related failures | `evolve_from_failures` copies `prevention_principle` verbatim per lesson — no cross-lesson generalization |
+| Cold-start SFT (§3.1) | Supervised fine-tuning on teacher-generated skills | Not implemented (N/A — MCP tools, not a trainable model) |
+| Skill scoring (§3.4, Table 3) | Reward-weighted skill selection during inference | Counter-based helpful/harmful scoring with temporal decay |
+| Trajectory replay buffer | Full (state, action, reward) trajectories stored | Only structured failure lessons stored — no full trajectories |
+
+## Limitations vs. Paper (CER Pattern Extraction)
+
+Pattern buffer uses **manual skill annotation** at commit time (zero VLM/LLM calls). Key gaps vs. paper:
+
+| CER Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| VLM distillation (§3.2, Eq. 3) | Vision-Language Model extracts skills from (observation, action) pairs | Manual — Claude Code provides `patterns_learned` list at `gcc_commit` time |
+| Dynamics D_i (§3.1, Eq. 1) | Environmental state transitions stored per experience | Not captured — only skills S_i (pattern strings) stored in buffer |
+| Retrieval module (§3.3, Eq. 5) | Automatic similarity-based retrieval conditioned on current state | Manual — Claude Code queries `gcc_patterns` explicitly |
+| Experience weighting (§3.4) | Recency + relevance weighted retrieval | Occurrence count only — no recency weighting on pattern retrieval |
+| Buffer management (§3.2) | Priority replay with TD-error weighting | FIFO eviction by lowest occurrence count. Cap at 200 entries |
+| Dedup mechanism | Embedding-based similarity | Word Jaccard (0.7 threshold) — sound data structure, lower discriminative power |
+
+## Limitations vs. Paper (MCE Schema Evolution)
+
+All schema evolution is **mechanical heuristics** (zero LLM calls). Key gaps vs. paper:
+
+| MCE Feature | Paper Mechanism | CCR Implementation |
+|---|---|---|
+| Agentic crossover (§3.1) | LLM synthesizes new skill from τ + H_{k-1} | Rule-based heuristic proposals |
+| Multi-metric evaluation (§3.2) | LLM evaluates context quality | Entropy, utilization, harmful ratio |
+| Skill = methodology folder | Processing pipeline + scripts + templates | Schema = sections + thresholds |
+| (1+1)-ES search (§3.1) | Full evolutionary search with LLM offspring | Single mechanical proposal per call |
+| Stop criteria (Appendix D.3.2) | Skill learns dynamically when to stop | Fixed threshold: overall_health ≥ 0.8 |
+| Skill database H (§3.1) | H = {(s_i, c_i, J_train, J_val)} | Version history with SchemaMetrics |
+| Context function c(x) (§3.1) | Executable retrieval function + context files | Playbook serialize() under schema params |
+
+## Limitations vs. Paper (Commit Cross-Linking — A-MEM/MAGMA)
 
 All commit linking is **mechanical heuristics** (zero LLM calls). Key gaps vs. papers:
 

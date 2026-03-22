@@ -86,7 +86,22 @@
       "Bash(cd /Users/qbit-glitch/Desktop/coding-projects/portfolio_website && /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -c \"\nimport sys, os\nos.chdir\\('/Users/qbit-glitch/Desktop/coding-projects/portfolio_website'\\)\nsys.argv = ['ccr.mcp_server']\nfrom ccr.mcp_server import _init\ntry:\n    _init\\(\\)\n    print\\('INIT OK'\\)\n    print\\('Project root:', os.getcwd\\(\\)\\)\nexcept Exception as e:\n    print\\(f'INIT FAILED: {e}'\\)\n\")",
       "Bash(cd /Users/qbit-glitch/Desktop/coding-projects/portfolio_website && rm -f .ccr/.session_active && /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/ccr/hooks/on_session_start.py 2>&1 | head -30)",
       "Bash(cd /Users/qbit-glitch/Desktop/coding-projects/portfolio_website && /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/ccr/hooks/on_session_start.py 2>&1)",
-      "Bash(gh auth:*)"
+      "Bash(gh auth:*)",
+      "Read(//Users/qbit-glitch/.claude/**)",
+      "Bash(cd /tmp && /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/ccr/hooks/on_session_start.py 2>&1; echo \"EXIT: $?\")",
+      "Bash(md5 ccr/ace/playbook.py && git show HEAD:ccr/ace/playbook.py | md5)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m pytest tests/unit/test_repl.py -x -q 2>&1)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m pytest tests/unit/ tests/integration/ -x -q 2>&1)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m pytest tests/unit/test_memory.py -x -q 2>&1 | tail -30)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m pytest tests/unit/test_memory.py -x -q 2>&1 | tail -20)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m pytest tests/unit/test_memory_gcc.py -x -q 2>&1 | tail -10)",
+      "Bash(source .venv/bin/activate && python -c \"\nfrom ccr.rlm.sandbox import generate_seatbelt_profile\nimport tempfile, os, subprocess, sys\n\npython_real = os.path.realpath\\(sys.executable\\)\n\nwith tempfile.TemporaryDirectory\\(\\) as proj:\n    with tempfile.TemporaryDirectory\\(\\) as tmpd:\n        profile = generate_seatbelt_profile\\(proj, tmpd\\)\n        pf = os.path.join\\(tmpd, 'test.sb'\\)\n        with open\\(pf, 'w'\\) as f:\n            f.write\\(profile\\)\n        \n        proc = subprocess.run\\(\n            ['sandbox-exec', '-f', pf, python_real, '-c', 'print\\(42\\)'],\n            capture_output=True, text=True, timeout=10,\n            env={'PATH': os.environ.get\\('PATH', ''\\), 'HOME': tmpd, 'PYTHONDONTWRITEBYTECODE': '1'}\n        \\)\n        print\\('RC:', proc.returncode\\)\n        print\\('STDOUT:', proc.stdout[:200]\\)\n        print\\('STDERR:', proc.stderr[:500]\\)\n\")",
+      "Bash(/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python --version)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python /Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/ccr/hooks/on_session_start.py)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -m ccr.mcp_server --help)",
+      "Bash(/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python -c \"from ccr.core.memory import MemoryManager; from ccr.core.types import CCRConfig; print\\('OK'\\)\" 2>&1)",
+      "Bash(semgrep --version)",
+      "Bash(wait)"
     ]
   },
   "enableAllProjectMcpServers": true,

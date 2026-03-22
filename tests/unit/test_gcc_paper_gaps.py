@@ -118,7 +118,9 @@ class TestConcatenationFallback:
             mem.commit(f"Commit {i}", f"Did thing {i} " * 10, "reason", [], "next")
         summary = mem._get_rolling_summary("main")
         assert len(summary) <= 1600  # small overhead allowed
-        assert summary.startswith("...")
+        # Structured truncation preserves first entry (project context)
+        # and last 3 entries — no longer starts with "..."
+        assert "Did thing 0" in summary  # first entry preserved
 
 
 class TestContextLogWindow:

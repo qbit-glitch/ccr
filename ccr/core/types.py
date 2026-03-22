@@ -221,6 +221,192 @@ class CommitLink:
 
 
 @dataclass
+class PatternEntry:
+    """A transferable decision-making pattern (CER S_i / skill).
+
+    Inspired by CER (arXiv:2506.06698) §3.1: abstract, parameterized,
+    reusable skills distilled from task trajectories. Uses {curly_braces}
+    for non-fixed elements (CER Fig 4).
+
+    Unlike CER's LLM distiller, patterns here are provided by Claude Code
+    at commit time (zero additional LLM calls).
+    """
+    text: str
+    first_seen: str           # Commit ID (e.g., "C003")
+    commit_ids: list[str] = field(default_factory=list)
+    occurrence_count: int = 1
+    created_at: str = ""      # ISO-8601
+    promoted: bool = False    # True after promotion suggestion delivered
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "first_seen": self.first_seen,
+            "commit_ids": list(self.commit_ids),
+            "occurrence_count": self.occurrence_count,
+            "created_at": self.created_at,
+            "promoted": self.promoted,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PatternEntry":
+        return cls(
+            text=d["text"],
+            first_seen=d["first_seen"],
+            commit_ids=d.get("commit_ids", []),
+            occurrence_count=d.get("occurrence_count", 1),
+            created_at=d.get("created_at", ""),
+            promoted=d.get("promoted", False),
+        )
+
+
+@dataclass
+class SchemaMetrics:
+    """Health metrics for a playbook schema (MCE evaluation function J).
+
+    All mechanical — computed from bullet data, no LLM calls.
+    MCE §3.2 (arXiv:2601.21557): J(s, D) evaluates skill s on dataset D.
+    """
+    section_balance: float = 0.0      # Normalized Shannon entropy [0,1]
+    utilization_rate: float = 0.0     # Fraction of bullets with helpful+harmful > 0
+    harmful_ratio: float = 0.0        # Of utilized, fraction net-harmful
+    unused_ratio: float = 0.0         # Fraction with helpful+harmful == 0
+    decay_impact: float = 0.0         # Fraction with effective_score < 50% of raw
+    empty_sections: list[str] = field(default_factory=list)
+    overflow_sections: list[str] = field(default_factory=list)
+    overall_health: float = 0.0       # Weighted composite [0,1]
+    total_bullets: int = 0
+    total_sections: int = 0
+    timestamp: str = ""               # ISO-8601
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "section_balance": self.section_balance,
+            "utilization_rate": self.utilization_rate,
+            "harmful_ratio": self.harmful_ratio,
+            "unused_ratio": self.unused_ratio,
+            "decay_impact": self.decay_impact,
+            "empty_sections": list(self.empty_sections),
+            "overflow_sections": list(self.overflow_sections),
+            "overall_health": self.overall_health,
+            "total_bullets": self.total_bullets,
+            "total_sections": self.total_sections,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SchemaMetrics":
+        return cls(
+            section_balance=d.get("section_balance", 0.0),
+            utilization_rate=d.get("utilization_rate", 0.0),
+            harmful_ratio=d.get("harmful_ratio", 0.0),
+            unused_ratio=d.get("unused_ratio", 0.0),
+            decay_impact=d.get("decay_impact", 0.0),
+            empty_sections=d.get("empty_sections", []),
+            overflow_sections=d.get("overflow_sections", []),
+            overall_health=d.get("overall_health", 0.0),
+            total_bullets=d.get("total_bullets", 0),
+            total_sections=d.get("total_sections", 0),
+            timestamp=d.get("timestamp", ""),
+        )
+
+
+@dataclass
+class SchemaProposal:
+    """A single schema change proposal (MCE offspring s_k in (1+1)-ES).
+
+    Part of the (1+1)-ES flow (MCE §3.1): generate one proposal,
+    compare metrics before/after. Claude Code decides whether to apply.
+    """
+    change_type: str          # ADD_SECTION, REMOVE_SECTION, ADJUST_DECAY, etc.
+    description: str          # Human-readable explanation
+    details: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0   # 0-1 heuristic confidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "change_type": self.change_type,
+            "description": self.description,
+            "details": self.details,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SchemaProposal":
+        return cls(
+            change_type=d["change_type"],
+            description=d.get("description", ""),
+            details=d.get("details", {}),
+            confidence=d.get("confidence", 0.0),
+        )
+
+
+@dataclass
+class PlaybookSchema:
+    """Versioned playbook schema (MCE skill s_k).
+
+    Contains sections + thresholds governing playbook behavior.
+    Part of schema history H = {(s_i, metrics_i)} in playbook_schema.json.
+    MCE Algorithm 1 (arXiv:2601.21557): evolve skill → execute → evaluate → update H.
+    """
+    version: int = 1
+    sections: list[str] = field(default_factory=list)
+    slug_map: dict[str, str] = field(default_factory=dict)
+    decay_rate: float = 0.95
+    prune_min_harmful: int = 3
+    evolution_threshold: int = 3
+    token_budget: int = 80000
+    parent_version: int | None = None
+    change_description: str = ""
+    created_at: str = ""
+    baseline_metrics: SchemaMetrics | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "version": self.version,
+            "sections": list(self.sections),
+            "slug_map": dict(self.slug_map),
+            "decay_rate": self.decay_rate,
+            "prune_min_harmful": self.prune_min_harmful,
+            "evolution_threshold": self.evolution_threshold,
+            "token_budget": self.token_budget,
+            "parent_version": self.parent_version,
+            "change_description": self.change_description,
+            "created_at": self.created_at,
+        }
+        if self.baseline_metrics is not None:
+            d["baseline_metrics"] = self.baseline_metrics.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PlaybookSchema":
+        bm = d.get("baseline_metrics")
+        return cls(
+            version=d.get("version", 1),
+            sections=d.get("sections", []),
+            slug_map=d.get("slug_map", {}),
+            decay_rate=d.get("decay_rate", 0.95),
+            prune_min_harmful=d.get("prune_min_harmful", 3),
+            evolution_threshold=d.get("evolution_threshold", 3),
+            token_budget=d.get("token_budget", 80000),
+            parent_version=d.get("parent_version"),
+            change_description=d.get("change_description", ""),
+            created_at=d.get("created_at", ""),
+            baseline_metrics=SchemaMetrics.from_dict(bm) if bm else None,
+        )
+
+    @classmethod
+    def default(cls) -> "PlaybookSchema":
+        """Create default schema matching current hardcoded values."""
+        from ccr.ace.playbook import DEFAULT_SECTIONS, _SLUG_MAP
+        return cls(
+            version=1,
+            sections=list(DEFAULT_SECTIONS),
+            slug_map=dict(_SLUG_MAP),
+        )
+
+
+@dataclass
 class CCRConfig:
     """Memory layer config."""
     recent_commit_count: int = 3
@@ -239,6 +425,10 @@ class CCRConfig:
     link_semantic_threshold: float = 0.3  # min keyword Jaccard for semantic links
     link_entity_threshold: float = 0.0    # min file Jaccard for entity links (any shared file)
     link_max_results: int = 10            # max results from BFS link traversal
+    # CER-inspired pattern buffer (arXiv:2506.06698)
+    pattern_dedup_threshold: float = 0.7     # word Jaccard for dedup
+    pattern_promotion_count: int = 3          # commits before suggesting ACE promotion
+    pattern_max_buffer_size: int = 200        # max patterns in buffer
 
 
 @dataclass
@@ -275,6 +465,13 @@ class ACEConfig:
     playbook_path: str = ""  # auto-set to .ccr/playbook.txt
     refinement_frequency: int = 10  # run deduplication every N steps
     dedup_similarity_threshold: float = 0.6  # Jaccard threshold for candidate pairs
+    # MCE-inspired schema evolution (arXiv:2601.21557)
+    schema_evolution_enabled: bool = True
+    overflow_threshold: float = 0.5       # Section fraction triggering overflow
+    min_cluster_size: int = 3             # Min bullets in OTHERS to propose new section
+    stop_health_threshold: float = 0.8    # "Healthy enough" → no proposals
+    rollback_health_delta: float = -0.05  # Health drop triggering rollback suggestion
+    schema_max_history: int = 20          # Max schema versions to retain
 
 
 @dataclass
