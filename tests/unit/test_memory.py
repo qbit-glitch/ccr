@@ -2112,3 +2112,159 @@ class TestScanPendingPromotions:
                                patterns_learned=[pat])
         # Should contain promotion suggestion exactly once (not duplicated)
         assert result.count("Pattern promotion suggestions") == 1
+
+
+# ===========================================================================
+# Tests for ONNX re-ranking in get_linked_commits()
+# ===========================================================================
+
+
+class TestGetLinkedCommitsONNXRerank:
+    """Tests for embedding-guided re-ranking in get_linked_commits()."""
+
+    def _setup_links(self, memory, src: str, targets: list[str]) -> None:
+        """Write a minimal commit_links.json with semantic links from src -> each target."""
+        import json
+
+        links_data: dict = {"version": 1, "links": {src: {}}}
+        entries = []
+        for tgt in targets:
+            entries.append({"target": tgt, "score": 0.5})
+        links_data["links"][src]["semantic"] = entries
+        memory._save_links(links_data)
+
+    def test_embedding_score_present_when_onnx_available(self, memory):
+        """embedding_score key appears in every result dict when ONNX available."""
+        import numpy as np
+
+        src_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        tgt_vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        self._setup_links(memory, "C001", ["C002"])
+
+        with patch.object(
+            memory,
+            "_load_commit_embeddings",
+            return_value={"C001": src_vec, "C002": tgt_vec},
+        ):
+            results = memory.get_linked_commits("C001")
+
+        assert len(results) == 1
+        assert "embedding_score" in results[0]
+        assert abs(results[0]["embedding_score"] - 0.0) < 1e-5  # dot([1,0,0],[0,1,0])=0
+
+    def test_results_sorted_by_embedding_score_descending(self, memory):
+        """When ONNX available, results are ordered by embedding_score high→low."""
+        import numpy as np
+
+        # C001 source: unit vector along dim 0
+        src_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        # C002: high similarity (cos ≈ 0.8)
+        v2 = np.array([0.8, 0.6, 0.0], dtype=np.float32)
+        v2 /= np.linalg.norm(v2)
+        # C003: low similarity (cos ≈ 0.1)
+        v3 = np.array([0.1, 0.995, 0.0], dtype=np.float32)
+        v3 /= np.linalg.norm(v3)
+
+        self._setup_links(memory, "C001", ["C003", "C002"])  # C003 first in link order
+
+        with patch.object(
+            memory,
+            "_load_commit_embeddings",
+            return_value={"C001": src_vec, "C002": v2, "C003": v3},
+        ):
+            results = memory.get_linked_commits("C001")
+
+        assert len(results) == 2
+        # C002 has higher cosine similarity → should appear first after re-rank
+        assert results[0]["id"] == "C002"
+        assert results[1]["id"] == "C003"
+        assert results[0]["embedding_score"] > results[1]["embedding_score"]
+
+    def test_graceful_degradation_when_no_embeddings(self, memory):
+        """When _load_commit_embeddings returns empty dict, no embedding_score key."""
+        self._setup_links(memory, "C001", ["C002", "C003"])
+
+        with patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001")
+
+        assert len(results) == 2
+        for r in results:
+            assert "embedding_score" not in r
+
+    def test_truncation_after_rerank(self, memory):
+        """Truncation to link_max_results happens after ONNX re-ranking."""
+        import numpy as np
+
+        # Override limit to 2 so we can observe truncation clearly
+        memory.config.link_max_results = 2
+
+        src_vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        # Three candidate vectors with descending cosine similarity
+        v_high = np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32)
+        v_high /= np.linalg.norm(v_high)
+        v_mid = np.array([0.5, 0.5, 0.0, 0.0], dtype=np.float32)
+        v_mid /= np.linalg.norm(v_mid)
+        v_low = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+        # Put low-similarity target first in link order
+        self._setup_links(memory, "C001", ["C004", "C003", "C002"])
+
+        with patch.object(
+            memory,
+            "_load_commit_embeddings",
+            return_value={
+                "C001": src_vec,
+                "C002": v_high,
+                "C003": v_mid,
+                "C004": v_low,
+            },
+        ):
+            results = memory.get_linked_commits("C001")
+
+        # Only 2 results returned (truncated)
+        assert len(results) == 2
+        # Top 2 by embedding score: C002 (high) and C003 (mid), not C004 (low)
+        ids = [r["id"] for r in results]
+        assert "C002" in ids
+        assert "C003" in ids
+        assert "C004" not in ids
+
+    def test_partial_embeddings_missing_targets_use_heuristic_score(self, memory):
+        """When src embedding available but some targets missing, those targets
+        fall back to their stored heuristic score for embedding_score."""
+        import numpy as np
+
+        src_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        tgt_vec = np.array([0.9, 0.1, 0.0], dtype=np.float32)
+        tgt_vec /= np.linalg.norm(tgt_vec)
+
+        # C002 has embedding, C003 does not
+        import json
+
+        links_data = {
+            "version": 1,
+            "links": {
+                "C001": {
+                    "semantic": [
+                        {"target": "C002", "score": 0.4},
+                        {"target": "C003", "score": 0.7},
+                    ]
+                }
+            },
+        }
+        memory._save_links(links_data)
+
+        with patch.object(
+            memory,
+            "_load_commit_embeddings",
+            return_value={"C001": src_vec, "C002": tgt_vec},
+        ):
+            results = memory.get_linked_commits("C001")
+
+        by_id = {r["id"]: r for r in results}
+        # C002 has a proper cosine score
+        assert "embedding_score" in by_id["C002"]
+        # C003 falls back to its stored heuristic score (0.7)
+        assert "embedding_score" in by_id["C003"]
+        assert abs(by_id["C003"]["embedding_score"] - 0.7) < 1e-5

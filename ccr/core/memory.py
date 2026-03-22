@@ -878,6 +878,12 @@ class MemoryManager:
         Returns list of dicts: {id, link_type, score, hop, title, what}.
         Caps at config.link_max_results (default 10) to avoid context explosion.
 
+        When ONNX embeddings are available for the source commit and candidate
+        commits, results are re-ranked by dense cosine similarity (dot product of
+        L2-normalised vectors) so the most semantically relevant linked commits
+        appear first.  An ``embedding_score`` key (float) is added to each result
+        dict when ONNX is available; it is absent on graceful degradation.
+
         Note: This is plain BFS, not MAGMA's intent-aware beam search (Alg. 1,
         Eq. 5-6). No query-dependent edge weighting or transition scoring.
         """
@@ -887,8 +893,14 @@ class MemoryManager:
         visited = {commit_id}
         frontier = [commit_id]
         results: list[dict] = []
+        # Collect up to 2× the final limit during BFS so re-ranking has enough
+        # candidates to surface the best results after truncation.
+        bfs_limit = self.config.link_max_results * 2
 
+        _bfs_full = False
         for hop in range(1, max_hops + 1):
+            if _bfs_full:
+                break
             next_frontier: list[str] = []
             for src in frontier:
                 node = data.get("links", {}).get(src, {})
@@ -911,13 +923,37 @@ class MemoryManager:
                             **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
                         })
                         next_frontier.append(tgt)
-                        if len(results) >= self.config.link_max_results:
-                            return results
+                        if len(results) >= bfs_limit:
+                            _bfs_full = True
+                            break
+                    if _bfs_full:
+                        break
+                if _bfs_full:
+                    break
             frontier = next_frontier
             if not frontier:
                 break
 
-        return results
+        # --- ONNX re-ranking (graceful degradation when unavailable) ---
+        all_ids = [commit_id] + [r["id"] for r in results]
+        cached = self._load_commit_embeddings(all_ids)
+        src_vec = cached.get(commit_id)
+
+        if src_vec is not None:
+            try:
+                import numpy as np
+                for r in results:
+                    tgt_vec = cached.get(r["id"])
+                    if tgt_vec is not None:
+                        r["embedding_score"] = float(np.dot(src_vec, tgt_vec))
+                    else:
+                        r["embedding_score"] = r.get("score", 0.0)
+                results.sort(key=lambda r: r.get("embedding_score", 0.0), reverse=True)
+            except ImportError:
+                pass
+
+        # Truncate to the configured limit AFTER re-ranking
+        return results[: self.config.link_max_results]
 
     @staticmethod
     def _parse_commit_block(text: str) -> dict:
