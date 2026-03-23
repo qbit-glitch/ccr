@@ -1384,3 +1384,112 @@ class TestGCCCommitRollingSummaryCompression:
         result = gcc_commit("Next", "added more", "reason", ["f.py"], "done",
                             compressed_summary="Clean compressed summary here")
         assert "Rolling summary is getting long" not in result
+
+
+# ===========================================================================
+# MAGMA Query-Aware BFS Tests
+# ===========================================================================
+
+
+class TestMagmaQueryBFS:
+    """Tests for MAGMA intent-aware BFS traversal via gcc_links query= parameter."""
+
+    def _setup_linked_commits(self):
+        """Create two commits sharing a file so entity links are generated."""
+        gcc_commit("Auth setup", "Implemented auth module", "Security baseline",
+                   ["auth.py"], "Next", admission_threshold=1.0)
+        gcc_commit("Auth fix", "Fixed auth bug", "Bug in C001",
+                   ["auth.py"], "Test", admission_threshold=1.0)
+
+    def _write_embeddings(self, commit_ids_and_vecs):
+        """Write embeddings directly into the memory cache file."""
+        import ccr.mcp_server as mod
+        import numpy as np
+        from ccr.context.embeddings import save_embeddings
+        mem = mod._memory
+        path = mem._get_commit_embeddings_path()
+        data = {cid: vec.tolist() for cid, vec in commit_ids_and_vecs.items()}
+        save_embeddings(data, path)
+
+    def test_gcc_links_with_query_returns_query_score(self):
+        """gcc_links with query= returns results with query_score field."""
+        import numpy as np
+        from unittest.mock import MagicMock, patch
+
+        self._setup_linked_commits()
+
+        # Build a unit query vector and a target embedding
+        query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        c001_vec = np.array([0.8, 0.2, 0.0], dtype=np.float32)
+        c002_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+        self._write_embeddings({"C001": c001_vec, "C002": c002_vec})
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = query_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            import ccr.mcp_server as mod
+            linked = mod._memory.get_linked_commits("C001", query="auth security")
+
+        # At least one result should carry a query_score
+        assert any("query_score" in r for r in linked), (
+            "Expected 'query_score' key in results when query= is provided"
+        )
+
+    def test_gcc_links_with_query_affects_ordering(self):
+        """query= can change result ordering vs no-query BFS when multi-hop."""
+        import numpy as np
+        from unittest.mock import MagicMock, patch
+
+        # Three commits: C001 (root) links to C002 and C003 via causal references
+        gcc_commit("Root", "Initial feature", "Baseline",
+                   ["root.py"], "Next", admission_threshold=1.0)
+        gcc_commit("Target A", "See C001 for context", "Related to C001",
+                   ["a.py"], "Test", admission_threshold=1.0)
+        gcc_commit("Target B", "See C001 for context", "Related to C001",
+                   ["b.py"], "Test", admission_threshold=1.0)
+
+        # C002 embedding is far from query; C003 is very close to query
+        query_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        c001_vec = np.array([0.9, 0.1, 0.0], dtype=np.float32)
+        # C002 is orthogonal to query (low relevance)
+        c002_vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        # C003 is aligned with query (high relevance)
+        c003_vec = np.array([0.95, 0.05, 0.0], dtype=np.float32)
+        self._write_embeddings({"C001": c001_vec, "C002": c002_vec, "C003": c003_vec})
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = query_vec
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+            import ccr.mcp_server as mod
+            mem = mod._memory
+            results_with_query = mem.get_linked_commits("C001", query="feature root")
+
+        # With query: C003 (score ~0.95) should appear before C002 (score ~0.0)
+        ids_with_query = [r["id"] for r in results_with_query]
+        if "C002" in ids_with_query and "C003" in ids_with_query:
+            assert ids_with_query.index("C003") < ids_with_query.index("C002"), (
+                "With query aligned to C003, C003 should appear before C002"
+            )
+
+    def test_gcc_links_without_query_unchanged(self):
+        """gcc_links without query= behaves identically to before (no query_score)."""
+        import ccr.mcp_server as mod
+        import numpy as np
+        from ccr.context.embeddings import save_embeddings
+
+        self._setup_linked_commits()
+
+        # Write embeddings so embedding_score path is exercised
+        c001_vec = np.array([0.8, 0.2, 0.0], dtype=np.float32)
+        c002_vec = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+        self._write_embeddings({"C001": c001_vec, "C002": c002_vec})
+
+        # No query= provided — should use old embedding_score path
+        linked = mod._memory.get_linked_commits("C001")
+
+        # No result should have query_score
+        assert not any("query_score" in r for r in linked), (
+            "Without query=, results must not contain 'query_score'"
+        )
