@@ -25,6 +25,7 @@ import tempfile
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +33,19 @@ import yaml
 
 from ccr.context.embeddings import get_embedding_model, load_embeddings, save_embeddings
 from ccr.core.types import CCRConfig, CommitLink
+from ccr.utils.parsing import extract_json_string
+
+
+@dataclass
+class EvolvedSummary:
+    """Mutable overlay for a commit's summary (A-MEM §3.3 Eq.7)."""
+
+    commit_id: str
+    evolved_what: str        # LLM-rewritten version of original what
+    evolution_reason: str    # why the summary was evolved
+    evolved_at: str          # ISO timestamp
+    source_commit_id: str    # the new commit that triggered evolution
+    original_what: str       # preserved original
 
 # --- Templates (from open-gcc bootstrap.ts) ---
 
@@ -132,10 +146,155 @@ class MemoryManager:
         self.config = config or CCRConfig()
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self.sub_client = None
+        self._evolved_summaries: dict[str, EvolvedSummary] = {}  # commit_id → EvolvedSummary
 
     def set_sub_client(self, client) -> None:
         """Set the sub-model client for LLM-regenerated rolling summaries."""
         self.sub_client = client
+
+    # --- A-MEM Evolved Summary Storage (§3.3 Eq.7) ---
+
+    @property
+    def _evolved_path(self) -> str:
+        return os.path.join(self.ccr_root, "evolved_summaries.json")
+
+    def _load_evolved_summaries(self) -> None:
+        """Load evolved summary overlays from JSON. Non-destructive if missing."""
+        path = self._evolved_path
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+            entries = data.get("evolved", {})
+            for commit_id, ev in entries.items():
+                self._evolved_summaries[commit_id] = EvolvedSummary(
+                    commit_id=ev["commit_id"],
+                    evolved_what=ev["evolved_what"],
+                    evolution_reason=ev["evolution_reason"],
+                    evolved_at=ev["evolved_at"],
+                    source_commit_id=ev["source_commit_id"],
+                    original_what=ev["original_what"],
+                )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass  # Corrupt data: silently ignore
+
+    def _save_evolved_summaries(self) -> None:
+        """Persist the evolved_summaries dict to JSON."""
+        path = self._evolved_path
+        data = {
+            "version": 1,
+            "evolved": {
+                cid: {
+                    "commit_id": ev.commit_id,
+                    "evolved_what": ev.evolved_what,
+                    "evolution_reason": ev.evolution_reason,
+                    "evolved_at": ev.evolved_at,
+                    "source_commit_id": ev.source_commit_id,
+                    "original_what": ev.original_what,
+                }
+                for cid, ev in self._evolved_summaries.items()
+            },
+        }
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        with self._locks[path], self._file_lock(path):
+            self._write_file_unlocked(path, content)
+
+    def get_evolved_what(self, commit_id: str) -> str | None:
+        """Return evolved summary if available, else None (A-MEM §3.3 Eq.7)."""
+        ev = self._evolved_summaries.get(commit_id)
+        return ev.evolved_what if ev else None
+
+    def _evolve_commit_summary(
+        self, existing_commit: dict, new_commit: dict
+    ) -> EvolvedSummary | None:
+        """Rewrite existing commit's 'what' to incorporate context from new_commit.
+
+        Implements A-MEM §3.3 Eq.7: m̃_i = f_LLM(m_i, m')
+        Returns None when sub_client is unavailable or an error occurs.
+        """
+        if self.sub_client is None:
+            return None
+        try:
+            prompt = (
+                "You are updating a project memory entry based on new related work.\n\n"
+                f"Original entry:\n"
+                f"Title: {existing_commit.get('title', '')}\n"
+                f"What: {existing_commit.get('what', '')}\n"
+                f"Why: {existing_commit.get('why', '')}\n\n"
+                f"New related work arrived:\n"
+                f"Title: {new_commit.get('title', '')}\n"
+                f"What: {new_commit.get('what', '')}\n"
+                f"Why: {new_commit.get('why', '')}\n\n"
+                "Rewrite the original \"What\" field to incorporate relevant context "
+                "from the new work.\n"
+                "Keep it concise (1-3 sentences). Only update if the new work adds "
+                "meaningful context.\n"
+                'Respond with a JSON object: {"evolved_what": "...", "evolution_reason": "..."}'
+            )
+            response = self.sub_client.completion([{"role": "user", "content": prompt}])
+            raw_json = extract_json_string(response)
+            parsed = json.loads(raw_json)
+            evolved_what = parsed.get("evolved_what", "").strip()
+            evolution_reason = parsed.get("evolution_reason", "").strip()
+            if not evolved_what:
+                return None
+            now_iso = datetime.now(timezone.utc).isoformat()
+            existing_id = existing_commit.get("id", "")
+            new_id = new_commit.get("id", "")
+            return EvolvedSummary(
+                commit_id=existing_id,
+                evolved_what=evolved_what,
+                evolution_reason=evolution_reason,
+                evolved_at=now_iso,
+                source_commit_id=new_id,
+                original_what=existing_commit.get("what", ""),
+            )
+        except Exception:
+            return None  # Never fail — evolution is supplementary
+
+    def _trigger_memory_evolution(self, new_commit_id: str, links: list) -> None:
+        """Evolve related commit summaries when a new commit arrives.
+
+        Implements A-MEM §3.3: fires on semantic/supersession links with score > 0.5.
+        Caps at 3 evolutions per commit to avoid LLM overuse.
+        """
+        try:
+            branch = self.get_active_branch()
+            new_block = self._find_commit_by_id(branch, new_commit_id)
+            if not new_block:
+                return
+            new_commit = self._parse_commit_block(new_block)
+            new_commit["id"] = new_commit_id
+
+            evolution_count = 0
+            for link in links:
+                if evolution_count >= 3:
+                    break
+                # Only evolve on semantic or supersession links above threshold
+                link_type = link.link_type if hasattr(link, "link_type") else link.get("link_type", "")
+                score = link.score if hasattr(link, "score") else link.get("score", 0.0)
+                if link_type not in ("semantic", "supersession"):
+                    continue
+                if score <= 0.5:
+                    continue
+                existing_id = link.target if hasattr(link, "target") else link.get("target", "")
+                if not existing_id:
+                    continue
+                existing_block = self._find_commit_by_id(branch, existing_id)
+                if not existing_block:
+                    continue
+                existing_commit = self._parse_commit_block(existing_block)
+                existing_commit["id"] = existing_id
+
+                result = self._evolve_commit_summary(existing_commit, new_commit)
+                if result is not None:
+                    self._evolved_summaries[existing_id] = result
+                    self._save_evolved_summaries()
+                    evolution_count += 1
+        except Exception:
+            pass  # Evolution is supplementary — never fail
 
     # --- Bootstrap ---
 
@@ -190,6 +349,9 @@ class MemoryManager:
         gitignore = os.path.join(self.project_root, ".gitignore")
         if os.path.isdir(os.path.join(self.project_root, ".git")):
             self._add_to_gitignore(gitignore)
+
+        # Load A-MEM evolved summaries overlay
+        self._load_evolved_summaries()
 
         return created
 
@@ -413,6 +575,7 @@ class MemoryManager:
         # Heuristic commit cross-linking (A-MEM/MAGMA inspired taxonomy)
         # _embed_commit is called here (normal path only) and its vector is
         # passed to _compute_links to avoid a second inference pass.
+        commit_links: list = []
         try:
             new_vec = self._embed_commit(
                 commit_id, f"{title} {what} {why} {next_step}"
@@ -425,6 +588,13 @@ class MemoryManager:
                 self._update_links(commit_id, commit_links)
         except Exception:
             pass  # Linking is supplementary — never fail the commit
+
+        # A-MEM §3.3: evolve related commit summaries if sub-model available
+        if self.sub_client is not None and commit_links:
+            try:
+                self._trigger_memory_evolution(commit_id, commit_links)
+            except Exception:
+                pass  # Evolution is supplementary — never fail the commit
 
         # CER-inspired pattern buffer management (arXiv:2506.06698 §3.1)
         promotion_suggestions: list[dict] = []
@@ -2070,6 +2240,11 @@ class MemoryManager:
             count = 3 if level < 4 else 10
             recent = self._read_commits_window(branch, offset, count)
             if recent:
+                # A-MEM §3.3: inject [evolved] tag for commits with evolved summaries
+                try:
+                    recent = self._inject_evolved_tags(recent)
+                except Exception:
+                    pass  # Evolution display is supplementary
                 parts.append(f"# Recent Commits ({branch}, offset={offset})\n{recent}")
 
             # CER pattern buffer: show high-occurrence patterns (arXiv:2506.06698)
@@ -3086,6 +3261,38 @@ class MemoryManager:
         commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
         windowed = commit_parts[offset:offset + count]
         return "\n".join(windowed)
+
+    def _inject_evolved_tags(self, commits_text: str) -> str:
+        """Replace **What**: <original> with **What** [evolved]: <evolved> for evolved commits.
+
+        A-MEM §3.3 Eq.7: shows evolved summaries in context output.
+        """
+        if not self._evolved_summaries:
+            return commits_text
+
+        def _evolve_block(block: str) -> str:
+            """Inject evolved tag into a single commit block if applicable."""
+            id_match = re.search(r"\[(C\d{3,})\]", block)
+            if not id_match:
+                return block
+            cid = id_match.group(1)
+            evolved_what = self.get_evolved_what(cid)
+            if not evolved_what:
+                return block
+            return re.sub(
+                r"\*\*What\*\*: .+",
+                f"**What** [evolved]: {evolved_what}",
+                block,
+                count=1,
+            )
+
+        # Split on commit header boundaries, evolve each block, then rejoin
+        parts = re.split(r"(?=## \[C\d{3,}\])", commits_text)
+        processed = [
+            _evolve_block(p) if re.match(r"## \[C\d{3,}\]", p.strip()) else p
+            for p in parts
+        ]
+        return "".join(processed)
 
     def _read_log_window(self, branch: str, count: int) -> str:
         """Read last N OTA entries from the branch log."""

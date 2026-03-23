@@ -519,3 +519,133 @@ class TestONNXAdmissionSimilarity:
         # Pure Jaccard on the shared file would give file_sim=1.0 → raw_sim=0.5+
         # ONNX cosine of orthogonal vectors = 0.0 → novelty near 1.0
         assert result["novelty"] > 0.9
+
+
+class TestAMEMMemoryEvolution:
+    """A-MEM §3.3 Eq.7 — mutable memory evolution (EvolvedSummary overlay)."""
+
+    def _make_commit_dict(self, cid: str, title: str, what: str, why: str) -> dict:
+        return {"id": cid, "title": title, "what": what, "why": why}
+
+    def test_evolve_commit_summary_calls_llm_and_returns_evolved(self, mem):
+        """With sub_client set, _evolve_commit_summary returns an EvolvedSummary."""
+        mock_client = MagicMock()
+        mock_client.completion.return_value = (
+            '{"evolved_what": "Auth module now integrates JWT.", '
+            '"evolution_reason": "New commit added JWT support."}'
+        )
+        mem.set_sub_client(mock_client)
+
+        existing = self._make_commit_dict("C001", "Add auth", "Added basic auth", "security")
+        new_c = self._make_commit_dict("C002", "Add JWT", "Added JWT tokens", "security")
+        result = mem._evolve_commit_summary(existing, new_c)
+
+        assert result is not None
+        assert result.commit_id == "C001"
+        assert "JWT" in result.evolved_what
+        assert result.source_commit_id == "C002"
+        assert result.original_what == "Added basic auth"
+        mock_client.completion.assert_called_once()
+
+    def test_evolve_commit_summary_returns_none_without_sub_client(self, mem):
+        """Without sub_client, _evolve_commit_summary returns None immediately."""
+        assert mem.sub_client is None
+        existing = self._make_commit_dict("C001", "Title", "What A", "Why A")
+        new_c = self._make_commit_dict("C002", "Title2", "What B", "Why B")
+        result = mem._evolve_commit_summary(existing, new_c)
+        assert result is None
+
+    def test_evolve_commit_summary_returns_none_on_error(self, mem):
+        """When sub_client raises, _evolve_commit_summary swallows and returns None."""
+        mock_client = MagicMock()
+        mock_client.completion.side_effect = RuntimeError("LLM timeout")
+        mem.set_sub_client(mock_client)
+
+        existing = self._make_commit_dict("C001", "Title", "What A", "Why A")
+        new_c = self._make_commit_dict("C002", "Title2", "What B", "Why B")
+        result = mem._evolve_commit_summary(existing, new_c)
+        assert result is None
+
+    def test_trigger_memory_evolution_evolves_semantic_links(self, mem):
+        """Semantic links with score > 0.5 trigger evolution of linked commit."""
+        # Create two real commits so _find_commit_by_id can locate them
+        mem.commit("First", "Did initial work", "bootstrap", ["a.py"], "next")
+        mem.commit("Second", "Did follow-up work", "extend", ["a.py"], "done")
+
+        recent = mem._parse_recent_commit_data("main", k=5)
+        assert len(recent) >= 2
+        old_id = recent[1]["id"]   # earlier commit
+        new_id = recent[0]["id"]   # latest commit
+
+        from ccr.core.types import CommitLink
+
+        mock_client = MagicMock()
+        mock_client.completion.return_value = (
+            '{"evolved_what": "Initial work now enriched by follow-up.", '
+            '"evolution_reason": "Related work arrived."}'
+        )
+        mem.set_sub_client(mock_client)
+
+        links = [CommitLink(target=old_id, link_type="semantic", score=0.8)]
+        mem._trigger_memory_evolution(new_id, links)
+
+        # The older commit should now have an evolved summary
+        evolved = mem.get_evolved_what(old_id)
+        assert evolved is not None
+        assert "enriched" in evolved or len(evolved) > 0
+
+    def test_trigger_memory_evolution_skips_entity_links(self, mem):
+        """Entity and causal links are NOT evolved — only semantic/supersession."""
+        mem.commit("Alpha", "Alpha work", "reason", ["x.py"], "next")
+        mem.commit("Beta", "Beta work", "reason", ["x.py"], "next")
+
+        recent = mem._parse_recent_commit_data("main", k=5)
+        old_id = recent[1]["id"]
+        new_id = recent[0]["id"]
+
+        from ccr.core.types import CommitLink
+
+        mock_client = MagicMock()
+        mock_client.completion.return_value = '{"evolved_what": "evolved", "evolution_reason": "r"}'
+        mem.set_sub_client(mock_client)
+
+        entity_links = [CommitLink(target=old_id, link_type="entity", score=0.9)]
+        mem._trigger_memory_evolution(new_id, entity_links)
+
+        # Entity links should NOT trigger evolution
+        evolved = mem.get_evolved_what(old_id)
+        assert evolved is None
+        mock_client.completion.assert_not_called()
+
+    def test_get_context_shows_evolved_summary(self, mem):
+        """get_context at level 2+ shows [evolved] tag for commits with evolved summaries."""
+        mem.commit("Feature A", "Built feature A", "needed", ["a.py"], "next")
+        recent = mem._parse_recent_commit_data("main", k=5)
+        commit_id = recent[0]["id"]
+
+        # Manually inject an evolved summary
+        from ccr.core.memory import EvolvedSummary
+        mem._evolved_summaries[commit_id] = EvolvedSummary(
+            commit_id=commit_id,
+            evolved_what="Feature A now includes caching layer.",
+            evolution_reason="New caching commit arrived.",
+            evolved_at="2026-03-23T00:00:00+00:00",
+            source_commit_id="C999",
+            original_what="Built feature A",
+        )
+
+        ctx = mem.get_context(level=2)
+        assert "[evolved]" in ctx
+        assert "caching layer" in ctx
+
+    def test_gcc_evolve_memory_tool_without_sub_client(self, mem):
+        """gcc_evolve_memory returns appropriate message when no sub-model."""
+        from unittest.mock import patch
+
+        # Patch only _get_sub_client to return None — function returns early before
+        # touching _state_lock or _ensure_memory, so no other patching needed.
+        with patch("ccr.mcp_server._get_sub_client", return_value=None):
+            import ccr.mcp_server as srv
+            result = srv.gcc_evolve_memory(commit_id=None)
+
+        assert "Sub-model not available" in result or "not available" in result.lower()

@@ -284,7 +284,7 @@ All commit linking is **mechanical heuristics** (zero LLM calls). Key gaps vs. p
 | Paper Feature | Paper Mechanism | CCR Implementation |
 |---|---|---|
 | A-MEM link generation (§3.2, Eq. 4-6) | Dense vector cosine similarity + LLM analysis | Word Jaccard + regex |
-| A-MEM memory evolution (§3.3, Eq. 7) | LLM rewrites existing memories on new info | Not implemented (commits immutable) |
+| A-MEM memory evolution (§3.3, Eq. 7) | LLM rewrites existing memories on new info | Implemented: EvolvedSummary overlay; _trigger_memory_evolution() fires on semantic/supersession links when sub_client set; get_context() shows [evolved] tag |
 | MAGMA temporal graph (§3.2) | Immutable chronological chain | Implicit in sequential C### IDs, not stored as links |
 | MAGMA causal graph (§3.2, Eq. 8) | LLM-inferred logical entailment | Regex detection of explicit C### references only |
 | MAGMA semantic graph (§3.2) | Dense vector cosine (all-MiniLM-L6-v2) | Word Jaccard with ~100-word stop list |

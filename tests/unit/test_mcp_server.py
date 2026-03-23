@@ -13,6 +13,7 @@ from ccr.mcp_server import (
     ace_evolve_from_failures,
     ace_evolve_schema,
     ace_find_similar,
+    ace_generate_bullets,
     ace_get_playbook,
     ace_get_stats,
     ace_prune,
@@ -1104,11 +1105,11 @@ class TestToolAnnotations:
         assert ann.destructiveHint is False
         assert ann.idempotentHint is True
 
-    # -- All 23 tools have annotations --
+    # -- All 25 tools have annotations --
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) == 23, f"Expected 23 tools, got {len(all_tools)}"
+        assert len(all_tools) == 25, f"Expected 25 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
 
@@ -1697,7 +1698,8 @@ class TestCERAutoPatternExtraction:
                 )
 
             assert "C0" in result
-            mock_sub.completion.assert_called_once()
+            # completion called at least once: pattern extraction + ACE pipeline may also fire
+            mock_sub.completion.assert_called()
         finally:
             mod._memory.config.auto_extract_patterns = False
 
@@ -1708,7 +1710,9 @@ class TestCERAutoPatternExtraction:
         mod._memory.config.auto_extract_patterns = True
         try:
             mock_sub = MagicMock()
-            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            # Patch _run_ace_pipeline to isolate pattern-extraction assertion
+            with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
+                 patch.object(mod, "_run_ace_pipeline"):
                 result = gcc_commit(
                     title="Add feature",
                     what="Implemented a comprehensive new feature with detailed logic spanning multiple modules and touching the core data pipeline",
@@ -1718,6 +1722,7 @@ class TestCERAutoPatternExtraction:
                     patterns_learned=["When patterns are already provided, skip extraction"],
                 )
             assert "C0" in result
+            # Pattern extraction skipped since patterns_learned already provided
             mock_sub.completion.assert_not_called()
         finally:
             mod._memory.config.auto_extract_patterns = False
@@ -1727,7 +1732,9 @@ class TestCERAutoPatternExtraction:
         import ccr.mcp_server as mod
 
         mock_sub = MagicMock()
-        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+        # Patch _run_ace_pipeline to isolate pattern-extraction assertion
+        with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
+             patch.object(mod, "_run_ace_pipeline"):
             result = gcc_commit(
                 title="Add feature",
                 what="Implemented a comprehensive new feature with detailed logic spanning multiple modules",
@@ -1736,6 +1743,7 @@ class TestCERAutoPatternExtraction:
                 next_step="Test",
             )
         assert "C0" in result
+        # auto_extract_patterns is False (default): no pattern extraction call
         mock_sub.completion.assert_not_called()
 
     def test_gcc_commit_skips_auto_extract_when_what_too_short(self):
@@ -1745,12 +1753,149 @@ class TestCERAutoPatternExtraction:
         mod._memory.config.auto_extract_patterns = True
         try:
             mock_sub = MagicMock()
-            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            # Patch _run_ace_pipeline to isolate pattern-extraction assertion
+            with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
+                 patch.object(mod, "_run_ace_pipeline"):
                 result = gcc_commit(
                     title="Tiny fix", what="Fixed typo", why="Quality",
                     files_changed=["readme.md"], next_step="Done",
                 )
             assert "C0" in result
+            # what is too short (<100 chars): no pattern extraction call
             mock_sub.completion.assert_not_called()
         finally:
             mod._memory.config.auto_extract_patterns = False
+
+
+# ===========================================================================
+# ACE 3-Agent Loop Tests
+# ===========================================================================
+
+
+class TestACEThreeAgentLoop:
+    """Tests for ACE Generator → Reflector → Curator pipeline."""
+
+    def test_ace_generator_returns_bullets(self):
+        """Generator returns a list of strings from sub_client."""
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = '["When you add a new feature, write tests first", "Always check for edge cases in loops"]'
+
+        result = mod._ace_generator("Title: Add feature\nWhat: added code\nWhy: needed", mock_sub)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert all(isinstance(s, str) for s in result)
+
+    def test_ace_generator_returns_empty_on_error(self):
+        """Generator returns [] when sub_client raises an exception."""
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.side_effect = RuntimeError("connection failed")
+
+        result = mod._ace_generator("trajectory", mock_sub)
+        assert result == []
+
+    def test_ace_reflector_filters_low_quality(self):
+        """Reflector removes bullets scoring below 3."""
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = json.dumps([
+            {"bullet": "high quality bullet here", "score": 5},
+            {"bullet": "mediocre bullet text", "score": 2},
+            {"bullet": "decent bullet content", "score": 3},
+        ])
+
+        candidates = ["high quality bullet here", "mediocre bullet text", "decent bullet content"]
+        result = mod._ace_reflector(candidates, "some context", mock_sub)
+        assert "high quality bullet here" in result
+        assert "mediocre bullet text" not in result
+        assert "decent bullet content" in result
+
+    def test_ace_curator_returns_add_skip_merge(self):
+        """Curator returns list of decisions with action field."""
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = json.dumps([
+            {"bullet": "novel strategy bullet", "action": "ADD", "merge_with": None},
+            {"bullet": "duplicate existing bullet", "action": "SKIP", "merge_with": None},
+            {"bullet": "similar to existing strategy", "action": "MERGE", "merge_with": "existing strategy text"},
+        ])
+
+        existing = ["existing strategy text", "another bullet"]
+        candidates = ["novel strategy bullet", "duplicate existing bullet", "similar to existing strategy"]
+        result = mod._ace_curator(existing, candidates, mock_sub)
+
+        assert len(result) == 3
+        actions = [d["action"] for d in result]
+        assert "ADD" in actions
+        assert "SKIP" in actions
+        assert "MERGE" in actions
+
+    def test_gcc_commit_triggers_ace_pipeline(self):
+        """After a successful commit, ACE pipeline fires when sub_client is available."""
+        from unittest.mock import MagicMock, patch, call
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        # Generator returns candidates
+        mock_sub.completion.return_value = '["When refactoring, write tests first", "Document all changes"]'
+
+        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            result = gcc_commit(
+                title="Test pipeline",
+                what="Implemented the pipeline wiring code",
+                why="Required for feature",
+                files_changed=["mcp_server.py"],
+                next_step="Verify",
+            )
+
+        assert "C0" in result
+        # sub_client.completion should have been called at least once (by pipeline)
+        assert mock_sub.completion.call_count >= 1
+
+    def test_ace_generate_bullets_preview_only(self):
+        """ace_generate_bullets with auto_apply=False returns preview without modifying playbook."""
+        from unittest.mock import MagicMock, patch
+        import ccr.mcp_server as mod
+
+        initial_bullet_count = len(mod._playbook.bullets)
+
+        mock_sub = MagicMock()
+        # Generator response
+        mock_sub.completion.side_effect = [
+            '["When debugging, add logging first", "Always check return values"]',
+            json.dumps([{"bullet": "When debugging, add logging first", "score": 5}, {"bullet": "Always check return values", "score": 4}]),
+            json.dumps([{"bullet": "When debugging, add logging first", "action": "ADD", "merge_with": None}, {"bullet": "Always check return values", "action": "ADD", "merge_with": None}]),
+        ]
+
+        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            result = ace_generate_bullets(context="debugging code", auto_apply=False)
+
+        # Playbook should not have been modified
+        assert len(mod._playbook.bullets) == initial_bullet_count
+        # But preview should mention decisions
+        assert "ADD" in result or "decisions" in result.lower() or "Results" in result
+
+    def test_ace_get_playbook_with_task_context(self):
+        """ace_get_playbook with task_context returns policy-ranked section."""
+        # First add some bullets with counters
+        ace_apply_delta([
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Always verify database connections before queries"},
+            {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Check API rate limits when making requests"},
+        ])
+        # Update counters to give non-zero scores
+        import ccr.mcp_server as mod
+        bullets = mod._playbook.bullets
+        if bullets:
+            ace_update_counters([{"id": bullets[0].id, "tag": "helpful"}])
+
+        result = ace_get_playbook(task_context="database connection issues")
+        assert "Policy-ranked skills" in result

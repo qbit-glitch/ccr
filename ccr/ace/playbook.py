@@ -145,6 +145,7 @@ class Bullet:
     scope: str = "general"  # "general" or "task_specific" (SkillRL §3.2 hierarchical SkillBank)
     when_to_apply: str = ""  # Applicability condition (SkillRL Table 5: "When to Apply")
     last_updated: str = ""  # ISO-8601 timestamp of last counter update (for temporal decay)
+    grpo_advantage: float = 0.0  # group-relative advantage (SkillRL GRPO Eq.3)
     failure_lessons: list[FailureLesson] = field(default_factory=list)
 
     @property
@@ -892,6 +893,90 @@ class Playbook:
                 if fl.prevention_principle:
                     principles.append((bullet.id, fl.prevention_principle))
         return principles
+
+    # ------------------------------------------------------------------
+    # GRPO-inspired group-relative advantage scoring (SkillRL GRPO Eq.3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _word_jaccard_sim(a: str, b: str) -> float:
+        """Word-level Jaccard similarity between two strings."""
+        sa = set(a.lower().split())
+        sb = set(b.lower().split())
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
+    def recompute_grpo_advantages(self) -> int:
+        """Recompute GRPO group-relative advantages for all bullets (SkillRL Eq.3).
+
+        Groups bullets within each section by word-Jaccard similarity (>= 0.4).
+        Reward r_i = effective_score (helpful * decay). Advantage A_i = (r_i - mean) / (std + epsilon).
+        Single-bullet groups get advantage 0.0.
+        Returns number of bullets updated.
+        """
+        updated = 0
+        for section in self._sections:
+            section_bullets = [b for b in self._bullets if b.section == section]
+            if not section_bullets:
+                continue
+
+            # Greedy word-Jaccard clustering with threshold 0.4
+            groups: list[list[Bullet]] = []
+            for bullet in section_bullets:
+                placed = False
+                for group in groups:
+                    anchor = group[0]
+                    if self._word_jaccard_sim(bullet.content, anchor.content) >= 0.4:
+                        group.append(bullet)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([bullet])
+
+            for group in groups:
+                rewards = [b.effective_score() for b in group]
+                n = len(rewards)
+                if n == 1:
+                    group[0].grpo_advantage = 0.0
+                    updated += 1
+                    continue
+                mean_r = sum(rewards) / n
+                variance = sum((r - mean_r) ** 2 for r in rewards) / n
+                std_r = math.sqrt(variance)
+                for bullet, r_i in zip(group, rewards):
+                    bullet.grpo_advantage = (r_i - mean_r) / (std_r + 1e-8)
+                    updated += 1
+
+        # Also handle bullets with no section or section not in self._sections
+        orphans = [b for b in self._bullets if b.section not in self._sections]
+        for bullet in orphans:
+            bullet.grpo_advantage = 0.0
+            updated += 1
+
+        return updated
+
+    def get_policy_ranked(self, task_context: str = "", top_k: int = 10) -> list[Bullet]:
+        """Return bullets ranked by effective_score * (1 + grpo_advantage) — GRPO policy-weighted.
+
+        When task_context is provided, filters to bullets with word-Jaccard overlap >= 0.1
+        against bullet content or when_to_apply. Returns top_k results.
+        """
+        candidates = list(self._bullets)
+
+        if task_context.strip():
+            filtered = []
+            for b in candidates:
+                text = b.content + " " + b.when_to_apply
+                if self._word_jaccard_sim(task_context, text) >= 0.1:
+                    filtered.append(b)
+            candidates = filtered if filtered else candidates
+
+        def policy_score(b: Bullet) -> float:
+            return b.effective_score() * (1.0 + b.grpo_advantage)
+
+        candidates.sort(key=policy_score, reverse=True)
+        return candidates[:top_k]
 
     # ------------------------------------------------------------------
     # MCE-inspired schema evolution (arXiv:2601.21557)

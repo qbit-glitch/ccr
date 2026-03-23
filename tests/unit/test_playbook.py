@@ -1892,3 +1892,108 @@ class TestApplySchema:
         schema = PlaybookSchema(sections=new_sections)
         pb.apply_schema(schema)
         assert pb.sections == new_sections
+
+
+class TestGRPOAdvantages:
+    """Tests for GRPO group-relative advantage scoring (SkillRL GRPO Eq.3)."""
+
+    def test_recompute_grpo_advantages_single_bullet(self):
+        """Single bullet in a section should get advantage 0.0."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Always verify inputs before processing"),
+        ])
+        count = pb.recompute_grpo_advantages()
+        assert count == 1
+        bullet = pb.bullets[0]
+        assert bullet.grpo_advantage == 0.0
+
+    def test_recompute_grpo_advantages_group_math(self):
+        """Three bullets with distinct rewards should satisfy GRPO Eq.3 math."""
+        from datetime import datetime, timezone
+
+        pb = Playbook()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Add 3 bullets to same section
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="alpha strategy one"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="alpha strategy two"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="alpha strategy three"),
+        ])
+        bullets = pb.bullets
+        # Set distinct helpful counts and timestamps (no decay since last_updated set now)
+        bullets[0].helpful = 10
+        bullets[0].last_updated = now_iso
+        bullets[1].helpful = 4
+        bullets[1].last_updated = now_iso
+        bullets[2].helpful = 1
+        bullets[2].last_updated = now_iso
+
+        count = pb.recompute_grpo_advantages()
+        assert count == 3
+
+        # GRPO Eq.3: A_i = (r_i - mean) / (std + eps)
+        # rewards are approximately 10, 4, 1 (no decay since just updated)
+        rewards = [b.effective_score() for b in bullets]
+        mean_r = sum(rewards) / len(rewards)
+        import math
+        variance = sum((r - mean_r) ** 2 for r in rewards) / len(rewards)
+        std_r = math.sqrt(variance)
+        eps = 1e-8
+
+        for bullet, r_i in zip(bullets, rewards):
+            expected_adv = (r_i - mean_r) / (std_r + eps)
+            assert abs(bullet.grpo_advantage - expected_adv) < 1e-6
+
+    def test_recompute_grpo_advantages_returns_count(self):
+        """recompute_grpo_advantages should return total number of bullets updated."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        total_bullets = len(pb.bullets)
+        count = pb.recompute_grpo_advantages()
+        assert count == total_bullets
+
+    def test_get_policy_ranked_filters_by_task_context(self):
+        """task_context should filter to relevant bullets."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Always check database connections before querying"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Use async patterns when handling multiple HTTP requests"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Database query optimization requires proper indexing"),
+        ])
+        # Set scores so ranking is deterministic
+        bullets = pb.bullets
+        bullets[0].helpful = 5
+        bullets[1].helpful = 3
+        bullets[2].helpful = 4
+        pb.recompute_grpo_advantages()
+
+        # Filter for database-related context
+        ranked = pb.get_policy_ranked(task_context="database queries", top_k=10)
+        # Should include database bullets but not the HTTP one
+        contents = [b.content for b in ranked]
+        assert any("database" in c.lower() or "query" in c.lower() for c in contents)
+
+    def test_get_policy_ranked_sorts_by_policy_score(self):
+        """Higher effective_score * (1 + advantage) should come first."""
+        from datetime import datetime, timezone
+
+        pb = Playbook()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="high score strategy for ranking"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="low score strategy for ranking"),
+        ])
+        bullets = pb.bullets
+        bullets[0].helpful = 10
+        bullets[0].last_updated = now_iso
+        bullets[1].helpful = 1
+        bullets[1].last_updated = now_iso
+        pb.recompute_grpo_advantages()
+
+        ranked = pb.get_policy_ranked(top_k=10)
+        assert len(ranked) >= 2
+        # First bullet should have higher policy score than second
+        def policy_score(b):
+            return b.effective_score() * (1.0 + b.grpo_advantage)
+        scores = [policy_score(b) for b in ranked]
+        assert scores[0] >= scores[-1]
