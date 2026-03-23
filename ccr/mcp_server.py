@@ -25,6 +25,7 @@ from ccr.context.indexer import RepoIndex
 from ccr.core.memory import MemoryManager
 from ccr.core.types import CCRConfig, PlaybookSchema, SchemaMetrics
 from ccr.rlm.repl import CCRRepl
+from ccr.utils.parsing import extract_json_string
 
 # ---------------------------------------------------------------------------
 # Globals — initialized once at startup
@@ -60,6 +61,22 @@ mcp = FastMCP(
 )
 
 
+def _get_sub_client() -> object | None:
+    """Return a ClaudeClient using ANTHROPIC_API_KEY_SUB or ANTHROPIC_API_KEY, or None.
+
+    Graceful no-op: when no key is set, all Phase 2 features are silently skipped.
+    Uses claude-haiku-4-5-20251001 (fast + cheap) for synthesis tasks.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY_SUB") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from ccr.models.anthropic_client import ClaudeClient  # noqa: PLC0415
+        return ClaudeClient(api_key=api_key, model_name="claude-haiku-4-5-20251001", max_tokens=1024)
+    except Exception:
+        return None
+
+
 def _init(project_root: str | None = None) -> None:
     """Initialize all subsystems for the given project root."""
     global _project_root, _memory, _playbook, _playbook_path, _failure_lessons_path
@@ -70,6 +87,11 @@ def _init(project_root: str | None = None) -> None:
     _project_root = os.path.abspath(project_root or os.getcwd())
     _memory = MemoryManager(_project_root, CCRConfig())
     _memory.ensure_structure()
+
+    # Wire optional sub-model (Phase 2): activates GCC LLM rolling summary + ACE synthesis
+    sub = _get_sub_client()
+    if sub is not None:
+        _memory.set_sub_client(sub)
 
     # Clear session marker so hooks detect new session on first prompt
     session_marker = os.path.join(_project_root, ".ccr", ".session_active")
@@ -239,6 +261,36 @@ def _ensure_index() -> RepoIndex:
     return _repo_index
 
 
+def _extract_patterns_from_commit(
+    title: str, what: str, why: str, files_changed: list[str], sub_client
+) -> list[str]:
+    """Auto-extract transferable patterns from a commit via sub-model (CER §3.2).
+
+    Returns "When X, do Y" pattern strings, or [] on any error.
+    Failures are transparent and never block the commit path.
+    """
+    try:
+        files_str = ", ".join(files_changed[:5])
+        prompt = (
+            "Extract 1-2 transferable patterns from this commit for future reference.\n\n"
+            f"Commit: {title}\n"
+            f"What: {what}\n"
+            f"Why: {why}\n"
+            f"Files: {files_str}\n\n"
+            'Write patterns as abstract "When X, do Y" rules that would help in similar future situations.\n'
+            'Respond with a JSON array of strings: ["When X, do Y", "When A, do B"]\n'
+            "Be concise. Each pattern should be 1 sentence."
+        )
+        response = sub_client.completion(prompt)
+        raw = extract_json_string(response)
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(p) for p in parsed if p]
+        return []
+    except Exception:
+        return []
+
+
 # ===========================================================================
 # GCC Memory Tools
 # ===========================================================================
@@ -302,6 +354,13 @@ def gcc_commit(
     try:
         with _state_lock:
             mem = _ensure_memory()
+            # Phase 2: Auto-extract patterns via sub-model when not provided (CER §3.2)
+            if patterns_learned is None and mem.config.auto_extract_patterns and len(what) > 100:
+                sub = _get_sub_client()
+                if sub is not None:
+                    patterns_learned = _extract_patterns_from_commit(
+                        title, what, why, files_changed or [], sub
+                    ) or None
             return mem.commit(title, what, why, files_changed, next_step,
                               patterns_learned,
                               admission_threshold, rejection_threshold,
@@ -870,6 +929,98 @@ def ace_prune(scope: str = "project") -> str:
         return f"Error: {type(e).__name__}: {e}"
 
 
+def _word_jaccard(a: str, b: str) -> float:
+    """Compute word-level Jaccard similarity between two strings."""
+    sa = set(a.lower().split())
+    sb = set(b.lower().split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _auto_synthesize_skills(candidates: list[dict], sub_client) -> list[dict]:
+    """Cross-synthesize generalized skills from related failure lessons (SkillRL §3.3).
+
+    Groups candidates by task_context similarity (word Jaccard >= 0.5), then calls
+    the sub-model once per group of 2+ candidates to generate 1-2 generalized
+    "When X, do Y" skills that abstract across all prevention_principles in the group.
+
+    Single-candidate groups are skipped — they were already handled by the mechanical
+    path (prevention_principle verbatim copy).
+
+    Args:
+        candidates: List of dicts with keys: bullet_slug, failure_lesson (dict with
+            prevention_principle, task_context, failure_point).
+        sub_client: A ClaudeClient instance (or compatible) with .completion() method.
+
+    Returns:
+        List of dicts with keys: content (str), when_to_apply (str), scope (str).
+        Returns [] on any error (graceful no-op).
+    """
+    try:
+        from ccr.utils.parsing import extract_json_string  # noqa: PLC0415
+
+        if not candidates:
+            return []
+
+        # Greedy grouping by task_context similarity (threshold 0.5)
+        groups: list[list[dict]] = []
+        for cand in candidates:
+            tc = cand.get("failure_lesson", {}).get("task_context", "")
+            placed = False
+            for group in groups:
+                anchor_tc = group[0].get("failure_lesson", {}).get("task_context", "")
+                if _word_jaccard(tc, anchor_tc) >= 0.5:
+                    group.append(cand)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([cand])
+
+        synthesized: list[dict] = []
+        for group in groups:
+            if len(group) < 2:
+                # Single-candidate groups handled by mechanical path — skip
+                continue
+            principles = [
+                c.get("failure_lesson", {}).get("prevention_principle", "")
+                for c in group
+            ]
+            # Filter empty principles
+            principles = [p for p in principles if p.strip()]
+            if not principles:
+                continue
+
+            principles_text = "\n".join(f"- {p}" for p in principles)
+            prompt = (
+                "You are synthesizing generalized skills from related failure lessons.\n\n"
+                f"Failure lessons (all from similar task contexts):\n{principles_text}\n\n"
+                'Write 1-2 generalized "When X, do Y" skills that abstract across all of these.\n'
+                'Respond with a JSON array: [{"content": "...", "when_to_apply": "..."}]\n'
+                "Be concise. Each skill should be 1-2 sentences."
+            )
+
+            try:
+                raw = sub_client.completion([{"role": "user", "content": prompt}])
+                json_str = extract_json_string(raw)
+                parsed = json.loads(json_str)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict) and item.get("content", "").strip():
+                            synthesized.append({
+                                "content": item["content"].strip(),
+                                "when_to_apply": item.get("when_to_apply", ""),
+                                "scope": "project",
+                            })
+            except Exception:
+                # Silent failure per spec — one bad group doesn't block others
+                continue
+
+        return synthesized
+    except Exception:
+        return []
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 def ace_evolve_from_failures(
     threshold: int = 3,
@@ -901,7 +1052,6 @@ def ace_evolve_from_failures(
 
             # Path 2: Save synthesized skills from Claude Code
             if synthesized_skills:
-                from ccr.ace.playbook import DeltaOperation
                 ops = []
                 for skill in synthesized_skills:
                     content = skill.get("content", "").strip()
@@ -938,6 +1088,46 @@ def ace_evolve_from_failures(
             # Include the candidates so Claude can optionally synthesize better skills
             candidate_ids = set(check.get("candidate_ids", []))
             candidates = [b for b in pb.bullets if b.id in candidate_ids]
+
+            # Phase 2: LLM cross-synthesis of related failure lessons (SkillRL §3.3)
+            # Runs when sub-client is available; graceful no-op otherwise.
+            sub = _get_sub_client()
+            synthesized_count = 0
+            if sub is not None and candidates:
+                # Build candidate dicts expected by _auto_synthesize_skills
+                cand_dicts = []
+                for b in candidates:
+                    for lesson in b.failure_lessons:
+                        fl_dict = lesson if isinstance(lesson, dict) else {
+                            "prevention_principle": getattr(lesson, "prevention_principle", ""),
+                            "task_context": getattr(lesson, "task_context", ""),
+                            "failure_point": getattr(lesson, "failure_point", ""),
+                        }
+                        cand_dicts.append({
+                            "bullet_slug": b.id,
+                            "failure_lesson": fl_dict,
+                        })
+                if cand_dicts:
+                    synthesized = _auto_synthesize_skills(cand_dicts, sub)
+                    for skill in synthesized:
+                        content = skill.get("content", "").strip()
+                        if content:
+                            op = DeltaOperation(
+                                op_type="ADD",
+                                section="PROBLEM-SOLVING HEURISTICS",
+                                content=content,
+                            )
+                            applied_count = pb.apply_delta([op])
+                            # Set when_to_apply and scope on the newly added bullet
+                            if applied_count > 0:
+                                new_b = pb.bullets[-1]
+                                if skill.get("when_to_apply"):
+                                    new_b.when_to_apply = skill["when_to_apply"]
+                                new_b.scope = skill.get("scope", "project")
+                                synthesized_count += 1
+                    if synthesized_count > 0:
+                        save_fn()
+
             lessons_text = []
             for b in candidates:
                 lessons_text.append(f"## Bullet [{b.id}]: {b.content[:100]}")
@@ -960,6 +1150,8 @@ def ace_evolve_from_failures(
                     result_parts.append(f"  [{b.id}] {b.content[:100]}")
                     if b.when_to_apply:
                         result_parts.append(f"    When: {b.when_to_apply[:100]}")
+            if synthesized_count > 0:
+                result_parts.append(f"Synthesized {synthesized_count} cross-lesson skill(s) via sub-model (SkillRL §3.3).")
 
             if lessons_text:
                 result_parts.append(

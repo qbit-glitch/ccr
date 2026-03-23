@@ -1493,3 +1493,264 @@ class TestMagmaQueryBFS:
         assert not any("query_score" in r for r in linked), (
             "Without query=, results must not contain 'query_score'"
         )
+
+
+# ===========================================================================
+# ACE Cross-Synthesis (Phase 2C — SkillRL §3.3 sub-model synthesis)
+# ===========================================================================
+
+
+class TestACECrossSynthesis:
+    """Tests for _auto_synthesize_skills and its integration into ace_evolve_from_failures."""
+
+    def _make_candidate(self, slug, prevention_principle, task_context, failure_point=""):
+        return {
+            "bullet_slug": slug,
+            "failure_lesson": {
+                "prevention_principle": prevention_principle,
+                "task_context": task_context,
+                "failure_point": failure_point,
+            },
+        }
+
+    def test_auto_synthesize_skills_groups_by_task_context(self):
+        """Candidates with similar task_context are grouped; sub_client called once per group."""
+        from ccr.mcp_server import _auto_synthesize_skills
+        from unittest.mock import MagicMock
+
+        # Two candidates with similar task_context (high word overlap)
+        c1 = self._make_candidate("heu-00001", "Always validate input before processing",
+                                   "database query optimization task")
+        c2 = self._make_candidate("heu-00002", "Check query plan before running expensive queries",
+                                   "database query performance task")
+        # One candidate with distinct task_context
+        c3 = self._make_candidate("mis-00001", "Verify file permissions before writing",
+                                   "file system access control")
+
+        sub = MagicMock()
+        sub.completion.return_value = '[{"content": "When optimizing database queries, validate inputs and review query plans first.", "when_to_apply": "Before executing queries"}]'
+
+        result = _auto_synthesize_skills([c1, c2, c3], sub)
+
+        # sub_client should be called once — for the group with c1 + c2 (similar context)
+        # c3 is alone → skipped (single-candidate group)
+        assert sub.completion.call_count == 1
+        assert len(result) == 1
+        assert "content" in result[0]
+        assert result[0]["scope"] == "project"
+
+    def test_auto_synthesize_skills_skips_single_candidates(self):
+        """Groups with exactly 1 candidate get no LLM call (mechanical path handles them)."""
+        from ccr.mcp_server import _auto_synthesize_skills
+        from unittest.mock import MagicMock
+
+        # All candidates have very different task_contexts → each in its own group
+        c1 = self._make_candidate("heu-00001", "Rule A", "database optimization")
+        c2 = self._make_candidate("heu-00002", "Rule B", "file system permissions")
+        c3 = self._make_candidate("heu-00003", "Rule C", "network request throttling")
+
+        sub = MagicMock()
+        sub.completion.return_value = '[]'
+
+        result = _auto_synthesize_skills([c1, c2, c3], sub)
+
+        # No group has 2+ candidates → no LLM calls
+        assert sub.completion.call_count == 0
+        assert result == []
+
+    def test_auto_synthesize_skills_returns_empty_on_error(self):
+        """sub_client raising an exception → returns [] without propagating."""
+        from ccr.mcp_server import _auto_synthesize_skills
+        from unittest.mock import MagicMock
+
+        # Two similar candidates so a group is formed
+        c1 = self._make_candidate("heu-00001", "Rule A", "database query optimization task")
+        c2 = self._make_candidate("heu-00002", "Rule B", "database query performance task")
+
+        sub = MagicMock()
+        sub.completion.side_effect = RuntimeError("API unavailable")
+
+        # Should not raise — graceful no-op
+        result = _auto_synthesize_skills([c1, c2], sub)
+        assert result == []
+
+    def test_auto_synthesize_skills_empty_candidates(self):
+        """Empty candidate list returns [] immediately without calling sub_client."""
+        from ccr.mcp_server import _auto_synthesize_skills
+        from unittest.mock import MagicMock
+
+        sub = MagicMock()
+        result = _auto_synthesize_skills([], sub)
+        assert result == []
+        sub.completion.assert_not_called()
+
+    def test_ace_evolve_from_failures_with_sub_client(self):
+        """With a mock sub-client available, synthesized skills are added to playbook."""
+        import re
+        from unittest.mock import MagicMock, patch
+
+        # Add 3 harmful bullets with similar task_contexts so grouping triggers
+        for i in range(3):
+            ace_apply_delta([{
+                "type": "ADD",
+                "section": "STRATEGIES & INSIGHTS",
+                "content": f"Fragile strategy {i}",
+            }])
+        pb_text = ace_get_playbook()
+        ids = re.findall(r"\[(str-\d+)\]", pb_text)
+        for i, bid in enumerate(ids[:3]):
+            ace_update_counters([{
+                "id": bid,
+                "tag": "harmful",
+                "failure_lesson": {
+                    "failure_point": f"Failure point {i}",
+                    "flawed_reasoning": f"Bad assumption {i}",
+                    "counterfactual": f"Should have done {i}",
+                    "prevention_principle": f"Always check condition {i} before proceeding",
+                    # All share similar task context → group of 3
+                    "task_context": "code review automated testing workflow",
+                },
+            }])
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = (
+            '[{"content": "When reviewing code, always verify test coverage before approving.", '
+            '"when_to_apply": "During code review"}]'
+        )
+
+        with patch("ccr.mcp_server._get_sub_client", return_value=mock_sub):
+            result = ace_evolve_from_failures(threshold=3)
+
+        # Mechanical path should have evolved 3 skills; sub-model adds 1 more
+        assert "Evolved 3 new skill" in result
+        assert "Synthesized 1 cross-lesson skill" in result
+        # Verify the synthesized skill appears in the playbook
+        pb = ace_get_playbook()
+        assert "When reviewing code" in pb
+
+
+class TestCERAutoPatternExtraction:
+    """Tests for _extract_patterns_from_commit and gcc_commit auto-extraction (Phase 2D)."""
+
+    def test_extract_patterns_from_commit_returns_patterns(self):
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = '["When adding auth, update tests and docs", "When fixing bugs, add regression test"]'
+
+        patterns = mod._extract_patterns_from_commit(
+            title="Add auth",
+            what="Implemented authentication module with JWT tokens",
+            why="Security requirement",
+            files_changed=["auth.py", "tests/test_auth.py"],
+            sub_client=mock_sub,
+        )
+
+        assert isinstance(patterns, list)
+        assert len(patterns) == 2
+        assert "When adding auth, update tests and docs" in patterns
+        mock_sub.completion.assert_called_once()
+
+    def test_extract_patterns_from_commit_returns_empty_on_error(self):
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.side_effect = RuntimeError("API unavailable")
+
+        patterns = mod._extract_patterns_from_commit(
+            title="Some commit", what="Did something", why="Reason",
+            files_changed=["foo.py"], sub_client=mock_sub,
+        )
+        assert patterns == []
+
+    def test_extract_patterns_from_commit_returns_empty_on_invalid_json(self):
+        from unittest.mock import MagicMock
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        mock_sub.completion.return_value = "Here are some patterns: blah blah blah"
+
+        patterns = mod._extract_patterns_from_commit(
+            title="Some commit", what="Did something", why="Reason",
+            files_changed=["foo.py"], sub_client=mock_sub,
+        )
+        assert patterns == []
+
+    def test_gcc_commit_auto_extracts_patterns_when_enabled(self):
+        from unittest.mock import MagicMock, patch
+        import ccr.mcp_server as mod
+
+        mod._memory.config.auto_extract_patterns = True
+        try:
+            mock_sub = MagicMock()
+            mock_sub.completion.return_value = '["When adding features with long descriptions, document the motivation"]'
+
+            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+                result = gcc_commit(
+                    title="Add feature",
+                    what="Implemented a comprehensive new feature with detailed logic spanning multiple modules and touching the core data pipeline",
+                    why="Required by product spec",
+                    files_changed=["feature.py"],
+                    next_step="Write tests",
+                )
+
+            assert "C0" in result
+            mock_sub.completion.assert_called_once()
+        finally:
+            mod._memory.config.auto_extract_patterns = False
+
+    def test_gcc_commit_skips_auto_extract_when_patterns_provided(self):
+        from unittest.mock import MagicMock, patch
+        import ccr.mcp_server as mod
+
+        mod._memory.config.auto_extract_patterns = True
+        try:
+            mock_sub = MagicMock()
+            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+                result = gcc_commit(
+                    title="Add feature",
+                    what="Implemented a comprehensive new feature with detailed logic spanning multiple modules and touching the core data pipeline",
+                    why="Required by product spec",
+                    files_changed=["feature.py"],
+                    next_step="Write tests",
+                    patterns_learned=["When patterns are already provided, skip extraction"],
+                )
+            assert "C0" in result
+            mock_sub.completion.assert_not_called()
+        finally:
+            mod._memory.config.auto_extract_patterns = False
+
+    def test_gcc_commit_skips_auto_extract_when_disabled(self):
+        from unittest.mock import MagicMock, patch
+        import ccr.mcp_server as mod
+
+        mock_sub = MagicMock()
+        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            result = gcc_commit(
+                title="Add feature",
+                what="Implemented a comprehensive new feature with detailed logic spanning multiple modules",
+                why="Required",
+                files_changed=["feature.py"],
+                next_step="Test",
+            )
+        assert "C0" in result
+        mock_sub.completion.assert_not_called()
+
+    def test_gcc_commit_skips_auto_extract_when_what_too_short(self):
+        from unittest.mock import MagicMock, patch
+        import ccr.mcp_server as mod
+
+        mod._memory.config.auto_extract_patterns = True
+        try:
+            mock_sub = MagicMock()
+            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+                result = gcc_commit(
+                    title="Tiny fix", what="Fixed typo", why="Quality",
+                    files_changed=["readme.md"], next_step="Done",
+                )
+            assert "C0" in result
+            mock_sub.completion.assert_not_called()
+        finally:
+            mod._memory.config.auto_extract_patterns = False

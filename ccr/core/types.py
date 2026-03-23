@@ -429,6 +429,8 @@ class CCRConfig:
     pattern_dedup_threshold: float = 0.7     # word Jaccard for dedup
     pattern_promotion_count: int = 3          # commits before suggesting ACE promotion
     pattern_max_buffer_size: int = 200        # max patterns in buffer
+    # Phase 2: Auto-extract transferable patterns via sub-model (CER §3.2, opt-in)
+    auto_extract_patterns: bool = False  # must opt in — adds latency to every commit
 
 
 @dataclass
