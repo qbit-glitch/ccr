@@ -393,6 +393,7 @@ def gcc_links(
     commit_id: str,
     link_types: str | None = None,
     max_hops: int = 1,
+    query: str | None = None,
 ) -> str:
     """Retrieve cross-links for a commit.
 
@@ -410,11 +411,14 @@ def gcc_links(
         link_types: Comma-separated link types to filter (default: all).
                     Options: entity, causal, supersession, semantic.
         max_hops: How many link hops to traverse (1 = direct, 2 = friends-of-friends).
+        query: Optional natural language search intent. When provided, BFS traversal
+               is weighted by query relevance (MAGMA intent-aware traversal, Alg. 1).
+               Example: query="why was the auth system changed"
     """
     with _state_lock:
         mem = _ensure_memory()
     types = [t.strip() for t in link_types.split(",")] if link_types else None
-    linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops)
+    linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops, query=query)
     if not linked:
         # Still show direct link summary even if BFS returned nothing
         direct = mem.get_commit_links(commit_id)
@@ -441,7 +445,9 @@ def gcc_links(
             elif lt in ("causal", "supersession") and e.get("snippet"):
                 detail = f' | "{e["snippet"]}"'
             score_tag = ""
-            if "embedding_score" in e:
+            if "query_score" in e:
+                score_tag = f" [q: {e['query_score']:.3f}]"
+            elif "embedding_score" in e:
                 score_tag = f" [emb: {e['embedding_score']:.3f}]"
             lines.append(f"- **[{e['id']}]**{hop_tag}{score_tag} {title}{detail}")
             if what:

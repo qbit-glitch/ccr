@@ -872,6 +872,7 @@ class MemoryManager:
         commit_id: str,
         link_types: list[str] | None = None,
         max_hops: int = 1,
+        query: str | None = None,
     ) -> list[dict]:
         """BFS traversal of commit links up to max_hops deep.
 
@@ -884,8 +885,11 @@ class MemoryManager:
         appear first.  An ``embedding_score`` key (float) is added to each result
         dict when ONNX is available; it is absent on graceful degradation.
 
-        Note: This is plain BFS, not MAGMA's intent-aware beam search (Alg. 1,
-        Eq. 5-6). No query-dependent edge weighting or transition scoring.
+        query: Optional natural language query for intent-aware traversal.
+               When provided and ONNX available, edges are weighted by cosine(query, commit)
+               so the BFS explores the most query-relevant commits first.
+               Approximates MAGMA Alg. 1 Eq. 5-6 intent-aware beam search.
+               Results include "query_score" field when query is used.
         """
         data = self._load_links()
         branch = self.get_active_branch()
@@ -897,11 +901,30 @@ class MemoryManager:
         # candidates to surface the best results after truncation.
         bfs_limit = self.config.link_max_results * 2
 
+        # --- ONNX embeddings: load cached vectors for all known commits ---
+        # We load these before BFS so edge-weighting can use them immediately.
+        all_ids_in_graph = list(data.get("links", {}).keys())
+        all_cached = self._load_commit_embeddings(all_ids_in_graph) if all_ids_in_graph else {}
+
+        # MAGMA Alg. 1: intent-aware traversal — embed user query for edge weighting
+        query_vec = None
+        if query:
+            try:
+                _qemb = get_embedding_model()
+                if _qemb is not None:
+                    query_vec = _qemb.embed_query(query)
+            except Exception:
+                pass  # Graceful fallback to plain BFS
+
         _bfs_full = False
         for hop in range(1, max_hops + 1):
             if _bfs_full:
                 break
             next_frontier: list[str] = []
+
+            # Collect all candidates for this hop, then sort by edge score
+            # (MAGMA Alg. 1: intent-aware traversal order)
+            hop_candidates: list[tuple[float, str, str, dict]] = []
             for src in frontier:
                 node = data.get("links", {}).get(src, {})
                 for lt in types:
@@ -909,34 +932,53 @@ class MemoryManager:
                         tgt = link_entry.get("target", "")
                         if tgt in visited:
                             continue
-                        visited.add(tgt)
-                        # Fetch commit data for context
-                        commit_text = self._find_commit_by_id(branch, tgt)
-                        parsed = self._parse_commit_block(commit_text) if commit_text else {}
-                        results.append({
-                            "id": tgt,
-                            "link_type": lt,
-                            "score": link_entry.get("score", 0.0),
-                            "hop": hop,
-                            "title": parsed.get("title", ""),
-                            "what": parsed.get("what", ""),
-                            **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
-                        })
-                        next_frontier.append(tgt)
-                        if len(results) >= bfs_limit:
-                            _bfs_full = True
-                            break
-                    if _bfs_full:
-                        break
-                if _bfs_full:
+                        # Compute query-weighted edge score (MAGMA Eq. 5-6)
+                        tgt_vec = all_cached.get(tgt)
+                        if query_vec is not None and tgt_vec is not None:
+                            try:
+                                import numpy as np
+                                edge_score = float(np.dot(query_vec, tgt_vec))
+                            except Exception:
+                                edge_score = link_entry.get("score", 0.0)
+                        else:
+                            edge_score = link_entry.get("score", 0.0)
+                        hop_candidates.append((edge_score, tgt, lt, link_entry))
+
+            # Sort by edge_score descending (intent-aware traversal order)
+            hop_candidates.sort(key=lambda x: x[0], reverse=True)
+
+            # Process in priority order, respecting bfs_limit
+            for edge_score, tgt, lt, link_entry in hop_candidates:
+                if len(results) >= bfs_limit:
+                    _bfs_full = True
                     break
+                if tgt in visited:
+                    continue
+                visited.add(tgt)
+                # Fetch commit data for context
+                commit_text = self._find_commit_by_id(branch, tgt)
+                parsed = self._parse_commit_block(commit_text) if commit_text else {}
+                result: dict = {
+                    "id": tgt,
+                    "link_type": lt,
+                    "score": link_entry.get("score", 0.0),
+                    "hop": hop,
+                    "title": parsed.get("title", ""),
+                    "what": parsed.get("what", ""),
+                    **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
+                }
+                if query_vec is not None:
+                    result["query_score"] = edge_score
+                results.append(result)
+                next_frontier.append(tgt)
+
             frontier = next_frontier
             if not frontier:
                 break
 
         # --- ONNX re-ranking (graceful degradation when unavailable) ---
-        all_ids = [commit_id] + [r["id"] for r in results]
-        cached = self._load_commit_embeddings(all_ids)
+        all_result_ids = [commit_id] + [r["id"] for r in results]
+        cached = self._load_commit_embeddings(all_result_ids)
         src_vec = cached.get(commit_id)
 
         if src_vec is not None:
@@ -948,9 +990,15 @@ class MemoryManager:
                         r["embedding_score"] = float(np.dot(src_vec, tgt_vec))
                     else:
                         r["embedding_score"] = r.get("score", 0.0)
-                results.sort(key=lambda r: r.get("embedding_score", 0.0), reverse=True)
             except ImportError:
                 pass
+
+        # Post-BFS sort: prefer query_score when available, else embedding_score
+        if query_vec is not None and any("query_score" in r for r in results):
+            results.sort(key=lambda r: r.get("query_score", 0.0), reverse=True)
+        elif src_vec is not None:
+            # Existing embedding_score sort (no query provided)
+            results.sort(key=lambda r: r.get("embedding_score", 0.0), reverse=True)
 
         # Truncate to the configured limit AFTER re-ranking
         return results[: self.config.link_max_results]
