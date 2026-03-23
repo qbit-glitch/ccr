@@ -188,24 +188,27 @@ ccr status                                   # Show memory state
    - Three search modes: keyword (§3.2 Eq 1), semantic (§3.2 Eq 3), hybrid
    - Dense embeddings via all-MiniLM-L6-v2 ONNX (384-dim, optional deps)
    - BM25 fallback (Okapi BM25, k1=1.5, b=0.75) when ONNX unavailable — CCR's own zero-dep fallback, not from A-RAG paper
-   - File-level summaries (path + symbols + first 10 lines) instead of sentence-level chunks
+   - Paragraph/function-level chunk embeddings (§3.1): `_split_into_chunks()` + `build_chunk_embeddings()` + `chunk_semantic_search()` (800-token max, Python def/class boundaries, paragraph breaks for other files)
+   - Snippet extraction (§3.2 Eq 2): `extract_snippet()` — sentences containing query keywords, up to 3 matches
+   - `hybrid_search(return_snippets=True)` delegates semantic component to chunk-level search
+   - File-level summaries still used for file-level fallback and keyword mode
    - Claude Code IS the agent — no ReAct loop implementation needed
    - See "Limitations vs. Paper (A-RAG Semantic Search)" below for gaps
 
 ## Limitations vs. Paper (A-RAG Semantic Search)
 
-Semantic search uses **file-level BM25/ONNX** (zero LLM calls). Key gaps vs. paper:
+Semantic search uses **chunk-level BM25/ONNX** (zero LLM calls). Key gaps vs. paper:
 
 | A-RAG Feature | Paper Mechanism | CCR Implementation |
 |---|---|---|
-| Hierarchical Index (§3.1) | Corpus → 1000-token chunks → sentence embeddings | Files → file-summary embeddings (path+symbols+first lines) |
+| Hierarchical Index (§3.1) | Corpus → 1000-token chunks → sentence embeddings | Files → paragraph/function-level chunks (800-token max) + chunk embeddings; file-level summaries for keyword mode |
 | keyword_search (§3.2, Eq 1) | Keyword frequency × length scoring | Substring matching (path=3, symbol=5, content=1) |
-| semantic_search (§3.2, Eq 3) | Sentence-level dense cosine (Qwen3-Embedding-0.6B) | File-level dense cosine (all-MiniLM-L6-v2 ONNX) / BM25 fallback |
+| semantic_search (§3.2, Eq 3) | Sentence-level dense cosine (Qwen3-Embedding-0.6B) | Chunk-level dense cosine (all-MiniLM-L6-v2 ONNX) / BM25 fallback |
 | chunk_read (§3.2) | Full content + context tracker C^read | get_file() in REPL / Read tool (no tracker) |
 | Agent Loop (§3.3, Alg 1) | ReAct with interleaved tool use | Claude Code IS the agent (no implementation needed) |
 | Context Tracker (§3.3) | C^read prevents re-reading same chunks | Not implemented (Claude Code tracks its own context) |
 | Dynamic strategy selection | Agent chooses keyword vs semantic per step | `mode` parameter — user/agent chooses at call time |
-| Snippet extraction (Eq 2) | Sentences containing keywords | Not implemented (full file paths returned) |
+| Snippet extraction (Eq 2) | Sentences containing keywords | `extract_snippet()` — keyword-matching sentences, up to 3, with " ... " separator |
 | BM25 fallback | Not in paper | CCR's own zero-dep fallback (not from A-RAG) |
 
 ## Limitations vs. Paper (A-MAC Admission Control)
@@ -216,7 +219,7 @@ Admission control uses **3 of 5 factors with hand-tuned weights** (zero LLM call
 |---|---|---|
 | Utility U(m) (§3.2 Factor 3) | LLM rates future usefulness on 1-5 scale | Not implemented (requires LLM) |
 | Confidence C(m) (§3.2 Factor 4) | ROUGE-L overlap against source turns | Not implemented (requires reference corpus) |
-| Similarity φ(m) (Eq. 3) | Sentence-BERT cosine similarity | Word Jaccard (0.50·file + 0.50·keyword). Lower discriminative power but zero cost |
+| Similarity φ(m) (Eq. 3) | Sentence-BERT cosine similarity | ONNX cosine (all-MiniLM-L6-v2 dot product on L2-normalized vectors) when available; Word Jaccard (0.50·file + 0.50·keyword) fallback |
 | Weight learning (Table 2) | 5-fold cross-validation on dialogue corpora | Hand-tuned: w_T=0.50, w_N=0.35, w_R=0.15 (informed by Table 2 ablation ranking) |
 | Rejection threshold (Alg. 1 line 11) | Score-based threshold learned from data | Configurable parameter, default 0.0 (disabled) |
 | Type Prior taxonomy (§3.2 Factor 5) | Classifies dialogue acts (question, instruction, etc.) | Classifies developer actions (progress, refactor, fix, etc.) — different domain |
@@ -286,7 +289,7 @@ All commit linking is **mechanical heuristics** (zero LLM calls). Key gaps vs. p
 | MAGMA causal graph (§3.2, Eq. 8) | LLM-inferred logical entailment | Regex detection of explicit C### references only |
 | MAGMA semantic graph (§3.2) | Dense vector cosine (all-MiniLM-L6-v2) | Word Jaccard with ~100-word stop list |
 | MAGMA entity graph (§3.2) | Abstract entity nodes (people, orgs) via LLM | File-path overlap (Jaccard) |
-| MAGMA adaptive traversal (§3.3, Alg. 1) | Intent-aware beam search with Eq. 5-6 | Plain BFS with configurable result cap. **Largest ablation impact in MAGMA (Table 3)** — removing adaptive traversal caused the biggest performance drop |
+| MAGMA adaptive traversal (§3.3, Alg. 1) | Intent-aware beam search with Eq. 5-6 | Query-weighted BFS: when `query` provided, edge scores = cosine(query_vec, target_vec); candidates sorted by edge_score per hop. Not true beam search (no adaptive cutoff). **Largest ablation impact in MAGMA (Table 3)** |
 | MAGMA fast/slow paths (§3.4) | Sync ingestion + async LLM consolidation | Sync only (all in commit path) |
 | Link scan scope | Global retrieval across all memories | Fixed sliding window (`link_scan_window`, default 20 most recent commits). Older commits are never scanned for links at commit time |
 
