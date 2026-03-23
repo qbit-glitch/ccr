@@ -553,6 +553,14 @@ class MemoryManager:
         union = a | b
         return len(a & b) / len(union) if union else 0.0
 
+    @staticmethod
+    def _commit_text(title: str, what: str, why: str) -> str:
+        """Canonical text representation of a commit for ONNX embedding.
+
+        A-MAC §3.2 Eq. 3: φ(m) computed on commit content.
+        """
+        return f"{title} {what} {why}".strip()
+
     # --- Heuristic Commit Cross-Linking (A-MEM/MAGMA inspired taxonomy) ---
     # Uses mechanical heuristics (file overlap, regex, word Jaccard) instead of
     # the papers' LLM inference (A-MEM Eq. 6, MAGMA Eq. 8) and dense vector
@@ -1337,10 +1345,16 @@ class MemoryManager:
             U(m) — Utility: requires LLM to rate future usefulness
             C(m) — Confidence: requires ROUGE-L against source turns
 
-        Similarity computation (proxy for Eq. 3):
+        Similarity φ(m): ONNX cosine (preferred, A-MAC Eq. 3) or word Jaccard
+        (fallback when ONNX unavailable).
+
+        When the ONNX embedding model is available (ccr[semantic] extras),
+        raw_sim uses cosine similarity on all-MiniLM-L6-v2 vectors — matching
+        the Sentence-BERT spirit of A-MAC Eq. 3. When ONNX is unavailable,
+        falls back to:
             sim(m, m') = 0.50 · Jaccard(files) + 0.50 · Jaccard(keywords)
-            Word Jaccard substitutes for Sentence-BERT cosine since CCR
-            has no embedding model. Lower discriminative power but zero cost.
+            Word Jaccard substitutes for Sentence-BERT cosine.
+            Lower discriminative power but zero cost.
 
             Two similarity signals (separated per paper):
             - Raw sim: pure content similarity, used for Novelty N(m) = 1 - max_sim
@@ -1396,6 +1410,27 @@ class MemoryManager:
         new_files = {f.strip().lower() for f in files_changed if f.strip()}
         new_words = self._extract_keywords(f"{title} {what} {why}")
 
+        # A-MAC §3.2 Eq. 3: ONNX cosine similarity φ(m) when available.
+        # Compute the new commit's embedding once, outside the per-commit loop.
+        new_vec_for_admission = None
+        try:
+            from ccr.context.embeddings import get_embedding_model
+            _emb_model = get_embedding_model()
+            if _emb_model is not None:
+                new_vec_for_admission = _emb_model.embed_query(
+                    self._commit_text(title, what, why)
+                )
+        except Exception:
+            pass  # Fall back to Jaccard on any error
+
+        # Pre-load all recent commit embeddings once (not per-commit) — avoids
+        # repeated file I/O inside the loop.
+        if new_vec_for_admission is not None and recent:
+            recent_ids = [c.get("id", "") for c in recent if c.get("id")]
+            all_cached_vecs = self._load_commit_embeddings(recent_ids)
+        else:
+            all_cached_vecs = {}
+
         best_similarity = 0.0       # Recency-modulated sim (for FindConflict threshold)
         best_raw_similarity = 0.0   # Pure content sim (for Novelty N(m) per Eq. 3)
         best_file_sim = 0.0
@@ -1413,8 +1448,19 @@ class MemoryManager:
             )
             keyword_sim = self._jaccard(new_words, old_words)
 
-            # Raw content similarity (pure, no recency — used for Novelty per Eq. 3)
-            raw_sim = 0.50 * file_sim + 0.50 * keyword_sim
+            # Raw content similarity (pure, no recency — used for Novelty per Eq. 3).
+            # Try ONNX cosine similarity first (A-MAC Eq. 3); fall back to Jaccard.
+            commit_id = commit.get("id", "")
+            old_vec = all_cached_vecs.get(commit_id) if all_cached_vecs else None
+            if new_vec_for_admission is not None and old_vec is not None:
+                try:
+                    import numpy as np
+                    raw_sim = float(np.dot(new_vec_for_admission, old_vec))
+                    # Note: both vectors are L2-normalized, so dot product = cosine similarity
+                except Exception:
+                    raw_sim = 0.50 * file_sim + 0.50 * keyword_sim  # Jaccard fallback
+            else:
+                raw_sim = 0.50 * file_sim + 0.50 * keyword_sim  # Jaccard fallback
 
             # Track best raw similarity across all commits for Novelty computation
             if raw_sim > best_raw_similarity:

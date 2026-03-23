@@ -403,3 +403,119 @@ class TestGetOTASliceSinceLastCommit:
         result = mem._get_ota_slice_since_last_commit("main")
         # Observation should be truncated to 80 chars
         assert len(result.split(": ", 1)[1]) <= 80
+
+
+class TestONNXAdmissionSimilarity:
+    """Tests for ONNX cosine similarity in A-MAC admission control."""
+
+    def test_onnx_path_uses_dot_product_not_jaccard(self, mem):
+        """When ONNX available, raw_sim uses cosine not Jaccard."""
+        import numpy as np
+
+        # Pre-create a commit so there is a recent commit to compare against
+        mem.commit("First commit", "Did initial work", "bootstrap", ["a.py"], "next")
+        commits = mem._parse_recent_commit_data("main", k=5)
+        assert len(commits) >= 1
+        first_id = commits[0].get("id")
+
+        # Two orthogonal unit vectors — cosine = 0.0
+        vec_new = np.zeros(384, dtype=np.float32)
+        vec_new[0] = 1.0
+        vec_old = np.zeros(384, dtype=np.float32)
+        vec_old[1] = 1.0
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = vec_new
+
+        with patch("ccr.core.memory.MemoryManager._load_commit_embeddings") as mock_load, \
+             patch("ccr.context.embeddings.get_embedding_model", return_value=mock_model):
+            mock_load.return_value = {first_id: vec_old} if first_id else {}
+            result = mem.compute_admission_score(
+                "main", "Second commit", "More work", "same reason",
+                ["a.py"], "continue"
+            )
+
+        # With orthogonal vectors cosine=0 → high novelty; Jaccard with shared
+        # file "a.py" would give file_sim=1.0 → raw_sim≥0.5 → novelty≤0.5.
+        # ONNX path should yield novelty close to 1.0.
+        assert result["novelty"] > 0.9
+
+    def test_jaccard_fallback_when_onnx_unavailable(self, mem):
+        """When get_embedding_model() returns None, Jaccard fallback runs without crash."""
+        mem.commit("First", "Did A", "reason A", ["x.py"], "next")
+
+        with patch("ccr.context.embeddings.get_embedding_model", return_value=None):
+            result = mem.compute_admission_score(
+                "main", "Second", "Did B", "reason B", ["y.py"], "continue"
+            )
+
+        # Must not crash and must return a valid score
+        assert "score" in result
+        assert 0.0 <= result["score"] <= 1.0
+
+    def test_onnx_fallback_on_exception(self, mem):
+        """When embed_query() raises, Jaccard fallback runs silently."""
+        mem.commit("First", "Did A", "reason A", ["x.py"], "next")
+
+        mock_model = MagicMock()
+        mock_model.embed_query.side_effect = RuntimeError("ONNX inference error")
+
+        with patch("ccr.context.embeddings.get_embedding_model", return_value=mock_model):
+            result = mem.compute_admission_score(
+                "main", "Second", "Did B", "reason B", ["y.py"], "continue"
+            )
+
+        # Exception must be swallowed — score returned normally
+        assert "score" in result
+        assert 0.0 <= result["score"] <= 1.0
+
+    def test_commit_embeddings_preloaded_once(self, mem):
+        """_load_commit_embeddings called at most once per admission check, not per commit."""
+        import numpy as np
+
+        # Create two prior commits so the loop iterates more than once
+        mem.commit("C1", "Work A", "reason", ["a.py"], "next")
+        mem.commit("C2", "Work B", "reason", ["b.py"], "next")
+
+        vec_new = np.zeros(384, dtype=np.float32)
+        vec_new[0] = 1.0
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = vec_new
+
+        with patch("ccr.context.embeddings.get_embedding_model", return_value=mock_model), \
+             patch.object(mem, "_load_commit_embeddings", wraps=mem._load_commit_embeddings) as mock_load:
+            mem.compute_admission_score(
+                "main", "C3", "Work C", "reason", ["c.py"], "next"
+            )
+
+        # Must be called at most once regardless of how many recent commits exist
+        assert mock_load.call_count <= 1
+
+    def test_cosine_sim_reduces_false_positives(self, mem):
+        """ONNX path can detect commits as different even when they share filenames."""
+        import numpy as np
+
+        mem.commit("First", "Add feature", "need it", ["shared.py"], "next")
+        commits = mem._parse_recent_commit_data("main", k=5)
+        first_id = commits[0].get("id")
+
+        # Orthogonal vectors → cosine = 0.0 even though both commits touch shared.py
+        vec_new = np.zeros(384, dtype=np.float32)
+        vec_new[0] = 1.0
+        vec_old = np.zeros(384, dtype=np.float32)
+        vec_old[1] = 1.0
+
+        mock_model = MagicMock()
+        mock_model.embed_query.return_value = vec_new
+
+        with patch("ccr.core.memory.MemoryManager._load_commit_embeddings") as mock_load, \
+             patch("ccr.context.embeddings.get_embedding_model", return_value=mock_model):
+            mock_load.return_value = {first_id: vec_old} if first_id else {}
+            result = mem.compute_admission_score(
+                "main", "Second", "Refactor feature", "clean up", ["shared.py"], "done"
+            )
+
+        # Pure Jaccard on the shared file would give file_sim=1.0 → raw_sim=0.5+
+        # ONNX cosine of orthogonal vectors = 0.0 → novelty near 1.0
+        assert result["novelty"] > 0.9
