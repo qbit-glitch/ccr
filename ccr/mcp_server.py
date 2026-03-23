@@ -62,19 +62,36 @@ mcp = FastMCP(
 
 
 def _get_sub_client() -> object | None:
-    """Return a ClaudeClient using ANTHROPIC_API_KEY_SUB or ANTHROPIC_API_KEY, or None.
+    """Return a sub-model client, or None when no backend is configured.
 
-    Graceful no-op: when no key is set, all Phase 2 features are silently skipped.
-    Uses claude-haiku-4-5-20251001 (fast + cheap) for synthesis tasks.
+    Priority order (first available wins):
+      1. Ollama (CCR_OLLAMA_MODEL env var, e.g. "qwen2.5:7b") — free, local
+      2. Anthropic Haiku (ANTHROPIC_API_KEY_SUB or ANTHROPIC_API_KEY)
+
+    Graceful no-op: when nothing is configured, all Phase 2 features are silently skipped.
     """
+    ollama_model = os.environ.get("CCR_OLLAMA_MODEL")
+    if ollama_model:
+        try:
+            from ccr.models.openai_compat import OpenAICompatClient  # noqa: PLC0415
+            return OpenAICompatClient(
+                model_name=ollama_model,
+                base_url=os.environ.get("CCR_OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+                api_key="ollama",
+                max_tokens=1024,
+            )
+        except Exception:
+            pass
+
     api_key = os.environ.get("ANTHROPIC_API_KEY_SUB") or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from ccr.models.anthropic_client import ClaudeClient  # noqa: PLC0415
-        return ClaudeClient(api_key=api_key, model_name="claude-haiku-4-5-20251001", max_tokens=1024)
-    except Exception:
-        return None
+    if api_key:
+        try:
+            from ccr.models.anthropic_client import ClaudeClient  # noqa: PLC0415
+            return ClaudeClient(api_key=api_key, model_name="claude-haiku-4-5-20251001", max_tokens=1024)
+        except Exception:
+            pass
+
+    return None
 
 
 def _init(project_root: str | None = None) -> None:
@@ -361,10 +378,17 @@ def gcc_commit(
                     patterns_learned = _extract_patterns_from_commit(
                         title, what, why, files_changed or [], sub
                     ) or None
-            return mem.commit(title, what, why, files_changed, next_step,
-                              patterns_learned,
-                              admission_threshold, rejection_threshold,
-                              compressed_summary)
+            result = mem.commit(title, what, why, files_changed, next_step,
+                                patterns_learned,
+                                admission_threshold, rejection_threshold,
+                                compressed_summary)
+
+        # ACE §3.1-3.3: Generator → Reflector → Curator pipeline (fire-and-forget)
+        sub = _get_sub_client()
+        if sub is not None and result and not result.startswith("Error"):
+            _run_ace_pipeline(title, what, why, sub)
+
+        return result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -518,6 +542,83 @@ def gcc_links(
             if what:
                 lines.append(f"  {what}")
     return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def gcc_evolve_memory(commit_id: str | None = None) -> str:
+    """Manually trigger A-MEM evolution for a commit or all recent commits.
+
+    When a sub-model is available, rewrites commit summaries to incorporate
+    context from related commits (A-MEM §3.3 Eq.7 memory evolution).
+
+    Args:
+        commit_id: Specific commit to evolve (e.g. "C001"). If None, evolves
+                   all recent commits that have semantic/supersession links.
+    """
+    sub = _get_sub_client()
+    if sub is None:
+        return (
+            "Sub-model not available. Set CCR_OLLAMA_MODEL or ANTHROPIC_API_KEY "
+            "to enable A-MEM memory evolution."
+        )
+
+    with _state_lock:
+        mem = _ensure_memory()
+    mem.sub_client = sub
+
+    branch = mem.get_active_branch()
+    evolutions_performed: list[str] = []
+
+    try:
+        from ccr.core.types import CommitLink  # noqa: PLC0415
+        links_data = mem._load_links()
+
+        def _evolve_commit_with_links(cid: str) -> int:
+            """Evolve one commit's linked peers. Returns count of newly evolved entries."""
+            node = links_data.get("links", {}).get(cid, {})
+            candidate_links: list[CommitLink] = []
+            for lt in ("semantic", "supersession"):
+                for entry in node.get(lt, []):
+                    score = entry.get("score", 0.0)
+                    if score > 0.5:
+                        candidate_links.append(CommitLink(
+                            target=entry["target"],
+                            link_type=lt,
+                            score=score,
+                        ))
+            if not candidate_links:
+                return 0
+            before = set(mem._evolved_summaries.keys())
+            mem._trigger_memory_evolution(cid, candidate_links)
+            after = set(mem._evolved_summaries.keys())
+            return len(after - before)
+
+        if commit_id:
+            n = _evolve_commit_with_links(commit_id)
+            if n > 0:
+                evolutions_performed.append(f"{commit_id}: {n} new evolution(s)")
+            else:
+                evolutions_performed.append(
+                    f"{commit_id}: no new evolutions "
+                    "(no eligible links or sub-model produced no changes)"
+                )
+        else:
+            # Scan last 10 commits
+            recent = mem._parse_recent_commit_data(branch, k=10)
+            for commit in recent:
+                cid = commit.get("id", "")
+                if not cid:
+                    continue
+                n = _evolve_commit_with_links(cid)
+                if n > 0:
+                    evolutions_performed.append(f"{cid}: {n} new evolution(s)")
+
+    except Exception as e:
+        return f"Error during memory evolution: {type(e).__name__}: {e}"
+
+    if not evolutions_performed or all("no new evolutions" in e for e in evolutions_performed):
+        return "No evolutions performed. Ensure commits have semantic/supersession links with score > 0.5."
+    return "A-MEM memory evolution complete:\n" + "\n".join(f"  - {e}" for e in evolutions_performed)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -699,7 +800,7 @@ def _serialize_playbook(pb: Playbook) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def ace_get_playbook() -> str:
+def ace_get_playbook(task_context: str = "") -> str:
     """Get the current ACE playbook — both global and project-specific strategies.
 
     Returns two tiers:
@@ -707,11 +808,27 @@ def ace_get_playbook() -> str:
     - PROJECT: Project-specific strategies (.ccr/)
 
     Review this after loading context to learn from past successes and failures.
+
+    Args:
+        task_context: Optional task description. When provided, prepends a
+            policy-ranked section showing the top 5 most relevant bullets
+            weighted by GRPO group-relative advantage (SkillRL Eq.3).
     """
     gpb = _ensure_global_playbook()
     ppb = _ensure_playbook()
 
     parts = []
+
+    # Policy-ranked section when task_context is provided
+    if task_context.strip():
+        ranked = ppb.get_policy_ranked(task_context, top_k=5)
+        if ranked:
+            ranked_lines = ["# Policy-ranked skills for this task:"]
+            for b in ranked:
+                adv = f"{b.grpo_advantage:+.3f}"
+                ranked_lines.append(f"[{b.id}] (advantage={adv}) :: {b.content}")
+            parts.append("\n".join(ranked_lines))
+
     g_text = _serialize_playbook(gpb)
     if g_text.strip():
         parts.append(f"# GLOBAL PLAYBOOK (applies to all projects)\n{g_text}")
@@ -801,6 +918,8 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> str:
         with _state_lock:
             pb, save_fn = _resolve_playbook(scope)
             updated = pb.update_bullet_counts(bullet_tags)
+            # Recompute GRPO advantages after counter update (SkillRL Eq.3)
+            pb.recompute_grpo_advantages()
             save_fn()
 
         # Count how many had structured lessons
@@ -1019,6 +1138,244 @@ def _auto_synthesize_skills(candidates: list[dict], sub_client) -> list[dict]:
         return synthesized
     except Exception:
         return []
+
+
+# ===========================================================================
+# ACE 3-Agent Pipeline (Generator → Reflector → Curator) — ACE §3.1-3.3
+# ===========================================================================
+
+
+def _ace_generator(trajectory: str, sub_client) -> list[str]:
+    """Generate candidate strategy bullets from task trajectory (ACE §3.1)."""
+    try:
+        prompt = (
+            "You are an AI strategy generator. Given this task trajectory:\n"
+            f"{trajectory}\n\n"
+            "Generate 2-3 actionable strategy bullets for a coding assistant playbook.\n"
+            'Each bullet should be: specific, actionable, abstract (not tied to this exact task).\n'
+            'Format as "When X, do Y" or "Always Y when Z".\n'
+            'Respond with a JSON array: ["bullet 1", "bullet 2"]'
+        )
+        response = sub_client.completion([{"role": "user", "content": prompt}])
+        raw = extract_json_string(response)
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(p) for p in parsed if p]
+        return []
+    except Exception:
+        return []
+
+
+def _ace_reflector(candidates: list[str], trajectory: str, sub_client) -> list[str]:
+    """Filter/score candidates by quality and relevance (ACE §3.2)."""
+    try:
+        if not candidates:
+            return []
+        numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
+        prompt = (
+            "Rate each strategy bullet for quality (1-5):\n"
+            "- 5: Highly actionable, specific, generalizable\n"
+            "- 3: Decent but could be improved\n"
+            "- 1: Too vague or too specific\n\n"
+            f"Task context: {trajectory}\n"
+            f"Candidates:\n{numbered}\n\n"
+            'Respond with JSON: [{"bullet": "...", "score": N}, ...]\n'
+            "Only include bullets with score >= 3."
+        )
+        response = sub_client.completion([{"role": "user", "content": prompt}])
+        raw = extract_json_string(response)
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [
+                item["bullet"]
+                for item in parsed
+                if isinstance(item, dict) and item.get("score", 0) >= 3 and item.get("bullet", "").strip()
+            ]
+        return candidates  # fallback: return original unfiltered
+    except Exception:
+        return candidates  # fallback: return original unfiltered on error
+
+
+def _ace_curator(existing_bullets: list[str], candidates: list[str], sub_client) -> list[dict]:
+    """Decide ADD/MERGE/SKIP for each candidate vs existing playbook (ACE §3.3)."""
+    try:
+        if not candidates:
+            return []
+        existing_sample = "\n".join(f"- {b}" for b in existing_bullets[:10])
+        numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
+        prompt = (
+            "For each candidate strategy bullet, decide: ADD (novel), MERGE (similar to existing), SKIP (duplicate).\n\n"
+            f"Existing bullets (first 10):\n{existing_sample}\n\n"
+            f"Candidates:\n{numbered}\n\n"
+            'Respond with JSON: [{"bullet": "...", "action": "ADD"|"MERGE"|"SKIP", "merge_with": "existing bullet text if MERGE else null"}]'
+        )
+        response = sub_client.completion([{"role": "user", "content": prompt}])
+        raw = extract_json_string(response)
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            result = []
+            for item in parsed:
+                if isinstance(item, dict) and item.get("bullet", "").strip():
+                    result.append({
+                        "bullet": item["bullet"],
+                        "action": item.get("action", "ADD"),
+                        "merge_with": item.get("merge_with"),
+                    })
+            return result
+        return [{"bullet": c, "action": "ADD", "merge_with": None} for c in candidates]
+    except Exception:
+        return [{"bullet": c, "action": "ADD", "merge_with": None} for c in candidates]
+
+
+def _run_ace_pipeline(title: str, what: str, why: str, sub_client) -> None:
+    """Run the ACE 3-agent Generator → Reflector → Curator pipeline after a commit.
+
+    Failures are silently swallowed — this must never affect the commit result.
+    """
+    try:
+        trajectory = f"Title: {title}\nWhat: {what}\nWhy: {why}"
+
+        # Step 1: Generator
+        candidates = _ace_generator(trajectory, sub_client)
+        if not candidates:
+            return
+
+        # Step 2: Reflector
+        filtered = _ace_reflector(candidates, trajectory, sub_client)
+        if not filtered:
+            return
+
+        # Step 3: Curator
+        with _state_lock:
+            pb = _ensure_playbook()
+        existing_sample = [b.content for b in pb.bullets[:10]]
+        decisions = _ace_curator(existing_sample, filtered, sub_client)
+
+        # Step 4: Apply decisions
+        with _state_lock:
+            pb = _ensure_playbook()
+            for decision in decisions:
+                action = decision.get("action", "ADD")
+                bullet_text = decision.get("bullet", "").strip()
+                if not bullet_text:
+                    continue
+                if action == "ADD":
+                    op = DeltaOperation(
+                        op_type="ADD",
+                        section="STRATEGIES & INSIGHTS",
+                        content=bullet_text,
+                    )
+                    pb.apply_delta([op])
+                elif action == "MERGE":
+                    merge_with = decision.get("merge_with", "")
+                    if merge_with:
+                        # Find closest existing bullet by word Jaccard
+                        best_id = None
+                        best_sim = 0.0
+                        for b in pb.bullets:
+                            sim = _word_jaccard(b.content, merge_with)
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_id = b.id
+                        if best_id and best_sim > 0.0:
+                            op = DeltaOperation(
+                                op_type="UPDATE",
+                                section="",
+                                content=bullet_text,
+                                bullet_id=best_id,
+                            )
+                            pb.apply_delta([op])
+                # SKIP: do nothing
+            _save_playbook()
+    except Exception:
+        pass  # Never raise — commit result must not be affected
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def ace_generate_bullets(context: str, auto_apply: bool = False) -> str:
+    """Generate and optionally apply strategy bullets via the ACE 3-agent pipeline.
+
+    Runs Generator → Reflector → Curator to produce candidate playbook bullets
+    from a task context or trajectory. Returns a preview of all decisions.
+
+    Args:
+        context: Task context or trajectory to generate bullets from.
+        auto_apply: If True, automatically apply ADD decisions. Default False (preview only).
+    """
+    try:
+        sub = _get_sub_client()
+        if sub is None:
+            return "No sub-model configured. Set CCR_OLLAMA_MODEL or ANTHROPIC_API_KEY to enable ACE pipeline."
+
+        candidates = _ace_generator(context, sub)
+        if not candidates:
+            return "Generator produced no candidates."
+
+        filtered = _ace_reflector(candidates, context, sub)
+        if not filtered:
+            return f"Reflector filtered all {len(candidates)} candidate(s). None passed quality threshold."
+
+        with _state_lock:
+            pb = _ensure_playbook()
+        existing_sample = [b.content for b in pb.bullets[:10]]
+        decisions = _ace_curator(existing_sample, filtered, sub)
+
+        if not decisions:
+            return "Curator produced no decisions."
+
+        lines = ["# ACE Pipeline Results"]
+        applied_count = 0
+        if auto_apply:
+            with _state_lock:
+                pb = _ensure_playbook()
+                for decision in decisions:
+                    action = decision.get("action", "ADD")
+                    bullet_text = decision.get("bullet", "").strip()
+                    if not bullet_text:
+                        continue
+                    if action == "ADD":
+                        op = DeltaOperation(
+                            op_type="ADD",
+                            section="STRATEGIES & INSIGHTS",
+                            content=bullet_text,
+                        )
+                        pb.apply_delta([op])
+                        applied_count += 1
+                    elif action == "MERGE":
+                        merge_with = decision.get("merge_with", "")
+                        if merge_with:
+                            best_id = None
+                            best_sim = 0.0
+                            for b in pb.bullets:
+                                sim = _word_jaccard(b.content, merge_with)
+                                if sim > best_sim:
+                                    best_sim = sim
+                                    best_id = b.id
+                            if best_id and best_sim > 0.0:
+                                op = DeltaOperation(
+                                    op_type="UPDATE",
+                                    section="",
+                                    content=bullet_text,
+                                    bullet_id=best_id,
+                                )
+                                pb.apply_delta([op])
+                                applied_count += 1
+                _save_playbook()
+            lines.append(f"Applied {applied_count} decision(s) to project playbook.")
+
+        lines.append(f"\n## Decisions ({len(decisions)} total):")
+        for d in decisions:
+            action = d.get("action", "?")
+            bullet = d.get("bullet", "")[:120]
+            merge_with = d.get("merge_with", "")
+            if merge_with:
+                lines.append(f"- [{action}] {bullet}\n  (merge with: {str(merge_with)[:80]})")
+            else:
+                lines.append(f"- [{action}] {bullet}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
