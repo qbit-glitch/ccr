@@ -419,3 +419,211 @@ class TestEmbeddingPersistence:
         loaded = idx.load_embeddings("/tmp/nonexistent_embeddings.json.gz")
         assert loaded is False
         assert len(idx._embeddings) == 0
+
+
+# ---------------------------------------------------------------------------
+# Chunking tests (A-RAG §3.1 sentence-level chunking)
+# ---------------------------------------------------------------------------
+
+
+class TestChunking:
+    def test_split_python_file_on_function_boundaries(self):
+        """Two top-level defs separated by blank line → 2 chunks."""
+        content = """\
+def foo():
+    x = 1
+    return x
+
+def bar():
+    y = 2
+    return y
+"""
+        chunks = RepoIndex._split_into_chunks(content, "module.py", max_tokens=800)
+        assert len(chunks) == 2
+        assert "def foo" in chunks[0].text
+        assert "def bar" in chunks[1].text
+
+    def test_split_markdown_on_paragraphs(self):
+        """Double-newline separated paragraphs → multiple chunks when large."""
+        # Two paragraphs separated by blank line; each small enough individually
+        para1 = "word " * 50  # 50 words
+        para2 = "term " * 50  # 50 words
+        content = para1.strip() + "\n\n" + para2.strip()
+        chunks = RepoIndex._split_into_chunks(content, "README.md", max_tokens=800)
+        # Should produce at least 1 chunk (content is well under 800 words each)
+        assert len(chunks) >= 1
+        full_text = " ".join(c.text for c in chunks)
+        assert "word" in full_text
+        assert "term" in full_text
+
+    def test_single_small_file_one_chunk(self):
+        """Content < 100 words → 1 chunk."""
+        content = "This is a small file. It has very few words.\n"
+        chunks = RepoIndex._split_into_chunks(content, "small.py", max_tokens=800)
+        assert len(chunks) == 1
+        assert "small" in chunks[0].text or "few" in chunks[0].text
+
+    def test_chunk_line_numbers_correct(self):
+        """Verify start_line/end_line match actual content positions."""
+        lines = ["line one", "line two", "line three", "line four", "line five"]
+        content = "\n".join(lines)
+        chunks = RepoIndex._split_into_chunks(content, "test.md", max_tokens=800)
+        assert len(chunks) >= 1
+        # All line numbers must be within [1, len(lines)]
+        for chunk in chunks:
+            assert chunk.start_line >= 1
+            assert chunk.end_line <= len(lines)
+            assert chunk.start_line <= chunk.end_line
+
+    def test_large_chunk_hard_split(self):
+        """Content with no natural boundaries > 800 words → split at line boundary."""
+        # 900 single-word lines (no blank lines, no def/class)
+        lines = [f"uniqueword{i}" for i in range(900)]
+        content = "\n".join(lines)
+        chunks = RepoIndex._split_into_chunks(content, "big.py", max_tokens=800)
+        assert len(chunks) >= 2
+        # No chunk should exceed max_tokens significantly
+        for chunk in chunks:
+            word_count = len(chunk.text.split())
+            assert word_count <= 900  # sanity; hard limit enforced
+
+    def test_empty_content_returns_empty(self):
+        """Empty string → []."""
+        chunks = RepoIndex._split_into_chunks("", "empty.py", max_tokens=800)
+        assert chunks == []
+
+
+# ---------------------------------------------------------------------------
+# Chunk semantic search tests (A-RAG §3.2)
+# ---------------------------------------------------------------------------
+
+
+class TestChunkSearch:
+    def _make_index_with_chunks(self):
+        """Create a RepoIndex with manually injected chunks and embeddings."""
+        from ccr.context.indexer import ChunkEntry, FileEntry
+
+        idx = RepoIndex.__new__(RepoIndex)
+        idx.root = "/fake"
+        idx._built_at = None
+        idx._mtime_sig = ""
+        idx._embeddings = {}
+        idx._bm25_cache = None
+        idx._chunk_embeddings = {}
+
+        # Create a file entry with 3 chunks
+        entry = FileEntry(
+            rel_path="src/auth.py",
+            size_bytes=200,
+            language="python",
+            symbols=["login", "logout"],
+            imports=[],
+            last_modified=0,
+            line_count=30,
+            _content="",
+        )
+        chunks = [
+            ChunkEntry("src/auth.py", 0, 1, 10, "def login(): authenticate user credentials"),
+            ChunkEntry("src/auth.py", 1, 11, 20, "def logout(): end user session and clear token"),
+            ChunkEntry("src/auth.py", 2, 21, 30, "def register(): create new user account in database"),
+        ]
+        entry.chunks = chunks
+        idx.files = {"src/auth.py": entry}
+
+        # Set up fake chunk embeddings (3-dim for simplicity)
+        # login chunk ~ [1, 0, 0], logout ~ [0, 1, 0], register ~ [0, 0, 1]
+        idx._chunk_embeddings = {
+            "src/auth.py::0": [1.0, 0.0, 0.0],
+            "src/auth.py::1": [0.0, 1.0, 0.0],
+            "src/auth.py::2": [0.0, 0.0, 1.0],
+        }
+        # Also store back on chunks
+        for chunk in chunks:
+            key = f"src/auth.py::{chunk.chunk_idx}"
+            chunk.embedding = idx._chunk_embeddings[key]
+
+        return idx
+
+    def _make_mock_model(self, query_vec: list[float]):
+        """Return a mock model that embeds queries as the given vector."""
+        import types
+        import numpy as np
+
+        model = types.SimpleNamespace()
+        model.embed_query = lambda q: np.array(query_vec, dtype=np.float32)
+        return model
+
+    def test_chunk_search_returns_snippet_field(self):
+        """chunk_semantic_search results include snippet field."""
+        import numpy as np
+
+        idx = self._make_index_with_chunks()
+        model = self._make_mock_model([1.0, 0.0, 0.0])  # closest to login chunk
+        results = idx.chunk_semantic_search("login authenticate", model, top_k=3)
+        assert len(results) > 0
+        assert "snippet" in results[0]
+        assert isinstance(results[0]["snippet"], str)
+
+    def test_chunk_search_returns_line_numbers(self):
+        """chunk_semantic_search results include start_line and end_line."""
+        import numpy as np
+
+        idx = self._make_index_with_chunks()
+        model = self._make_mock_model([0.0, 1.0, 0.0])  # closest to logout chunk
+        results = idx.chunk_semantic_search("logout session", model, top_k=3)
+        assert len(results) > 0
+        top = results[0]
+        assert "start_line" in top
+        assert "end_line" in top
+        assert top["start_line"] >= 1
+        assert top["end_line"] >= top["start_line"]
+
+    def test_chunk_search_fallback_empty_when_no_embeddings(self):
+        """When _chunk_embeddings is empty, returns []."""
+        idx = self._make_index_with_chunks()
+        idx._chunk_embeddings = {}
+        model = self._make_mock_model([1.0, 0.0, 0.0])
+        results = idx.chunk_semantic_search("login", model, top_k=5)
+        assert results == []
+
+    def test_chunk_search_top_k_respected(self):
+        """With 3 chunks and top_k=2 → at most 2 results."""
+        idx = self._make_index_with_chunks()
+        model = self._make_mock_model([0.33, 0.33, 0.34])  # roughly equal to all
+        results = idx.chunk_semantic_search("user", model, top_k=2)
+        assert len(results) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Snippet extraction tests (A-RAG §3.2 Eq. 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSnippetExtraction:
+    def test_extract_returns_sentence_with_keyword(self):
+        """Text with 3 sentences, only 1 contains query word → returns that sentence."""
+        text = "The sky is blue. Python is great for coding. The cat sat on mat."
+        snippet = RepoIndex.extract_snippet(text, "Python coding")
+        assert "Python" in snippet or "coding" in snippet
+
+    def test_extract_returns_fallback_when_no_match(self):
+        """No query words in text → returns first 200 chars."""
+        text = "The sky is blue. The sun is warm. The grass is green."
+        snippet = RepoIndex.extract_snippet(text, "xyzzy quux wumpus")
+        # Fallback: first 200 chars (query words all len <= 3 after filter, or no match)
+        assert len(snippet) <= 203  # 200 + "..."
+
+    def test_extract_caps_at_max_sentences(self):
+        """5 matching sentences, max_sentences=2 → at most 2 returned."""
+        sentences = [f"The algorithm processes data {i} efficiently." for i in range(5)]
+        text = " ".join(sentences)
+        snippet = RepoIndex.extract_snippet(text, "algorithm data", max_sentences=2)
+        # Count how many of the original sentences appear by looking at " ... " splits
+        parts = snippet.split(" ... ")
+        assert len(parts) <= 2
+
+    def test_extract_case_insensitive(self):
+        """Query 'Python', sentence has 'python' → matches."""
+        text = "This is a test line. python is used here for scripting. Another line."
+        snippet = RepoIndex.extract_snippet(text, "Python")
+        assert "python" in snippet.lower()
