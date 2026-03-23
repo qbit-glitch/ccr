@@ -80,6 +80,18 @@ DEFAULT_IGNORES = [
 
 
 @dataclass
+class ChunkEntry:
+    """A sentence/paragraph-level chunk of a file (A-RAG §3.1)."""
+
+    file_path: str       # relative path (same as FileEntry.path)
+    chunk_idx: int       # 0-based chunk index within the file
+    start_line: int      # 1-based line number where chunk starts
+    end_line: int        # 1-based line number where chunk ends (inclusive)
+    text: str            # raw chunk text
+    embedding: list[float] = field(default_factory=list)  # set by build_chunk_embeddings
+
+
+@dataclass
 class FileEntry:
     rel_path: str
     size_bytes: int
@@ -89,6 +101,7 @@ class FileEntry:
     last_modified: float
     line_count: int
     _content: str = field(default="", repr=False)
+    chunks: list[ChunkEntry] = field(default_factory=list)
 
     @property
     def content(self) -> str:
@@ -126,6 +139,8 @@ class RepoIndex:
         # Semantic search state
         self._embeddings: dict[str, list[float]] = {}
         self._bm25_cache: dict | None = None
+        # Chunk-level embeddings (A-RAG §3.1 sentence-level chunks)
+        self._chunk_embeddings: dict[str, list[float]] = {}
 
     @classmethod
     def build(
@@ -191,7 +206,7 @@ class RepoIndex:
             imports = cls._extract_imports(content, language)
             lines = content.count("\n") + 1
 
-            index.files[rel] = FileEntry(
+            entry = FileEntry(
                 rel_path=rel,
                 size_bytes=stat.st_size,
                 language=language,
@@ -201,6 +216,10 @@ class RepoIndex:
                 line_count=lines,
                 _content=content,
             )
+            # A-RAG §3.1: chunk content into ~800-token segments
+            if content and len(content.encode()) < 50_000:
+                entry.chunks = cls._split_into_chunks(content, rel, max_tokens=800)
+            index.files[rel] = entry
             file_count += 1
 
         index._built_at = time.time()
@@ -270,6 +289,97 @@ class RepoIndex:
             first_lines = "\n".join(entry._content.split("\n")[:10])
             parts.append(first_lines)
         return "\n".join(parts)
+
+    @staticmethod
+    def _split_into_chunks(content: str, rel_path: str, max_tokens: int = 800) -> list[ChunkEntry]:
+        """Split file content into ~max_tokens chunks on natural boundaries.
+
+        Split priority (highest to lowest):
+        1. Blank lines between top-level Python def/class blocks
+        2. Single blank lines (paragraph breaks) for non-Python files
+        3. Hard split at max_tokens on the nearest line boundary
+
+        A-RAG §3.1: corpus is chunked into ~1000-token segments.
+        CCR adaptation: 800-token target, split on semantic boundaries.
+
+        Returns [] for empty content.
+        """
+        if not content:
+            return []
+
+        lines = content.split("\n")
+        n_lines = len(lines)
+
+        # Collect natural split points (0-based line indices to split BEFORE)
+        split_before: list[int] = []
+
+        if rel_path.endswith(".py"):
+            # Python: split before top-level def/class that follow a blank line
+            for i in range(1, n_lines):
+                prev_blank = lines[i - 1].strip() == ""
+                curr_toplevel = re.match(r"^(def |class |async def )", lines[i])
+                if prev_blank and curr_toplevel:
+                    split_before.append(i)
+        else:
+            # Non-Python: split before a non-blank line that follows a blank line
+            for i in range(1, n_lines):
+                if lines[i - 1].strip() == "" and lines[i].strip() != "":
+                    split_before.append(i)
+
+        # Build list of (start, end) segments from split boundaries
+        boundaries = sorted(set(split_before))
+        segment_starts = [0] + boundaries
+        segment_ends = boundaries + [n_lines]
+        raw_segments = [(s, e) for s, e in zip(segment_starts, segment_ends) if s < e]
+
+        chunks: list[ChunkEntry] = []
+
+        for seg_start, seg_end in raw_segments:
+            text = "\n".join(lines[seg_start:seg_end])
+            if not text.strip():
+                continue
+
+            # Count words in this segment
+            word_count = sum(len(ln.split()) for ln in lines[seg_start:seg_end])
+
+            if word_count <= max_tokens:
+                # Segment fits — emit as-is
+                chunks.append(ChunkEntry(
+                    file_path=rel_path,
+                    chunk_idx=len(chunks),
+                    start_line=seg_start + 1,
+                    end_line=seg_end,
+                    text=text,
+                ))
+            else:
+                # Hard split: walk line by line until max_tokens
+                pos = seg_start
+                while pos < seg_end:
+                    ptr = pos
+                    wc = 0
+                    while ptr < seg_end:
+                        wc += len(lines[ptr].split())
+                        if wc > max_tokens:
+                            break
+                        ptr += 1
+                    if ptr == pos:
+                        ptr = pos + 1  # always advance at least one line
+                    seg_text = "\n".join(lines[pos:ptr])
+                    if seg_text.strip():
+                        chunks.append(ChunkEntry(
+                            file_path=rel_path,
+                            chunk_idx=len(chunks),
+                            start_line=pos + 1,
+                            end_line=ptr,
+                            text=seg_text,
+                        ))
+                    pos = ptr
+
+        # Reindex chunk_idx sequentially
+        for i, chunk in enumerate(chunks):
+            chunk.chunk_idx = i
+
+        return chunks
 
     def _build_bm25_cache(self) -> dict:
         """Pre-compute BM25 data structures from indexed file content.
@@ -452,11 +562,16 @@ class RepoIndex:
         file_glob: str = "**/*",
         keyword_weight: float = 0.3,
         semantic_weight: float = 0.7,
+        return_snippets: bool = False,
     ) -> list[dict]:
         """Combine keyword + semantic scores (CCR's own score-fusion design).
 
         Normalizes both score types to [0,1] and combines with weights.
         Uses ONNX embeddings if model + embeddings available, else BM25.
+
+        When return_snippets=True and chunk embeddings are available, uses
+        chunk-level semantic search (A-RAG §3.2) and attaches snippet field
+        to results.
 
         Note: A-RAG (arXiv:2602.03442) uses agent-driven tool selection
         (the agent chooses keyword_search vs semantic_search per step).
@@ -469,9 +584,24 @@ class RepoIndex:
             r["path"]: r["score"] / max_kw for r in kw_results
         }
 
+        # Snippet map from chunk search (if requested)
+        snippet_map: dict[str, str] = {}
+
         # Semantic scores
         sem_scores: dict[str, float] = {}
-        if model is not None and self._embeddings:
+        if return_snippets and model is not None and self._chunk_embeddings:
+            # Use chunk-level semantic search (A-RAG §3.2)
+            chunk_results = self.chunk_semantic_search(query, model, top_k=100)
+            for r in chunk_results:
+                path = r["path"]
+                score = r["score"]
+                # Keep best chunk score per file
+                if path not in sem_scores or score > sem_scores[path]:
+                    sem_scores[path] = score
+                # Keep snippet from best-scoring chunk per file
+                if path not in snippet_map or score > sem_scores.get(path, 0):
+                    snippet_map[path] = r["snippet"]
+        elif model is not None and self._embeddings:
             sem_results = self.semantic_search(
                 query, model, top_k=100, file_glob=file_glob
             )
@@ -498,14 +628,17 @@ class RepoIndex:
             entry = self.files.get(path)
             if entry is None:
                 continue
-            combined.append({
+            result: dict = {
                 "path": path,
                 "score": round(final, 4),
                 "language": entry.language,
                 "symbols": entry.symbols[:10],
                 "size": entry.size_bytes,
                 "lines": entry.line_count,
-            })
+            }
+            if return_snippets and path in snippet_map:
+                result["snippet"] = snippet_map[path]
+            combined.append(result)
 
         combined.sort(key=lambda r: r["score"], reverse=True)
         return combined[:top_k]
@@ -525,6 +658,165 @@ class RepoIndex:
             self._embeddings = loaded
             return True
         return False
+
+    def build_chunk_embeddings(self, model: "EmbeddingModel") -> tuple[int, int]:
+        """Compute and store embeddings for all file chunks.
+
+        A-RAG §3.1: each chunk gets a dense embedding.
+
+        Returns: (chunks_embedded, files_processed)
+        """
+        all_texts: list[str] = []
+        all_keys: list[str] = []
+
+        for rel, entry in self.files.items():
+            for chunk in entry.chunks:
+                key = f"{rel}::{chunk.chunk_idx}"
+                all_texts.append(chunk.text[:2000])
+                all_keys.append(key)
+
+        if not all_texts:
+            return 0, 0
+
+        # Batch embed
+        vecs = model.embed_batch(all_texts)
+
+        # Store flat dict
+        self._chunk_embeddings = {}
+        for key, vec in zip(all_keys, vecs):
+            self._chunk_embeddings[key] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+
+        # Restore back into ChunkEntry for convenience
+        for rel, entry in self.files.items():
+            for chunk in entry.chunks:
+                key = f"{rel}::{chunk.chunk_idx}"
+                if key in self._chunk_embeddings:
+                    chunk.embedding = self._chunk_embeddings[key]
+
+        files = len({k.split("::")[0] for k in all_keys})
+        return len(all_texts), files
+
+    def save_chunk_embeddings(self, path: str) -> None:
+        """Save chunk embeddings to gzip-compressed JSON.
+
+        Mirror of save_embeddings() for chunk-level data.
+        Path: index_chunk_embeddings.json.gz in .ccr/.
+        """
+        from ccr.context.embeddings import save_embeddings
+
+        save_embeddings(self._chunk_embeddings, path)
+
+    def load_chunk_embeddings(self, path: str) -> bool:
+        """Load pre-computed chunk embeddings. Returns True if loaded.
+
+        Mirror of load_embeddings() for chunk-level data.
+        Also restores chunk.embedding on each ChunkEntry by matching keys.
+        """
+        from ccr.context.embeddings import load_embeddings
+
+        loaded = load_embeddings(path)
+        if not loaded:
+            return False
+
+        self._chunk_embeddings = loaded
+
+        # Restore embeddings back into ChunkEntry objects
+        for rel, entry in self.files.items():
+            for chunk in entry.chunks:
+                key = f"{rel}::{chunk.chunk_idx}"
+                if key in self._chunk_embeddings:
+                    chunk.embedding = self._chunk_embeddings[key]
+
+        return True
+
+    @staticmethod
+    def extract_snippet(text: str, query: str, max_sentences: int = 3) -> str:
+        """Extract sentences from text that contain query keywords.
+
+        A-RAG §3.2 Eq. 2: snippet = sentences containing query terms.
+
+        Returns up to max_sentences sentences containing query keywords,
+        joined with " ... ". Returns first 200 chars of text if no match found.
+        """
+        # Split on sentence boundaries
+        parts = re.split(r"(?<=[.!?])\s+|\n", text)
+        sentences = [s.strip() for s in parts if s.strip()]
+
+        # Query keywords: words longer than 3 chars, lowercased
+        query_words = {w.lower() for w in query.split() if len(w) > 3}
+
+        if not query_words:
+            return text[:200] + ("..." if len(text) > 200 else "")
+
+        matching = []
+        for sentence in sentences:
+            lower_sentence = sentence.lower()
+            if any(word in lower_sentence for word in query_words):
+                matching.append(sentence)
+                if len(matching) >= max_sentences:
+                    break
+
+        if matching:
+            return " ... ".join(matching)
+
+        return text[:200] + ("..." if len(text) > 200 else "")
+
+    def chunk_semantic_search(
+        self,
+        query: str,
+        model: "EmbeddingModel",
+        top_k: int = 10,
+    ) -> list[dict]:
+        """Semantic search at chunk level with snippet extraction.
+
+        A-RAG §3.2: sentence-level dense retrieval + snippet extraction.
+
+        Returns list of dicts: {path, chunk_idx, start_line, end_line, score, snippet}
+        Falls back to empty list if no chunk embeddings built (caller falls back to file-level).
+        """
+        if not self._chunk_embeddings:
+            return []
+
+        try:
+            import numpy as np
+        except ImportError:
+            return []
+
+        query_vec = model.embed_query(query)
+
+        keys = list(self._chunk_embeddings.keys())
+        vecs = [self._chunk_embeddings[k] for k in keys]
+
+        scores = [float(np.dot(query_vec, np.array(v, dtype=np.float32))) for v in vecs]
+        indexed = sorted(enumerate(scores), key=lambda x: -x[1])
+
+        results = []
+        for idx, score in indexed[:top_k]:
+            if score <= 0:
+                continue
+            key = keys[idx]
+            rel_path, chunk_idx_str = key.rsplit("::", 1)
+            chunk_idx = int(chunk_idx_str)
+
+            entry = self.files.get(rel_path)
+            if entry is None:
+                continue
+
+            chunk = next((c for c in entry.chunks if c.chunk_idx == chunk_idx), None)
+            if chunk is None:
+                continue
+
+            snippet = self.extract_snippet(chunk.text, query)
+            results.append({
+                "path": rel_path,
+                "chunk_idx": chunk_idx,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "score": round(score, 4),
+                "snippet": snippet,
+            })
+
+        return results
 
     def to_json(self) -> str:
         """Serialize to JSON for REPL loading. Excludes file contents for efficiency."""

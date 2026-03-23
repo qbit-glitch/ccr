@@ -47,6 +47,7 @@ _schema_path: str = ""
 _global_schema_path: str = ""
 _embedding_model: object | None = None  # EmbeddingModel when available
 _embeddings_path: str = ""
+_chunk_embeddings_path: str = ""
 
 mcp = FastMCP(
     "ccr",
@@ -64,7 +65,7 @@ def _init(project_root: str | None = None) -> None:
     global _project_root, _memory, _playbook, _playbook_path, _failure_lessons_path
     global _global_playbook, _global_playbook_path, _global_failure_lessons_path, _repo_index
     global _schema_path, _global_schema_path
-    global _embedding_model, _embeddings_path
+    global _embedding_model, _embeddings_path, _chunk_embeddings_path
 
     _project_root = os.path.abspath(project_root or os.getcwd())
     _memory = MemoryManager(_project_root, CCRConfig())
@@ -93,8 +94,9 @@ def _init(project_root: str | None = None) -> None:
     _schema_path = os.path.join(_project_root, ".ccr", "playbook_schema.json")
     _global_schema_path = os.path.join(global_ccr, "global_playbook_schema.json")
 
-    # Embeddings path (A-RAG semantic search)
+    # Embeddings paths (A-RAG semantic search)
     _embeddings_path = os.path.join(_project_root, ".ccr", "index_embeddings.json.gz")
+    _chunk_embeddings_path = os.path.join(_project_root, ".ccr", "index_chunk_embeddings.json.gz")
 
     # Build repo index
     _repo_index = RepoIndex.build(_project_root)
@@ -102,6 +104,10 @@ def _init(project_root: str | None = None) -> None:
     # Load cached embeddings if available
     if os.path.isfile(_embeddings_path):
         _repo_index.load_embeddings(_embeddings_path)
+
+    # Load cached chunk embeddings if available (A-RAG §3.1 sentence-level chunks)
+    if os.path.isfile(_chunk_embeddings_path):
+        _repo_index.load_chunk_embeddings(_chunk_embeddings_path)
 
     # Cache index
     try:
@@ -1422,6 +1428,13 @@ def index_build() -> str:
                     _repo_index.save_embeddings(_embeddings_path)
                     _embedding_model = model
                     emb_status = f"\nEmbeddings: {count} files ({model.MODEL_NAME})"
+                    # A-RAG §3.1: build chunk-level embeddings for snippet extraction
+                    try:
+                        chunk_count, chunk_files = _repo_index.build_chunk_embeddings(model)
+                        _repo_index.save_chunk_embeddings(_chunk_embeddings_path)
+                        emb_status += f"\nChunk embeddings: {chunk_count} chunks across {chunk_files} files"
+                    except Exception as ce:
+                        emb_status += f"\nChunk embeddings: skipped ({ce})"
             else:
                 emb_status = (
                     "\nEmbeddings: unavailable (install onnxruntime + tokenizers for semantic search)"
