@@ -55,7 +55,7 @@ MCP server that gives Claude Code persistent memory (GCC), self-evolving strateg
 
 ```
 ccr/
-  mcp_server.py     # MCP server: all 23 tools (GCC + ACE + RLM + Index)
+  mcp_server.py     # MCP server: all 25 tools (GCC + ACE + RLM + Index)
   hooks/
     on_session_start.py  # Injects playbook + context on UserPromptSubmit
     on_session_end.py    # Logs session end OTA
@@ -102,13 +102,14 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ## Key Patterns
 
-- **MCP server**: 23 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
+- **MCP server**: 25 tools exposed via stdio transport — GCC memory, ACE playbook, RLM sandbox, repo index
 - **CER-inspired pattern buffer** (arXiv:2506.06698): `gcc_commit` accepts optional `patterns_learned` list of transferable skills. Patterns deduped via word Jaccard (0.7 threshold), tracked in `.ccr/patterns.json` with occurrence counts. Patterns in 3+ commits → suggested for ACE playbook promotion (suggestion-only, not auto-add). Buffer capped at 200 entries with eviction by lowest occurrence. `gcc_patterns` tool queries the buffer. Zero LLM calls.
 - **Memory**: GCC-inspired `.ccr/` directory. Commits track what was done/learned/planned. Branches for experiments. 5-level context retrieval. A-MAC admission control with correct polarity: S(m) = 0.50·TypePrior + 0.35·Novelty + 0.15·Recency. Algorithm 1 with S(m) vs S(m_conflict) comparison, FindConflict with recency-dampened similarity (CCR adaptation; paper uses pure cosine threshold 0.85 per §3.3), three-way admit/merge/reject, structural bypass.
-- **Heuristic commit cross-linking** (A-MEM/MAGMA inspired taxonomy): When `gcc_commit` creates a new entry, scans recent commits for overlap and stores bidirectional cross-links in `.ccr/commit_links.json`. Four link types: entity (file-set Jaccard), causal (regex C### detection), supersession (replacement language), semantic (word Jaccard). `gcc_links` tool traverses via BFS; `gcc_context` level 5 shows links. All mechanical — zero LLM calls.
+- **Heuristic commit cross-linking** (A-MEM/MAGMA inspired taxonomy): When `gcc_commit` creates a new entry, scans recent commits for overlap and stores bidirectional cross-links in `.ccr/commit_links.json`. Four link types: entity (file-set Jaccard), causal (regex C### detection), supersession (replacement language), semantic (word Jaccard). `gcc_links` tool traverses via BFS (query-intent-aware when `query=` provided); `gcc_context` level 5 shows links. All mechanical — zero LLM calls.
+- **A-MEM memory evolution** (opt-in, requires sub-model): `gcc_evolve_memory` tool triggers LLM rewrite of a commit's `what` field when semantic/supersession links exist. `EvolvedSummary` overlay stored in `.ccr/evolved_summaries.json`; `get_context()` shows `[evolved]` tag. Also fires automatically in `commit()` when `sub_client` is set and a strong semantic/supersession link is found. Zero-LLM fallback: evolution simply doesn't run.
 - **Two-tier playbook**: Global (`~/.ccr/global_playbook.txt`) + project (`.ccr/playbook.txt`). All ACE tools accept `scope="global"|"project"`. Cross-tier similarity detection via `ace_find_similar(scope="cross")`.
 - **Temporal decay**: Bullet counters decay via `effective_score = raw * 0.95^days`. Unused 30d → 21%, 90d → 1%. `last_updated` persisted in companion JSON. Budget pruning uses effective scores.
-- **Playbook evolution**: ACE playbook with helpful/harmful counters. Claude Code reflects and curates — no sub-model needed.
+- **Playbook evolution**: ACE playbook with helpful/harmful counters. Claude Code reflects and curates — no sub-model needed. Optional 3-agent pipeline (requires sub-model): `ace_generate_bullets` exposes Generator→Reflector→Curator chain; `_run_ace_pipeline()` fires automatically after every `gcc_commit` when sub-model is set. GRPO group-relative advantages on bullets: `recompute_grpo_advantages()` clusters bullets by similarity and scores `A_i = (r_i − mean) / (std + ε)`; `ace_get_playbook(task_context=...)` returns policy-ranked top-5.
 - **Structured Failure Lessons** (SkillRL-inspired): When tagging harmful, include a failure_lesson dict explaining why. Lessons accumulate, then `ace_evolve_from_failures` copies prevention_principle verbatim as new bullets when harmful count >= 3 (no cross-lesson synthesis, no teacher model). Companion data in `.ccr/failure_lessons.json`.
 - **MCE-inspired schema evolution** (arXiv:2601.21557): Playbook structure (sections, decay rate, pruning thresholds, token budget) is itself evolvable. `ace_evolve_schema` computes health metrics (entropy-normalized section balance, utilization, harmful ratio, decay impact), proposes one structural change per call (rule-based, deterministic — not true (1+1)-ES), tracks schema versions with baseline comparison for rollback. Schema stored in `.ccr/playbook_schema.json`.
 - **Semantic search** (A-RAG-inspired): `index_search` supports three modes — keyword (substring), semantic (ONNX embeddings or BM25 fallback), hybrid (default, combines both). Fallback chain: ONNX dense embeddings → BM25 term frequency → keyword substring. BM25 zero-dep fallback (CCR's own; not from paper). ONNX requires optional `ccr[semantic]` extras. File-level embeddings use path + symbols + first 10 lines per file.
@@ -120,7 +121,7 @@ vendor/             # Reference implementations (rlm, open-gcc, git-context-cont
 
 ```bash
 source .venv/bin/activate
-pytest tests/unit/ tests/integration/ -x -q  # Run all tests (1215 pass)
+pytest tests/unit/ tests/integration/ -x -q  # Run all tests (1323 pass)
 python -m ccr.mcp_server                     # Start MCP server (stdio)
 ccr init                                     # Init .ccr/ in current dir
 ccr index                                    # Build repo index
@@ -170,7 +171,7 @@ ccr status                                   # Show memory state
    - See "Limitations vs. Paper (CER Pattern Extraction)" below for gaps
 
 6. **A-MEM** (arXiv:2502.12110) + **MAGMA** (arXiv:2601.03236): Commit cross-linking taxonomy
-   - Bidirectional commit cross-references using file-overlap and regex heuristics. Borrows link-type taxonomy from MAGMA; no A-MEM operations (LLM enrichment, link generation, memory evolution) implemented.
+   - Bidirectional commit cross-references using file-overlap and regex heuristics. Borrows link-type taxonomy from MAGMA; A-MEM memory evolution implemented as opt-in `EvolvedSummary` overlay (LLM enrichment via sub-model when available).
    - Four link types inspired by MAGMA's multi-graph edge taxonomy
    - See "Limitations vs. Paper (Commit Cross-Linking — A-MEM/MAGMA)" below for what is NOT implemented
 
