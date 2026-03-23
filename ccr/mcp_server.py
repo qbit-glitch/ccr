@@ -1233,7 +1233,22 @@ def _run_ace_pipeline(title: str, what: str, why: str, sub_client) -> None:
     Failures are silently swallowed — this must never affect the commit result.
     """
     try:
+        # Build enriched trajectory: commit + rolling context + top bullets (ACE §3.1)
         trajectory = f"Title: {title}\nWhat: {what}\nWhy: {why}"
+        try:
+            mem = _ensure_memory()
+            rolling = mem._get_rolling_summary("main") or ""
+            if rolling:
+                trajectory += f"\n\nProject context (rolling summary):\n{rolling[:600]}"
+        except Exception:
+            pass
+        try:
+            pb = _ensure_playbook()
+            top_bullets = [b.content for b in pb.bullets[:5]]
+            if top_bullets:
+                trajectory += "\n\nExisting playbook (top 5):\n" + "\n".join(f"- {b}" for b in top_bullets)
+        except Exception:
+            pass
 
         # Step 1: Generator
         candidates = _ace_generator(trajectory, sub_client)
@@ -1278,13 +1293,22 @@ def _run_ace_pipeline(title: str, what: str, why: str, sub_client) -> None:
                                 best_sim = sim
                                 best_id = b.id
                         if best_id and best_sim > 0.0:
-                            op = DeltaOperation(
-                                op_type="UPDATE",
-                                section="",
+                            # ADD new bullet, then MERGE it into keeper to combine counters
+                            add_op = DeltaOperation(
+                                op_type="ADD",
+                                section="STRATEGIES & INSIGHTS",
                                 content=bullet_text,
-                                bullet_id=best_id,
                             )
-                            pb.apply_delta([op])
+                            pb.apply_delta([add_op])
+                            new_id = pb.bullets[-1].id  # newly added bullet
+                            merge_op = DeltaOperation(
+                                op_type="MERGE",
+                                section="",
+                                content=bullet_text,  # merged content
+                                bullet_id=best_id,    # keeper (existing)
+                                merge_target=new_id,  # absorbed (new)
+                            )
+                            pb.apply_delta([merge_op])
                 # SKIP: do nothing
             _save_playbook()
     except Exception:
