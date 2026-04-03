@@ -470,7 +470,7 @@ class CCRRepl:
         if self.repo_index is None:
             return []
         if hasattr(self.repo_index, "search"):
-            return self.repo_index.search(query)
+            return self.repo_index.search(query, file_glob=file_glob)
         return []
 
     def _estimate_tokens(self, text: str) -> int:

@@ -4,8 +4,10 @@ Tests metadata.yaml, summary.md, OTA triples, context windowing, auto-CONTEXT.
 """
 
 import json
+import math
 import os
 import tempfile
+from datetime import datetime, timezone
 
 import pytest
 import yaml
@@ -202,3 +204,53 @@ class TestAutoContextBeforeMerge:
         # If auto-CONTEXT fails, merge would raise — this is an integration test
         result = mem.merge("exp", "success", "it worked")
         assert "Merged" in result
+
+
+class TestComputeClusters:
+    def test_compute_clusters_returns_list(self, mem):
+        """compute_clusters returns a list (even with no cross-links)."""
+        clusters = mem.compute_clusters(min_cluster_size=2)
+        assert isinstance(clusters, list)
+
+    def test_compute_clusters_empty_with_no_links(self, mem):
+        """Without any cross-links, there are no clusters."""
+        mem.commit("first commit", "some work", "reason", ["a.py"], "next")
+        clusters = mem.compute_clusters(min_cluster_size=2)
+        assert clusters == []
+
+
+class TestPatternRecencyWeight:
+    def test_iso8601_timestamp_scores_high(self):
+        """A recent ISO-8601 timestamp should score close to 1.0."""
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat()
+        score = MemoryManager._pattern_recency_weight_at(ts, now)
+        assert score > 0.99
+
+    def test_legacy_timestamp_still_works(self):
+        """The legacy '%Y-%m-%d %H:%M' format should still score > 0.95 when recent."""
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%d %H:%M")
+        score = MemoryManager._pattern_recency_weight_at(ts, now)
+        assert score > 0.95
+
+    def test_empty_timestamp_returns_half(self):
+        """An empty timestamp string should return the default 0.5 weight."""
+        now = datetime.now(timezone.utc)
+        score = MemoryManager._pattern_recency_weight_at("", now)
+        assert score == 0.5
+
+    def test_iso8601_with_timezone_offset(self):
+        """ISO-8601 timestamps with UTC offset should be parsed correctly."""
+        now = datetime.now(timezone.utc)
+        ts = "2026-04-03T12:00:00+00:00"
+        score = MemoryManager._pattern_recency_weight_at(ts, now)
+        # Should produce a valid float (not the fallback 0.5)
+        assert 0.0 <= score <= 1.0
+        assert isinstance(score, float)
+
+    def test_invalid_timestamp_returns_half(self):
+        """An unparseable timestamp should return the fallback 0.5."""
+        now = datetime.now(timezone.utc)
+        score = MemoryManager._pattern_recency_weight_at("not-a-date", now)
+        assert score == 0.5

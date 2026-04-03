@@ -16,22 +16,26 @@ GCC paper features:
 from __future__ import annotations
 
 import fcntl
+import heapq
 import json
+import logging
 import math
 import os
 import re
 import subprocess
 import tempfile
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 import yaml
 
-from ccr.context.embeddings import get_embedding_model, load_embeddings, save_embeddings
+from ccr.context.embeddings import get_embedding_model, load_embeddings, quick_cosine, save_embeddings
 from ccr.core.types import CCRConfig, CommitLink
 from ccr.utils.parsing import extract_json_string
 
@@ -147,10 +151,32 @@ class MemoryManager:
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self.sub_client = None
         self._evolved_summaries: dict[str, EvolvedSummary] = {}  # commit_id → EvolvedSummary
+        # ALMA-inspired: optional schema override for retrieval params
+        self._schema_overrides: dict[str, Any] = {}
+        # In-memory commit index: branch -> {commit_id -> text_block} for O(1) lookups
+        self._commit_index: dict[str, dict[str, str]] = {}
 
     def set_sub_client(self, client) -> None:
         """Set the sub-model client for LLM-regenerated rolling summaries."""
         self.sub_client = client
+
+    def set_schema_overrides(self, overrides: dict[str, Any]) -> None:
+        """Set schema-driven parameter overrides (ALMA-inspired).
+
+        Called by MCP server when PlaybookSchema has non-default retrieval params.
+        Supported keys: link_scan_window, link_semantic_threshold.
+        """
+        self._schema_overrides = dict(overrides)
+
+    @property
+    def effective_link_scan_window(self) -> int:
+        """Return link_scan_window from schema override or config fallback."""
+        return self._schema_overrides.get("link_scan_window", self.config.link_scan_window)
+
+    @property
+    def effective_link_semantic_threshold(self) -> float:
+        """Return link_semantic_threshold from schema override or config fallback."""
+        return self._schema_overrides.get("link_semantic_threshold", self.config.link_semantic_threshold)
 
     # --- A-MEM Evolved Summary Storage (§3.3 Eq.7) ---
 
@@ -177,8 +203,8 @@ class MemoryManager:
                     source_commit_id=ev["source_commit_id"],
                     original_what=ev["original_what"],
                 )
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass  # Corrupt data: silently ignore
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to load %s: %s", path, exc)
 
     def _save_evolved_summaries(self) -> None:
         """Persist the evolved_summaries dict to JSON."""
@@ -549,6 +575,12 @@ class MemoryManager:
 
         self._prepend_commit(branch, entry)
 
+        # Track commit count (ALMA-inspired retrieval parameter evolution)
+        try:
+            self._increment_memory_metric("total_commits")
+        except Exception:
+            pass  # Metrics are supplementary — never fail the commit
+
         # GCC paper: regenerate rolling summary S_t = f(S_{t-1}, D_t)
         # Capture pre-update summary length for the compression warning (G4).
         # Strategy 2.5 may auto-compress the summary during _update_rolling_summary(),
@@ -773,6 +805,65 @@ class MemoryManager:
     )
     _COMMIT_ID_RE = re.compile(r"\b(C\d{3,})\b")
 
+    # --- Memory Metrics (ALMA-inspired retrieval parameter evolution) ---
+
+    def _get_memory_metrics_path(self) -> str:
+        """Return path to .ccr/memory_metrics.json."""
+        return os.path.join(self.ccr_root, "memory_metrics.json")
+
+    def _increment_memory_metric(self, key: str, amount: int = 1) -> None:
+        """Thread-safe increment of a memory metric counter."""
+        path = self._get_memory_metrics_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning("Failed to load %s: %s", path, exc)
+                    data = {}
+            else:
+                data = {}
+            # Ensure defaults
+            data.setdefault("search_calls", 0)
+            data.setdefault("search_zero_results", 0)
+            data.setdefault("link_creations", 0)
+            data.setdefault("total_commits", 0)
+            data[key] = data.get(key, 0) + amount
+            data["last_updated"] = datetime.now(timezone.utc).isoformat()
+            self._write_file_unlocked(path, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def get_memory_metrics(self) -> dict:
+        """Load and return current memory metrics. Returns zeros if no file."""
+        path = self._get_memory_metrics_path()
+        raw = self._read_file(path)
+        if not raw:
+            return {
+                "search_calls": 0,
+                "search_zero_results": 0,
+                "link_creations": 0,
+                "total_commits": 0,
+                "last_updated": "",
+            }
+        try:
+            data = json.loads(raw)
+            # Ensure all expected keys exist
+            data.setdefault("search_calls", 0)
+            data.setdefault("search_zero_results", 0)
+            data.setdefault("link_creations", 0)
+            data.setdefault("total_commits", 0)
+            data.setdefault("last_updated", "")
+            return data
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to load %s: %s", path, exc)
+            return {
+                "search_calls": 0,
+                "search_zero_results": 0,
+                "link_creations": 0,
+                "total_commits": 0,
+                "last_updated": "",
+            }
+
     def _get_links_path(self) -> str:
         return os.path.join(self.ccr_root, "commit_links.json")
 
@@ -782,7 +873,8 @@ class MemoryManager:
     def _embed_commit(self, commit_id: str, text: str) -> "np.ndarray | None":
         """Embed commit text and persist to cache. Returns vector or None.
 
-        Appends to .ccr/commit_embeddings.json.gz (capped at
+        Tries sqlite-vec first (persistent KNN store at .ccr/embeddings.db).
+        Falls back to .ccr/commit_embeddings.json.gz (capped at
         link_scan_window * 2 entries, oldest evicted). Returns the computed
         (384,) float32 L2-normalized vector so the caller can reuse it
         without a second inference pass. Returns None if ONNX unavailable.
@@ -794,11 +886,21 @@ class MemoryManager:
         try:
             # embed_query is expensive ONNX inference — run outside the lock
             vec = model.embed_query(text)
+
+            # Try sqlite-vec first (persistent vector store)
+            from ccr.context.vec_store import get_vec_store
+            db_path = os.path.join(self.ccr_root, "embeddings.db")
+            store = get_vec_store(db_path)
+            if store is not None:
+                store.upsert(commit_id, vec.tolist(), namespace="commit")
+                return vec
+
+            # Fallback: gzip JSON (existing behavior)
             path = self._get_commit_embeddings_path()
             with self._locks[path], self._file_lock(path):
                 cache = load_embeddings(path)
                 cache[commit_id] = vec.tolist()
-                cap = self.config.link_scan_window * 2
+                cap = self.effective_link_scan_window * 2
                 if len(cache) > cap:
                     for old_id in sorted(
                         cache.keys(),
@@ -807,24 +909,59 @@ class MemoryManager:
                         del cache[old_id]
                 save_embeddings(cache, path)
             return vec
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to embed/persist commit %s: %s", commit_id, exc)
             return None
 
     def _load_commit_embeddings(self, commit_ids: list) -> dict:
         """Load cached embeddings for given commit IDs as numpy arrays.
 
+        Tries sqlite-vec first, falls back to gzip JSON.
         Returns dict[str, np.ndarray] with only IDs present in cache.
         Silently omits missing IDs. Returns empty dict on any error.
         """
         try:
             import numpy as np  # soft dep
+
+            # Try sqlite-vec first
+            from ccr.context.vec_store import get_vec_store
+            db_path = os.path.join(self.ccr_root, "embeddings.db")
+            store = get_vec_store(db_path)
+            if store is not None:
+                batch = store.get_batch(commit_ids)
+                if batch:
+                    return {
+                        cid: np.array(vec, dtype=np.float32)
+                        for cid, vec in batch.items()
+                    }
+
+            # Fallback: gzip JSON
             raw = load_embeddings(self._get_commit_embeddings_path())
             return {
                 cid: np.array(raw[cid], dtype=np.float32)
                 for cid in commit_ids
                 if cid in raw
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load commit embeddings: %s", exc)
+            return {}
+
+    def _load_all_commit_embeddings(self) -> dict:
+        """Load ALL cached commit embeddings as numpy arrays.
+
+        Unlike _load_commit_embeddings(ids) which filters by ID,
+        this returns the entire cache for search operations.
+        Returns dict[str, np.ndarray]. Empty dict on error.
+        """
+        try:
+            import numpy as np
+            raw = load_embeddings(self._get_commit_embeddings_path())
+            return {
+                cid: np.array(vec, dtype=np.float32)
+                for cid, vec in raw.items()
+            }
+        except Exception as exc:
+            logger.warning("Failed to load all commit embeddings: %s", exc)
             return {}
 
     def _load_links(self) -> dict:
@@ -839,7 +976,8 @@ class MemoryManager:
             if not isinstance(data.get("links"), dict):
                 return {"version": 1, "links": {}}
             return data
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to load %s: %s", path, exc)
             return {"version": 1, "links": {}}
 
     def _save_links(self, data: dict) -> None:
@@ -861,12 +999,18 @@ class MemoryManager:
                     data = json.loads(raw)
                     if not isinstance(data.get("links"), dict):
                         data = {"version": 1, "links": {}}
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning("Failed to load %s: %s", path, exc)
                     data = {"version": 1, "links": {}}
             for cl in links:
                 self._add_link(data, commit_id, cl.target, cl)
             content = json.dumps(data, indent=2, ensure_ascii=False)
             self._write_file_unlocked(path, content)
+        # Track link creation metrics (ALMA-inspired retrieval parameter evolution)
+        try:
+            self._increment_memory_metric("link_creations", len(links))
+        except Exception:
+            pass  # Metrics are supplementary — never fail the link update
 
     @staticmethod
     def _add_link(data: dict, source: str, target: str, link: CommitLink) -> None:
@@ -950,7 +1094,7 @@ class MemoryManager:
         MAGMA's temporal graph (immutable chronological chain) is implicit in
         sequential commit IDs and not stored as explicit links.
         """
-        recent = self._parse_recent_commit_data(branch, k=self.config.link_scan_window)
+        recent = self._parse_recent_commit_data(branch, k=self.effective_link_scan_window)
         if not recent:
             return []
 
@@ -1026,7 +1170,7 @@ class MemoryManager:
                     old_text = f"{commit.get('title', '')} {commit.get('what', '')} {commit.get('why', '')}".lower()
                     old_keywords = self._extract_keywords(old_text)
                     score = self._jaccard(new_keywords, old_keywords)
-                if score > self.config.link_semantic_threshold:
+                if score > self.effective_link_semantic_threshold:
                     links.append(CommitLink(
                         target=cid, link_type="semantic", score=round(score, 3),
                     ))
@@ -1051,40 +1195,67 @@ class MemoryManager:
         link_types: list[str] | None = None,
         max_hops: int = 1,
         query: str | None = None,
+        max_results: int | None = None,
     ) -> list[dict]:
-        """BFS traversal of commit links up to max_hops deep.
+        """Priority-queue traversal of commit links (MAGMA-inspired adaptive).
+
+        Uses a max-heap to explore the most relevant linked commits first.
+        When ``query`` is provided and ONNX embeddings are available, edge
+        scores are computed via ``quick_cosine(query, commit_what)`` so
+        traversal is intent-aware (MAGMA Alg. 1 Eq. 5-6).  When ONNX is
+        unavailable or ``query`` is empty, falls back to plain BFS using
+        stored heuristic link scores.
 
         Returns list of dicts: {id, link_type, score, hop, title, what}.
-        Caps at config.link_max_results (default 10) to avoid context explosion.
 
         When ONNX embeddings are available for the source commit and candidate
-        commits, results are re-ranked by dense cosine similarity (dot product of
-        L2-normalised vectors) so the most semantically relevant linked commits
-        appear first.  An ``embedding_score`` key (float) is added to each result
-        dict when ONNX is available; it is absent on graceful degradation.
+        commits, results are re-ranked by dense cosine similarity (dot product
+        of L2-normalised vectors) so the most semantically relevant linked
+        commits appear first.  An ``embedding_score`` key (float) is added to
+        each result dict when ONNX is available; it is absent on graceful
+        degradation.
 
-        query: Optional natural language query for intent-aware traversal.
-               When provided and ONNX available, edges are weighted by cosine(query, commit)
-               so the BFS explores the most query-relevant commits first.
-               Approximates MAGMA Alg. 1 Eq. 5-6 intent-aware beam search.
-               Results include "query_score" field when query is used.
+        Args:
+            commit_id: Starting commit for traversal.
+            link_types: Restrict to these link types (default: all).
+            max_hops: Maximum BFS depth (default 1).
+            query: Natural language query for intent-aware traversal.
+                   When provided and ONNX available, edges are weighted by
+                   cosine(query, commit) so the heap explores the most
+                   query-relevant commits first.  Results include
+                   ``query_score`` field when query is used.
+            max_results: Maximum number of results to return.
+                         Defaults to ``config.link_max_results`` (10).
         """
         data = self._load_links()
         branch = self.get_active_branch()
         types = set(link_types) if link_types else set(self._LINK_TYPES)
-        visited = {commit_id}
-        frontier = [commit_id]
+        visited: set[str] = {commit_id}
         results: list[dict] = []
-        # Collect up to 2× the final limit during BFS so re-ranking has enough
-        # candidates to surface the best results after truncation.
-        bfs_limit = self.config.link_max_results * 2
+        effective_limit = max_results if max_results is not None else self.config.link_max_results
+        # Collect up to 2x the final limit so re-ranking has enough candidates
+        collect_limit = effective_limit * 2
 
-        # --- ONNX embeddings: load cached vectors for all known commits ---
-        # We load these before BFS so edge-weighting can use them immediately.
+        # --- Determine whether ONNX-based scoring is available ---
+        # Two scoring paths for query-aware traversal:
+        #   1. quick_cosine (text-to-text): preferred, computes cosine on the fly
+        #   2. cached vector dot product: fallback when quick_cosine unavailable
+        # Either path produces query_score in results.
+        use_onnx_scoring = False
+        if query:
+            # Probe quick_cosine to check if ONNX backend is operational
+            try:
+                probe = quick_cosine("a", "b")
+                if probe is not None:
+                    use_onnx_scoring = True
+            except Exception:
+                pass  # Graceful fallback to cached vectors or plain BFS
+
+        # --- ONNX embeddings: load cached vectors for edge scoring + post-traversal re-ranking ---
         all_ids_in_graph = list(data.get("links", {}).keys())
         all_cached = self._load_commit_embeddings(all_ids_in_graph) if all_ids_in_graph else {}
 
-        # MAGMA Alg. 1: intent-aware traversal — embed user query for edge weighting
+        # Pre-embed query vector for cached-vector scoring fallback
         query_vec = None
         if query:
             try:
@@ -1092,67 +1263,56 @@ class MemoryManager:
                 if _qemb is not None:
                     query_vec = _qemb.embed_query(query)
             except Exception:
-                pass  # Graceful fallback to plain BFS
+                pass
 
-        _bfs_full = False
-        for hop in range(1, max_hops + 1):
-            if _bfs_full:
-                break
-            next_frontier: list[str] = []
+        # query_scoring_active: True when either quick_cosine or cached vectors can score
+        query_scoring_active = use_onnx_scoring or (query_vec is not None)
 
-            # Collect all candidates for this hop, then sort by edge score
-            # (MAGMA Alg. 1: intent-aware traversal order)
-            hop_candidates: list[tuple[float, str, str, dict]] = []
-            for src in frontier:
-                node = data.get("links", {}).get(src, {})
-                for lt in types:
-                    for link_entry in node.get(lt, []):
-                        tgt = link_entry.get("target", "")
-                        if tgt in visited:
-                            continue
-                        # Compute query-weighted edge score (MAGMA Eq. 5-6)
-                        tgt_vec = all_cached.get(tgt)
-                        if query_vec is not None and tgt_vec is not None:
-                            try:
-                                import numpy as np
-                                edge_score = float(np.dot(query_vec, tgt_vec))
-                            except Exception:
-                                edge_score = link_entry.get("score", 0.0)
-                        else:
-                            edge_score = link_entry.get("score", 0.0)
-                        hop_candidates.append((edge_score, tgt, lt, link_entry))
+        # --- Priority-queue traversal (max-heap via negated scores) ---
+        # Heap entries: (-edge_score, tie_breaker, hop, target_id, link_type, link_entry)
+        # The tie_breaker ensures stable ordering when scores are equal.
+        heap: list[tuple[float, int, int, str, str, dict]] = []
+        tie_counter = 0
 
-            # Sort by edge_score descending (intent-aware traversal order)
-            hop_candidates.sort(key=lambda x: x[0], reverse=True)
+        # Seed the heap with neighbors of the starting commit
+        self._heap_push_neighbors(
+            data, commit_id, types, visited, heap, tie_counter,
+            hop=1, query=query, use_onnx_scoring=use_onnx_scoring,
+            branch=branch, all_cached=all_cached, query_vec=query_vec,
+        )
+        tie_counter += len(heap)
 
-            # Process in priority order, respecting bfs_limit
-            for edge_score, tgt, lt, link_entry in hop_candidates:
-                if len(results) >= bfs_limit:
-                    _bfs_full = True
-                    break
-                if tgt in visited:
-                    continue
-                visited.add(tgt)
-                # Fetch commit data for context
-                commit_text = self._find_commit_by_id(branch, tgt)
-                parsed = self._parse_commit_block(commit_text) if commit_text else {}
-                result: dict = {
-                    "id": tgt,
-                    "link_type": lt,
-                    "score": link_entry.get("score", 0.0),
-                    "hop": hop,
-                    "title": parsed.get("title", ""),
-                    "what": parsed.get("what", ""),
-                    **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
-                }
-                if query_vec is not None:
-                    result["query_score"] = edge_score
-                results.append(result)
-                next_frontier.append(tgt)
+        while heap and len(results) < collect_limit:
+            neg_score, _tie, hop, tgt, lt, link_entry = heapq.heappop(heap)
+            if tgt in visited:
+                continue
+            visited.add(tgt)
+            edge_score = -neg_score
 
-            frontier = next_frontier
-            if not frontier:
-                break
+            # Fetch commit data for context
+            commit_text = self._find_commit_by_id(branch, tgt)
+            parsed = self._parse_commit_block(commit_text) if commit_text else {}
+            result: dict = {
+                "id": tgt,
+                "link_type": lt,
+                "score": link_entry.get("score", 0.0),
+                "hop": hop,
+                "title": parsed.get("title", ""),
+                "what": parsed.get("what", ""),
+                **({k: link_entry[k] for k in ("shared_files", "snippet") if k in link_entry}),
+            }
+            if query_scoring_active and query:
+                result["query_score"] = edge_score
+            results.append(result)
+
+            # Expand next hop if within depth limit
+            if hop < max_hops:
+                added = self._heap_push_neighbors(
+                    data, tgt, types, visited, heap, tie_counter,
+                    hop=hop + 1, query=query, use_onnx_scoring=use_onnx_scoring,
+                    branch=branch, all_cached=all_cached, query_vec=query_vec,
+                )
+                tie_counter += added
 
         # --- ONNX re-ranking (graceful degradation when unavailable) ---
         all_result_ids = [commit_id] + [r["id"] for r in results]
@@ -1171,15 +1331,91 @@ class MemoryManager:
             except ImportError:
                 pass
 
-        # Post-BFS sort: prefer query_score when available, else embedding_score
-        if query_vec is not None and any("query_score" in r for r in results):
+        # Post-traversal sort: prefer query_score when available, else embedding_score
+        if query_scoring_active and any("query_score" in r for r in results):
             results.sort(key=lambda r: r.get("query_score", 0.0), reverse=True)
         elif src_vec is not None:
-            # Existing embedding_score sort (no query provided)
             results.sort(key=lambda r: r.get("embedding_score", 0.0), reverse=True)
 
-        # Truncate to the configured limit AFTER re-ranking
-        return results[: self.config.link_max_results]
+        # Truncate to effective limit AFTER re-ranking
+        return results[:effective_limit]
+
+    def _heap_push_neighbors(
+        self,
+        data: dict,
+        src: str,
+        types: set[str],
+        visited: set[str],
+        heap: list[tuple[float, int, int, str, str, dict]],
+        tie_counter: int,
+        *,
+        hop: int,
+        query: str | None,
+        use_onnx_scoring: bool,
+        branch: str,
+        all_cached: dict,
+        query_vec: Any,
+    ) -> int:
+        """Push neighbors of ``src`` onto the priority heap.
+
+        Computes edge scores using ``quick_cosine(query, commit_what)`` when
+        ONNX is available, otherwise uses stored heuristic link scores.
+
+        Args:
+            data: Full link graph data.
+            src: Source commit ID to expand.
+            types: Allowed link types.
+            visited: Already-visited commit IDs.
+            heap: The priority heap (mutated in place).
+            tie_counter: Starting counter for tie-breaking.
+            hop: Current hop depth for newly pushed entries.
+            query: Natural language query (may be None).
+            use_onnx_scoring: Whether ONNX quick_cosine is available.
+            branch: Active branch name for commit text lookup.
+            all_cached: Pre-loaded commit embedding vectors.
+            query_vec: Pre-embedded query vector (numpy array or None).
+
+        Returns:
+            Number of entries pushed onto the heap.
+        """
+        node = data.get("links", {}).get(src, {})
+        pushed = 0
+        for lt in types:
+            for link_entry in node.get(lt, []):
+                tgt = link_entry.get("target", "")
+                if tgt in visited:
+                    continue
+
+                edge_score: float
+                if use_onnx_scoring and query:
+                    # Primary: quick_cosine(query, target commit text)
+                    commit_text = self._find_commit_by_id(branch, tgt)
+                    parsed = self._parse_commit_block(commit_text) if commit_text else {}
+                    tgt_what = parsed.get("what", parsed.get("title", ""))
+                    cosine = quick_cosine(query, tgt_what) if tgt_what else None
+                    if cosine is not None:
+                        edge_score = cosine
+                    else:
+                        # Fallback to cached vector dot product
+                        tgt_vec = all_cached.get(tgt)
+                        if query_vec is not None and tgt_vec is not None:
+                            try:
+                                import numpy as np
+                                edge_score = float(np.dot(query_vec, tgt_vec))
+                            except Exception:
+                                edge_score = link_entry.get("score", 0.0)
+                        else:
+                            edge_score = link_entry.get("score", 0.0)
+                else:
+                    edge_score = link_entry.get("score", 0.0)
+
+                # Max-heap: negate score for heapq (min-heap)
+                heapq.heappush(
+                    heap,
+                    (-edge_score, tie_counter + pushed, hop, tgt, lt, link_entry),
+                )
+                pushed += 1
+        return pushed
 
     @staticmethod
     def _parse_commit_block(text: str) -> dict:
@@ -1222,6 +1458,165 @@ class MemoryManager:
             lines.append(f"- **{lt.capitalize()}**: {', '.join(parts)}")
         return "\n".join(lines)
 
+    # --- EverMemOS-Inspired Thematic Clustering (arXiv:2601.02163) ---
+
+    def compute_clusters(
+        self, min_cluster_size: int = 2, link_score_threshold: float = 0.3
+    ) -> list[dict]:
+        """Compute thematic clusters from the cross-link graph.
+
+        Uses connected components (BFS) on entity + semantic links.
+        Inspired by EverMemOS (arXiv:2601.02163) MemScene clustering.
+
+        Args:
+            min_cluster_size: Minimum commits to form a cluster.
+            link_score_threshold: Minimum link score to consider.
+
+        Returns:
+            List of cluster dicts: {id, name, commit_ids, top_keywords}
+        """
+        links_data = self._load_links()
+        all_links = links_data.get("links", {})
+
+        # Build adjacency from entity + semantic links
+        adjacency: dict[str, set[str]] = {}
+        for src, typed_links in all_links.items():
+            if src not in adjacency:
+                adjacency[src] = set()
+            for link_type in ("entity", "semantic"):
+                for entry in typed_links.get(link_type, []):
+                    tgt = entry.get("target", "")
+                    score = entry.get("score", 0.0)
+                    if tgt and score >= link_score_threshold:
+                        adjacency.setdefault(src, set()).add(tgt)
+                        adjacency.setdefault(tgt, set()).add(src)
+
+        # BFS connected components
+        visited: set[str] = set()
+        components: list[list[str]] = []
+        for node in adjacency:
+            if node in visited:
+                continue
+            component: list[str] = []
+            queue: deque[str] = deque([node])
+            while queue:
+                n = queue.popleft()
+                if n in visited:
+                    continue
+                visited.add(n)
+                component.append(n)
+                for neighbor in adjacency.get(n, set()):
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+            if len(component) >= min_cluster_size:
+                components.append(sorted(component))
+
+        # Name clusters by top keywords
+        branch = self.get_active_branch()
+        clusters: list[dict] = []
+        for i, commit_ids in enumerate(components):
+            keywords = self._extract_cluster_keywords(branch, commit_ids)
+            name = (
+                " ".join(w.title() for w in keywords[:4])
+                if keywords
+                else f"Cluster {i + 1}"
+            )
+            clusters.append({
+                "id": f"CL{i + 1:03d}",
+                "name": name,
+                "commit_ids": commit_ids,
+                "top_keywords": keywords[:6],
+            })
+
+        # Save clusters
+        self._save_clusters(clusters)
+        return clusters
+
+    def _extract_cluster_keywords(
+        self, branch: str, commit_ids: list[str]
+    ) -> list[str]:
+        """Extract top keywords from a set of commits."""
+        from collections import Counter
+
+        _cluster_stop_words = frozenset({
+            "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
+            "for", "of", "with", "by", "from", "is", "are", "was", "were",
+            "be", "been", "has", "have", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "can", "that", "this",
+            "it", "not", "no", "if", "when", "then", "than", "so", "as", "up",
+            "out", "about", "all", "each", "every", "both", "few", "more",
+            "most", "other", "some", "such", "only", "own", "same", "into",
+            "over", "after",
+        })
+
+        word_counts: Counter = Counter()
+        for cid in commit_ids:
+            block = self._find_commit_by_id(branch, cid)
+            if not block:
+                continue
+            # Extract text from What and Title lines
+            for line in block.split("\n"):
+                if line.startswith("**What**:") or line.startswith("## [C"):
+                    text = line.split("|")[-1] if "|" in line else line
+                    text = re.sub(r"\*\*\w+\*\*:", "", text)  # Remove **Field**: markers
+                    text = re.sub(r"\[C\d+\]", "", text)  # Remove commit refs
+                    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
+                    for w in words:
+                        if w not in _cluster_stop_words:
+                            word_counts[w] += 1
+
+        return [w for w, _ in word_counts.most_common(10)]
+
+    def _get_clusters_path(self) -> str:
+        return os.path.join(self.ccr_root, "commit_clusters.json")
+
+    def _save_clusters(self, clusters: list[dict]) -> None:
+        """Save clusters to JSON using atomic write with file locking."""
+        path = self._get_clusters_path()
+        commit_to_cluster: dict[str, str] = {}
+        for cl in clusters:
+            for cid in cl.get("commit_ids", []):
+                commit_to_cluster[cid] = cl["id"]
+
+        data = {
+            "version": 1,
+            "clusters": clusters,
+            "commit_to_cluster": commit_to_cluster,
+        }
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        with self._locks[path], self._file_lock(path):
+            self._write_file_unlocked(path, content)
+
+    def _load_clusters(self) -> dict:
+        """Load clusters from JSON. Returns default if missing/corrupt."""
+        path = self._get_clusters_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+        if not raw:
+            return {"version": 1, "clusters": [], "commit_to_cluster": {}}
+        try:
+            data = json.loads(raw)
+            if not isinstance(data.get("clusters"), list):
+                return {"version": 1, "clusters": [], "commit_to_cluster": {}}
+            return data
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to load %s: %s", path, exc)
+            return {"version": 1, "clusters": [], "commit_to_cluster": {}}
+
+    def format_clusters_for_context(self) -> str:
+        """Format clusters for inclusion in gcc_context output."""
+        data = self._load_clusters()
+        clusters = data.get("clusters", [])
+        if not clusters:
+            return ""
+        lines = ["# Thematic Clusters"]
+        for cl in clusters:
+            commit_str = ", ".join(cl["commit_ids"][:5])
+            if len(cl["commit_ids"]) > 5:
+                commit_str += f" (+{len(cl['commit_ids']) - 5} more)"
+            lines.append(f"- **{cl['name']}** [{cl['id']}]: {commit_str}")
+        return "\n".join(lines)
+
     # --- CER-Inspired Pattern Buffer (arXiv:2506.06698 §3.1) ---
 
     def _get_patterns_path(self) -> str:
@@ -1239,7 +1634,8 @@ class MemoryManager:
             if not isinstance(data.get("patterns"), dict):
                 return {"version": 1, "patterns": {}, "next_id": 1}
             return data
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to load %s: %s", path, exc)
             return {"version": 1, "patterns": {}, "next_id": 1}
 
     def _save_patterns(self, data: dict) -> None:
@@ -1250,7 +1646,7 @@ class MemoryManager:
             self._write_file_unlocked(path, content)
 
     def _find_matching_pattern(self, data: dict, new_text: str) -> str | None:
-        """Find existing pattern matching new_text via word Jaccard >= threshold.
+        """Find existing pattern matching new_text. Primary: ONNX cosine. Fallback: word Jaccard.
 
         CER §3.1: existing buffer shown to distiller to avoid repetition.
         Returns matching pattern ID or None.
@@ -1260,15 +1656,22 @@ class MemoryManager:
         if len(new_words) < 2:
             return None
 
+        # Try ONNX cosine similarity first
+        from ccr.context.embeddings import quick_cosine
         best_id = None
         best_sim = 0.0
 
         for pid, entry in data.get("patterns", {}).items():
-            existing_words = {w.lower() for w in entry["text"].split()
+            existing_text = entry["text"]
+            existing_words = {w.lower() for w in existing_text.split()
                               if w.lower() not in self._STOP_WORDS and len(w) > 2}
             if len(existing_words) < 2:
                 continue
-            sim = self._jaccard(new_words, existing_words)
+
+            # ONNX primary, Jaccard fallback
+            onnx_sim = quick_cosine(new_text, existing_text)
+            sim = onnx_sim if onnx_sim is not None else self._jaccard(new_words, existing_words)
+
             if sim >= self.config.pattern_dedup_threshold and sim > best_sim:
                 best_sim = sim
                 best_id = pid
@@ -1299,7 +1702,8 @@ class MemoryManager:
                     data = json.loads(raw)
                     if not isinstance(data.get("patterns"), dict):
                         data = {"version": 1, "patterns": {}, "next_id": 1}
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning("Failed to load %s: %s", path, exc)
                     data = {"version": 1, "patterns": {}, "next_id": 1}
 
             promotion_suggestions: list[dict] = []
@@ -1318,6 +1722,8 @@ class MemoryManager:
                     if commit_id not in entry["commit_ids"]:
                         entry["commit_ids"].append(commit_id)
                         entry["occurrence_count"] = len(entry["commit_ids"])
+                    # CER recency tracking: update last_seen timestamp
+                    entry["last_seen"] = timestamp
 
                     # Check promotion threshold
                     if (entry["occurrence_count"] >= self.config.pattern_promotion_count
@@ -1339,6 +1745,10 @@ class MemoryManager:
                         "occurrence_count": 1,
                         "created_at": timestamp,
                         "promoted": False,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "quality_score": 0.5,
+                        "last_quality_update": "",
                     }
 
             # Buffer size enforcement (CER §3.1 Dynamic Buffer)
@@ -1356,10 +1766,12 @@ class MemoryManager:
         if len(patterns) <= max_size:
             return
 
-        # Sort by (occurrence_count ASC, created_at ASC) — evict least frequent + oldest
+        # Sort by (quality_score ASC, occurrence_count ASC, created_at ASC)
+        # Evict lowest quality + least frequent + oldest first
         sorted_ids = sorted(
             patterns.keys(),
             key=lambda pid: (
+                patterns[pid].get("quality_score", 0.5),
                 patterns[pid].get("occurrence_count", 1),
                 patterns[pid].get("created_at", ""),
             ),
@@ -1418,7 +1830,8 @@ class MemoryManager:
                 return 0
             try:
                 data = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("Failed to load %s: %s", path, exc)
                 return 0
 
             matched_id = self._find_matching_pattern(data, text)
@@ -1433,15 +1846,75 @@ class MemoryManager:
             self._write_file_unlocked(path, json.dumps(data, indent=2))
             return 1
 
+    def update_pattern_quality(self, pattern_text: str, success: bool) -> bool:
+        """Update quality score for a pattern based on its promoted bullet's performance.
+
+        Called when ace_update_counters tags a bullet that was promoted from a pattern.
+        Uses Bayesian average: (success+1) / (success+failure+2).
+
+        Inspired by EvolveR (arXiv:2510.16079) quality-scored pattern buffer.
+
+        Args:
+            pattern_text: The pattern text to find (uses word Jaccard matching).
+            success: True if bullet was tagged helpful, False if harmful.
+
+        Returns:
+            True if a matching pattern was found and updated.
+        """
+        from datetime import datetime, timezone
+
+        path = self._get_patterns_path()
+        with self._locks[path], self._file_lock(path):
+            raw = self._read_file_unlocked(path)
+            if not raw:
+                return False
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("Failed to load %s: %s", path, exc)
+                return False
+
+            # Find matching pattern by word Jaccard
+            match_pid = self._find_matching_pattern(data, pattern_text)
+            if match_pid is None:
+                return False
+
+            p = data["patterns"][match_pid]
+            # Ensure quality fields exist (backward compat with old format)
+            p.setdefault("success_count", 0)
+            p.setdefault("failure_count", 0)
+            if success:
+                p["success_count"] += 1
+            else:
+                p["failure_count"] += 1
+
+            # Recompute Bayesian quality score
+            sc = p["success_count"]
+            fc = p["failure_count"]
+            p["quality_score"] = (sc + 1) / (sc + fc + 2)
+            p["last_quality_update"] = datetime.now(timezone.utc).isoformat()
+
+            self._write_file_unlocked(
+                path, json.dumps(data, indent=2, ensure_ascii=False)
+            )
+            return True
+
     def get_patterns(
         self,
         min_occurrences: int = 1,
         include_promoted: bool = True,
         search_term: str | None = None,
     ) -> dict:
-        """Query the pattern buffer. Returns dict for MCP tool formatting."""
+        """Query the pattern buffer. Returns dict for MCP tool formatting.
+
+        CER-inspired recency-weighted retrieval: patterns seen recently
+        are ranked higher. Combines quality_score with temporal decay
+        on last_seen timestamp (λ=0.005/hour, half-life ~139h).
+        """
         data = self._load_patterns()
         results = []
+        # Snapshot current time once to avoid floating point drift between entries
+        now = datetime.now(timezone.utc)
 
         for pid, entry in data.get("patterns", {}).items():
             if entry.get("occurrence_count", 1) < min_occurrences:
@@ -1451,16 +1924,54 @@ class MemoryManager:
             if search_term:
                 if search_term.lower() not in entry["text"].lower():
                     continue
+            # CER recency-weighted retrieval: compute effective score
+            quality = entry.get("quality_score", 0.5)
+            last_seen = entry.get("last_seen", entry.get("created_at", ""))
+            recency_weight = self._pattern_recency_weight_at(last_seen, now)
+            entry["effective_score"] = quality * recency_weight
             results.append({"id": pid, **entry})
 
-        # Sort by occurrence_count DESC, then by created_at DESC
-        results.sort(key=lambda x: (-x.get("occurrence_count", 1), x.get("created_at", "")))
+        # Sort by effective_score DESC (quality * recency), then occurrence_count DESC
+        # (EvolveR + CER: high-quality recent patterns surface first)
+        results.sort(key=lambda x: (
+            -x.get("effective_score", 0.5),
+            -x.get("occurrence_count", 1),
+        ))
 
         return {
             "total": len(data.get("patterns", {})),
             "matching": len(results),
             "patterns": results,
         }
+
+    @staticmethod
+    def _pattern_recency_weight_at(timestamp_str: str, now: datetime) -> float:
+        """Compute recency weight for pattern retrieval (CER-inspired).
+
+        Uses decay formula: exp(-0.005 * hours). Half-life ~139h.
+        Returns 1.0 for recent patterns, decaying toward 0 for old ones.
+        `now` is passed in to avoid floating point drift between entries.
+        """
+        if not timestamp_str:
+            return 0.5  # Default moderate weight for undated patterns
+        # Try ISO-8601 first (modern format used by datetime.now().isoformat())
+        try:
+            ts = datetime.fromisoformat(timestamp_str.strip())
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            hours = (now - ts).total_seconds() / 3600.0
+            return math.exp(-0.005 * max(0.0, hours))
+        except (ValueError, TypeError):
+            pass
+        # Legacy fallback: "%Y-%m-%d %H:%M" format
+        try:
+            ts = datetime.strptime(timestamp_str.strip(), "%Y-%m-%d %H:%M")
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            hours = (now - ts).total_seconds() / 3600.0
+            return math.exp(-0.005 * max(0.0, hours))
+        except (ValueError, TypeError):
+            return 0.5
 
     # --- Commit Type Classification (A-MAC §3.2 Factor 5: Type Prior T(m)) ---
 
@@ -1551,16 +2062,16 @@ class MemoryManager:
         Implements A-MAC (arXiv:2603.04549) with correct polarity:
         **Higher score = more valuable = more likely to admit as new.**
 
-        A-MAC Eq. 1 (adapted — 3 of 5 factors, no LLM):
-            S(m) = w_N · N(m) + w_R · R(m) + w_T · T(m)
+        A-MAC Eq. 1 (adapted — 4 of 5 factors):
+            S(m) = w_T · T(m) + w_N · N(m) + w_R · R(m) + w_U · U(m)
 
         Factors implemented:
             N(m) = 1 − max_{m' ∈ M} sim(φ(m), φ(m'))    [Eq. 3, Novelty]
             R(m) = exp(−λ · τ(m)), λ=0.01/hour           [Eq. 4, Recency]
             T(m) = type_prior(classify(m))                 [§3.2 Factor 5]
+            U(m) = utility_heuristic(commit richness)      [§3.2 Factor 3, rule-based proxy]
 
-        Factors NOT implemented (no LLM available):
-            U(m) — Utility: requires LLM to rate future usefulness
+        Factor NOT implemented:
             C(m) — Confidence: requires ROUGE-L against source turns
 
         Similarity φ(m): ONNX cosine (preferred, A-MAC Eq. 3) or word Jaccard
@@ -1580,9 +2091,10 @@ class MemoryManager:
               threshold checking only. Old conflicts are dampened per Eq. 4.
 
         Weight rationale (per Table 2 ablation — T is most impactful, ΔF1=-0.107):
-            w_T = 0.50: Type Prior dominates — most impactful factor per ablation.
-            w_N = 0.35: Novelty — "does this add new information?"
-            w_R = 0.15: Recency — included per Eq. 1 (for new commits R=1.0,
+            w_T = 0.40: Type Prior dominates — most impactful factor per ablation.
+            w_N = 0.30: Novelty — "does this add new information?"
+            w_U = 0.20: Utility — "how rich and useful is this commit?"
+            w_R = 0.10: Recency — included per Eq. 1 (for new commits R=1.0,
                 but recomputed for S(m_conflict) to decay old scores properly).
             R also modulates FindConflict similarity (old conflicts dampened).
 
@@ -1718,7 +2230,9 @@ class MemoryManager:
                 else:
                     conflict_novelty = 0.7  # Assume moderate novelty for old commits
                 # Recompute S(m') with current R(m') per Eq. 1
-                best_conflict_score = 0.50 * conflict_tp + 0.35 * conflict_novelty + 0.15 * conflict_recency
+                # Conflict utility: estimate from stored commit richness
+                conflict_utility = 0.5  # Default moderate utility for existing commits
+                best_conflict_score = 0.40 * conflict_tp + 0.30 * conflict_novelty + 0.10 * conflict_recency + 0.20 * conflict_utility
 
         # Novelty N(m) = 1 - max_similarity (Eq. 3, pure content similarity)
         # Uses best_raw_similarity (no recency modulation) to separate Novelty
@@ -1731,16 +2245,23 @@ class MemoryManager:
         # recomputed with decayed R for old commits.
         recency = 1.0  # New commit — τ(m)=0, so R(m)=exp(0)=1.0
 
-        # Admission score S(m) = w_T*T + w_N*N + w_R*R (Eq. 1, adapted)
-        # Weights per Table 2 ablation: T most impactful (ΔF1=-0.107)
-        # Higher = more valuable = more likely to admit as new
-        admission_score = 0.50 * tp + 0.35 * novelty + 0.15 * recency
+        # --- Utility heuristic U(m) (A-MAC §3.2 Factor 3, rule-based proxy) ---
+        # Paper uses LLM to rate future usefulness on 1-5 scale.
+        # CCR proxy: score based on commit richness (more detail = higher utility).
+        utility = self._utility_heuristic(what, why, files_changed, next_step)
+
+        # Admission score S(m) = w_T*T + w_N*N + w_R*R + w_U*U (Eq. 1, 4 factors)
+        # Weights rebalanced from 3-factor (0.50/0.35/0.15) to include utility:
+        # T remains most impactful (Table 2 ablation); U gets moderate weight.
+        admission_score = 0.40 * tp + 0.30 * novelty + 0.10 * recency + 0.20 * utility
 
         reason_parts = []
         if best_similarity > 0.5:
             reason_parts.append(f"sim={best_similarity:.2f}")
         if novelty > 0.7:
             reason_parts.append("novel")
+        if utility > 0.7:
+            reason_parts.append(f"utility={utility:.2f}")
         if tp >= 0.85:
             reason_parts.append(f"type={commit_type}")
         if tp <= 0.3:
@@ -1750,6 +2271,7 @@ class MemoryManager:
             "score": admission_score,
             "similarity": best_similarity,
             "novelty": novelty,
+            "utility": utility,
             "conflict_id": best_conflict_id,
             "conflict_recency": best_conflict_recency,
             "conflict_score": best_conflict_score,
@@ -1759,6 +2281,69 @@ class MemoryManager:
             "keyword_similarity": best_keyword_sim,
             "reason": ", ".join(reason_parts) if reason_parts else "moderate",
         }
+
+    @staticmethod
+    def _utility_heuristic(
+        what: str, why: str, files_changed: list[str], next_step: str,
+    ) -> float:
+        """Rule-based proxy for A-MAC Utility U(m) (§3.2 Factor 3).
+
+        Paper uses LLM to rate future usefulness on 1-5 scale.
+        CCR proxy: scores commit richness on [0, 1]. More detailed commits
+        with explicit reasoning, multiple files, and forward planning are
+        rated as higher utility.
+
+        Scoring signals (each contributes up to ~0.2):
+        - what length: longer descriptions → higher utility
+        - why present and non-trivial: reasoning → higher utility
+        - files_changed count: more files → broader impact
+        - next_step present: forward planning → higher utility
+        - what contains patterns/learnings: meta-cognitive → higher utility
+        """
+        score = 0.0
+
+        # What description richness (up to 0.25)
+        what_len = len(what.strip())
+        if what_len > 200:
+            score += 0.25
+        elif what_len > 100:
+            score += 0.20
+        elif what_len > 50:
+            score += 0.15
+        elif what_len > 20:
+            score += 0.10
+
+        # Why reasoning present (up to 0.20)
+        why_len = len(why.strip())
+        if why_len > 50:
+            score += 0.20
+        elif why_len > 20:
+            score += 0.15
+        elif why_len > 0:
+            score += 0.10
+
+        # File breadth (up to 0.20)
+        n_files = len(files_changed)
+        if n_files >= 5:
+            score += 0.20
+        elif n_files >= 3:
+            score += 0.15
+        elif n_files >= 1:
+            score += 0.10
+
+        # Forward planning (up to 0.15)
+        if next_step and len(next_step.strip()) > 10:
+            score += 0.15
+        elif next_step and next_step.strip():
+            score += 0.10
+
+        # Meta-cognitive signals (up to 0.20)
+        what_lower = what.lower()
+        meta_signals = ["pattern", "learn", "insight", "principle", "realized", "discovered"]
+        if any(s in what_lower for s in meta_signals):
+            score += 0.20
+
+        return min(1.0, score)
 
     def _hours_since_commit(self, timestamp_str: str) -> float:
         """Parse commit timestamp and return hours elapsed.
@@ -1894,6 +2479,7 @@ class MemoryManager:
 
             content = content[:match.start()] + new_block + content[match.end():]
             self._write_file_unlocked(path, content)
+            self._invalidate_commit_index(branch)
 
         return commit_id
 
@@ -3017,6 +3603,7 @@ class MemoryManager:
                 # Fallback: append
                 content = content + "\n" + entry
             self._write_file_unlocked(path, content)
+            self._invalidate_commit_index(branch)
 
     def _update_main_milestones(self, date: str, branch: str, title: str) -> None:
         """Update Recent Milestones in main.md."""
@@ -3072,24 +3659,164 @@ class MemoryManager:
                 content,
             )
             self._write_file_unlocked(path, content)
+            self._invalidate_commit_index(branch)
 
-    def _find_commit_by_id(self, branch: str, commit_id: str) -> str:
+    def _build_commit_index(self, branch: str) -> dict[str, str]:
+        """Parse commits.md once and build {commit_id: text_block} index.
+
+        Lazily called by _find_commit_by_id on cache miss. The index is
+        invalidated by _invalidate_commit_index whenever commits.md is mutated
+        (_prepend_commit, _merge_into_last_commit, _update_branch_conclusion).
+        """
         content = self._read_file(self._get_commits_path(branch))
+        index: dict[str, str] = {}
         if not content:
-            return ""
+            self._commit_index[branch] = index
+            return index
         parts = re.split(r"(?=## \[C\d{3,}\])", content)
         for part in parts:
-            if f"[{commit_id}]" in part:
-                return part.strip()
-        return ""
+            id_match = re.match(r"## \[(C\d{3,})\]", part.strip())
+            if id_match:
+                index[id_match.group(1)] = part.strip()
+        self._commit_index[branch] = index
+        return index
+
+    def _invalidate_commit_index(self, branch: str) -> None:
+        """Drop cached commit index for a branch so next lookup rebuilds it."""
+        self._commit_index.pop(branch, None)
+
+    def _find_commit_by_id(self, branch: str, commit_id: str) -> str:
+        """O(1) commit lookup using in-memory index (lazy-built, auto-invalidated)."""
+        if branch not in self._commit_index:
+            self._build_commit_index(branch)
+        result = self._commit_index[branch].get(commit_id, "")
+        if not result:
+            # Cache miss after index exists — rebuild once in case file changed externally
+            self._build_commit_index(branch)
+            result = self._commit_index[branch].get(commit_id, "")
+        return result
+
+    def _bm25_search_commits(
+        self, parts: list[str], query: str, max_results: int
+    ) -> list[tuple[float, str]]:
+        """BM25-scored search over commit text blocks (zero-dep fallback).
+
+        Inspired by ExpRAG (arXiv:2603.18272) experience retrieval.
+        Uses simplified Okapi BM25 with k1=1.5, b=0.75.
+        Returns list of (score, commit_block) tuples sorted by score descending.
+        """
+        query_terms = [w.lower() for w in query.split() if len(w) > 2]
+        if not query_terms:
+            return []
+
+        # Compute average document length
+        non_empty = [p for p in parts if p.strip()]
+        doc_lengths = [len(p.split()) for p in non_empty]
+        avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
+
+        # Document frequency for IDF
+        n_docs = len(non_empty)
+        df: dict[str, int] = {}
+        for term in query_terms:
+            df[term] = sum(1 for p in non_empty if term in p.lower())
+
+        k1 = 1.5
+        b = 0.75
+
+        scored: list[tuple[float, str]] = []
+        for p in non_empty:
+            p_lower = p.lower()
+            dl = len(p.split())
+            score = 0.0
+            for term in query_terms:
+                tf = p_lower.count(term)
+                if tf == 0:
+                    continue
+                # IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+                idf = math.log(
+                    (n_docs - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1
+                )
+                # BM25 TF normalization
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
+                score += idf * tf_norm
+            if score > 0:
+                scored.append((score, p.strip()))
+
+        scored.sort(key=lambda x: -x[0])
+        return scored[:max_results]
 
     def _search_commits(self, branch: str, term: str, max_results: int = 5) -> str:
+        """Search commits using 3-phase strategy: exact -> semantic -> BM25.
+
+        Phase 1: Exact substring match (existing behavior, always first).
+        Phase 2: ONNX embedding cosine similarity (when available).
+        Phase 3: BM25 fallback (when ONNX unavailable and exact finds nothing).
+
+        Inspired by ExpRAG (arXiv:2603.18272) embedding-based experience retrieval.
+        """
         content = self._read_file(self._get_commits_path(branch))
         if not content:
             return ""
         parts = re.split(r"(?=## \[C\d{3,}\])", content)
-        matches = [p.strip() for p in parts if term.lower() in p.lower()]
-        return "\n\n".join(matches[:max_results])
+
+        # Phase 1: Exact substring match
+        exact_matches = [p.strip() for p in parts if term.lower() in p.lower()]
+
+        # Extract commit IDs from exact matches to avoid duplicates
+        exact_ids: set[str] = set()
+        for m in exact_matches:
+            id_match = re.search(r"\[C(\d{3,})\]", m)
+            if id_match:
+                exact_ids.add(f"C{id_match.group(1)}")
+
+        remaining = max_results - len(exact_matches)
+        semantic_matches: list[str] = []
+
+        if remaining > 0:
+            # Phase 2: Semantic search via embeddings
+            model = get_embedding_model()
+            if model is not None:
+                try:
+                    import numpy as np
+
+                    query_vec = model.embed_query(term)
+                    all_embeddings = self._load_all_commit_embeddings()
+                    if all_embeddings:
+                        ids = list(all_embeddings.keys())
+                        vecs = np.stack([all_embeddings[cid] for cid in ids])
+                        scores = vecs @ query_vec  # cosine (L2-normalized)
+                        ranked = sorted(zip(ids, scores), key=lambda x: -x[1])
+                        for cid, score in ranked:
+                            if score < 0.3 or cid in exact_ids:
+                                continue
+                            block = self._find_commit_by_id(branch, cid)
+                            if block:
+                                semantic_matches.append(block.strip())
+                            if len(semantic_matches) >= remaining:
+                                break
+                except Exception:
+                    pass  # Fall through to BM25
+
+            # Phase 3: BM25 fallback when no ONNX and exact found nothing
+            if not semantic_matches and not exact_matches:
+                bm25_results = self._bm25_search_commits(parts, term, remaining)
+                semantic_matches = [block for _, block in bm25_results]
+
+        # Merge: exact first, then semantic/BM25
+        combined = exact_matches[:max_results]
+        remaining = max_results - len(combined)
+        if remaining > 0 and semantic_matches:
+            combined.extend(semantic_matches[:remaining])
+
+        # Track memory metrics (ALMA-inspired retrieval parameter evolution)
+        result = "\n\n".join(combined[:max_results])
+        try:
+            self._increment_memory_metric("search_calls")
+            if not result.strip():
+                self._increment_memory_metric("search_zero_results")
+        except Exception:
+            pass  # Metrics are supplementary — never fail the search
+        return result
 
     def _update_registry_active_branch(self, branch: str) -> None:
         path = os.path.join(self.branches_dir, "_registry.md")

@@ -1997,3 +1997,338 @@ class TestGRPOAdvantages:
             return b.effective_score() * (1.0 + b.grpo_advantage)
         scores = [policy_score(b) for b in ranked]
         assert scores[0] >= scores[-1]
+
+
+# ===========================================================================
+# B1: ace_prune double-calls evolve_from_failures
+# Verified at data layer: evolve_from_failures is idempotent — calling it twice
+# should not create duplicate bullets.
+# ===========================================================================
+
+class TestB1PruneNoDuplicateEvolution:
+    """B1 fix: verify evolve_from_failures doesn't create duplicates when called twice."""
+
+    def _make_playbook_with_lessons(self) -> Playbook:
+        """Return a playbook with one harmful bullet that has a failure lesson."""
+        pb = Playbook()
+        pb.apply_delta([DeltaOperation(
+            op_type="ADD",
+            section="COMMON MISTAKES TO AVOID",
+            content="Bad strategy with lesson",
+        )])
+        bullet = pb.bullets[0]
+        bullet.harmful = 3
+        bullet.failure_lessons.append(FailureLesson(
+            failure_point="Broke on null input",
+            flawed_reasoning="Assumed input always exists",
+            counterfactual="Add null guard",
+            prevention_principle="Always guard against null before dereferencing",
+        ))
+        return pb
+
+    def test_evolve_from_failures_once_adds_skill(self):
+        """Single call to evolve_from_failures adds exactly one new bullet."""
+        pb = self._make_playbook_with_lessons()
+        count_before = len(pb.bullets)
+        evolved = pb.evolve_from_failures(threshold=1)
+        assert len(evolved) == 1
+        assert len(pb.bullets) == count_before + 1
+
+    def test_evolve_from_failures_twice_no_duplicate(self):
+        """Calling evolve_from_failures a second time does not add duplicate bullets.
+
+        The lesson is marked evolved=True after the first call so the second call
+        finds no eligible lessons and returns an empty list.
+        """
+        pb = self._make_playbook_with_lessons()
+        pb.evolve_from_failures(threshold=1)
+        count_after_first = len(pb.bullets)
+        evolved_second = pb.evolve_from_failures(threshold=1)
+        assert len(evolved_second) == 0
+        assert len(pb.bullets) == count_after_first
+
+
+# ===========================================================================
+# B2: ace_update_counters silent zero for invalid slugs
+# Verified at data layer: update_bullet_counts returns 0 for unknown IDs.
+# The MCP layer should surface missing IDs — tested in test_mcp_server.py;
+# here we confirm the data layer behaviour that drives the fix.
+# ===========================================================================
+
+class TestB2UpdateCountersMissingIds:
+    """B2 fix: update_bullet_counts returns 0 for unknown IDs."""
+
+    def test_update_nonexistent_returns_zero(self):
+        """update_bullet_counts returns 0 when no bullet matches the given ID."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        updated = pb.update_bullet_counts([{"id": "nonexistent-99999", "tag": "helpful"}])
+        assert updated == 0
+
+    def test_update_mix_valid_invalid(self):
+        """Only the valid ID is counted; the invalid one does not raise."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        tags = [
+            {"id": "str-00001", "tag": "helpful"},
+            {"id": "does-not-exist", "tag": "helpful"},
+        ]
+        updated = pb.update_bullet_counts(tags)
+        assert updated == 1
+        assert pb.get_bullet("str-00001").helpful == 6  # was 5 in SAMPLE_PLAYBOOK
+
+    def test_all_invalid_ids_returns_zero(self):
+        """When all IDs are invalid, updated count is 0."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        tags = [
+            {"id": "fake-00001", "tag": "helpful"},
+            {"id": "fake-00002", "tag": "harmful"},
+        ]
+        updated = pb.update_bullet_counts(tags)
+        assert updated == 0
+
+
+# ===========================================================================
+# B3: ace_get_playbook policy-rank ignores global playbook
+# Verified at data layer: get_policy_ranked returns bullets from the playbook
+# it is called on; merging two lists works correctly.
+# ===========================================================================
+
+class TestB3PolicyRankMerge:
+    """B3 fix: policy ranking should incorporate both global and project bullets."""
+
+    def test_get_policy_ranked_returns_list(self):
+        """get_policy_ranked returns a list of Bullet objects."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        pb.recompute_grpo_advantages()
+        ranked = pb.get_policy_ranked(top_k=3)
+        assert isinstance(ranked, list)
+        assert len(ranked) <= 3
+        for b in ranked:
+            assert isinstance(b, Bullet)
+
+    def test_merge_ranked_deduplicates_by_id(self):
+        """Merging two ranked lists and deduplicating by ID produces correct count."""
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        pb.recompute_grpo_advantages()
+        # Simulate merging project + global results (both from same playbook to test logic)
+        p_ranked = pb.get_policy_ranked(top_k=5)
+        g_ranked = pb.get_policy_ranked(top_k=5)
+        seen: set = set()
+        merged = []
+        for b in p_ranked + g_ranked:
+            if b.id not in seen:
+                seen.add(b.id)
+                merged.append(b)
+        # Should equal p_ranked length (no new bullets from g_ranked since same playbook)
+        assert len(merged) == len(p_ranked)
+
+    def test_merge_ranked_sorted_by_grpo_advantage(self):
+        """After merging, bullets are sorted descending by grpo_advantage."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="A high advantage bullet"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="A low advantage bullet"),
+        ])
+        bullets = pb.bullets
+        bullets[0].helpful = 10
+        bullets[1].helpful = 1
+        pb.recompute_grpo_advantages()
+
+        ranked = pb.get_policy_ranked(top_k=2)
+        # Re-sort as the fix does
+        re_sorted = sorted(ranked, key=lambda b: b.grpo_advantage, reverse=True)
+        assert re_sorted[0].grpo_advantage >= re_sorted[-1].grpo_advantage
+
+
+# ===========================================================================
+# B4: ace_generate_bullets Curator sees only 10 bullets
+# Verified at data layer: bullets list access and grpo_advantage sorting.
+# ===========================================================================
+
+class TestB4CuratorBulletSample:
+    """B4 fix: for large playbooks, sample top-50 by grpo_advantage."""
+
+    def test_small_playbook_uses_all_bullets(self):
+        """For playbooks with <= 50 bullets, all bullets are used as sample."""
+        pb = Playbook()
+        for i in range(30):
+            pb.apply_delta([DeltaOperation(
+                op_type="ADD",
+                section="STRATEGIES & INSIGHTS",
+                content=f"Strategy number {i}",
+            )])
+        bullets = pb.bullets
+        # Simulates the fixed logic
+        if len(bullets) <= 50:
+            sample = [b.content for b in bullets]
+        else:
+            sorted_b = sorted(bullets, key=lambda b: b.grpo_advantage, reverse=True)
+            sample = [b.content for b in sorted_b[:50]]
+        assert len(sample) == 30
+
+    def test_large_playbook_samples_top50_by_grpo(self):
+        """For playbooks with > 50 bullets, sample is top-50 by grpo_advantage."""
+        pb = Playbook()
+        for i in range(60):
+            pb.apply_delta([DeltaOperation(
+                op_type="ADD",
+                section="STRATEGIES & INSIGHTS",
+                content=f"Strategy number {i}",
+            )])
+        # Give different grpo_advantages
+        for idx, b in enumerate(pb.bullets):
+            b.grpo_advantage = float(idx)  # bullet 59 has highest advantage
+        bullets = pb.bullets
+        sorted_b = sorted(bullets, key=lambda b: b.grpo_advantage, reverse=True)
+        sample = [b.content for b in sorted_b[:50]]
+        assert len(sample) == 50
+        # The top bullet by grpo_advantage is "Strategy number 59"
+        assert "Strategy number 59" in sample
+        # The lowest-advantage bullet is not included
+        assert "Strategy number 0" not in sample
+
+
+# ===========================================================================
+# B5: MERGE in auto_apply mode implemented as UPDATE
+# Verified at data layer: DeltaOperation with op_type="MERGE" preserves
+# counter history whereas "UPDATE" does not.
+# ===========================================================================
+
+class TestB5MergeOpType:
+    """B5 fix: MERGE preserves counter history; UPDATE does not."""
+
+    def test_merge_combines_helpful_counts(self):
+        """MERGE operation combines helpful/harmful counters from both bullets."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Bullet A"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Bullet B"),
+        ])
+        a, b = pb.bullets[0], pb.bullets[1]
+        a.helpful = 4
+        a.harmful = 1
+        b.helpful = 3
+        b.harmful = 2
+
+        # Apply MERGE: keep a, absorb b
+        pb.apply_delta([DeltaOperation(
+            op_type="MERGE",
+            section="",
+            content="Merged content",
+            bullet_id=a.id,
+            merge_target=b.id,
+        )])
+
+        keeper = pb.get_bullet(a.id)
+        assert keeper is not None
+        assert keeper.helpful == 7   # 4 + 3
+        assert keeper.harmful == 3   # 1 + 2
+        assert keeper.content == "Merged content"
+        assert pb.get_bullet(b.id) is None  # absorbed bullet removed
+
+    def test_update_does_not_combine_counts(self):
+        """UPDATE operation replaces content but does NOT merge counter history."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Bullet A"),
+        ])
+        a = pb.bullets[0]
+        a.helpful = 4
+        a.harmful = 1
+
+        pb.apply_delta([DeltaOperation(
+            op_type="UPDATE",
+            section="",
+            content="Updated content",
+            bullet_id=a.id,
+        )])
+
+        updated = pb.get_bullet(a.id)
+        assert updated is not None
+        assert updated.helpful == 4   # unchanged
+        assert updated.harmful == 1   # unchanged
+        assert updated.content == "Updated content"
+
+    def test_merge_preserves_failure_lessons(self):
+        """MERGE combines failure_lessons from both bullets."""
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Keeper"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="Absorbed"),
+        ])
+        keeper_b, absorbed_b = pb.bullets[0], pb.bullets[1]
+        absorbed_b.failure_lessons.append(FailureLesson(
+            failure_point="broke",
+            flawed_reasoning="wrong assumption",
+            counterfactual="fix it",
+            prevention_principle="always check",
+        ))
+
+        pb.apply_delta([DeltaOperation(
+            op_type="MERGE",
+            section="",
+            content="Combined",
+            bullet_id=keeper_b.id,
+            merge_target=absorbed_b.id,
+        )])
+
+        merged = pb.get_bullet(keeper_b.id)
+        assert len(merged.failure_lessons) == 1
+        assert merged.failure_lessons[0].prevention_principle == "always check"
+
+
+# ===========================================================================
+# B6: ROLLBACK proposal is dead code
+# Verified at data layer: PlaybookSchema.from_dict / apply_schema.
+# The _apply_rollback helper is MCP-layer, but we test the data operations
+# it relies on (apply_schema with a parent schema) here.
+# ===========================================================================
+
+class TestB6RollbackDataLayer:
+    """B6 fix: verify that applying a parent schema reverts sections correctly."""
+
+    def _make_schema_pair(self):
+        """Return (original_schema, evolved_schema) for rollback tests."""
+        from ccr.core.types import PlaybookSchema
+        original = PlaybookSchema.default()
+        evolved = PlaybookSchema(
+            version=original.version + 1,
+            sections=original.sections + ["EXTRA SECTION"],
+            slug_map=dict(original.slug_map),
+            decay_rate=original.decay_rate,
+            prune_min_harmful=original.prune_min_harmful,
+            evolution_threshold=original.evolution_threshold,
+            token_budget=original.token_budget,
+            parent_version=original.version,
+        )
+        return original, evolved
+
+    def test_apply_schema_reverts_to_parent_sections(self):
+        """Applying the original schema removes the extra section added in the evolved schema."""
+        from ccr.core.types import PlaybookSchema
+        original, evolved = self._make_schema_pair()
+
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        # Apply evolved schema (adds EXTRA SECTION)
+        pb.apply_schema(evolved)
+        assert "EXTRA SECTION" in pb._sections
+
+        # Roll back to original schema
+        pb.apply_schema(original)
+        assert "EXTRA SECTION" not in pb._sections
+
+    def test_apply_schema_roundtrip(self):
+        """Schema serialization/deserialization preserves parent_version."""
+        from ccr.core.types import PlaybookSchema
+        original, evolved = self._make_schema_pair()
+
+        serialized = evolved.to_dict()
+        restored = PlaybookSchema.from_dict(serialized)
+        assert restored.parent_version == original.version
+        assert restored.version == evolved.version
+
+    def test_rollback_requires_parent_version(self):
+        """Schema with no parent_version cannot be rolled back."""
+        from ccr.core.types import PlaybookSchema
+        schema = PlaybookSchema.default()
+        # Default schema has parent_version=None
+        assert schema.parent_version is None

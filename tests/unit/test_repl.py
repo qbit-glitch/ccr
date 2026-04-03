@@ -6,6 +6,7 @@ import tempfile
 
 import pytest
 
+from ccr.context.indexer import RepoIndex
 from ccr.core.types import REPLResult
 from ccr.rlm.repl import CCRRepl
 
@@ -753,3 +754,120 @@ class TestASTSandboxHardening:
         result = repl.execute_code("x.co_consts")
         assert result.error is not None
         assert "blocked" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# Bug A1: rlm_finalize must NOT destroy the session on a bad variable name
+# ---------------------------------------------------------------------------
+
+
+class TestREPLFinalizePreservation:
+    """Verify that _final_var with a bad name returns an error string but leaves
+    the REPL intact so subsequent calls can still access computed state."""
+
+    def test_final_var_nonexistent_returns_error_string(self):
+        """_final_var('nonexistent_variable') must return a string starting with 'Error:'."""
+        repl = CCRRepl()
+        repl.execute_code("real_answer = 42")
+        result = repl._final_var("nonexistent_variable")
+        assert result is not None
+        assert str(result).startswith("Error:")
+
+    def test_repl_still_usable_after_failed_final_var(self):
+        """After a failed _final_var call the REPL session is unaffected.
+
+        Previously set variables must still be accessible, and new code must
+        execute without errors.
+        """
+        repl = CCRRepl()
+        # Set a variable in the session
+        repl.execute_code("computed = 99")
+        # Attempt to retrieve a name that does not exist
+        bad_result = repl._final_var("nonexistent_variable")
+        assert str(bad_result).startswith("Error:")
+        # The session must still be alive — existing variable reachable
+        result = repl.execute_code("print(computed)")
+        assert result.error is None
+        assert "99" in result.stdout
+        # And new code runs fine too
+        result2 = repl.execute_code("new_var = computed + 1\nprint(new_var)")
+        assert result2.error is None
+        assert "100" in result2.stdout
+
+    def test_final_var_succeeds_after_failed_attempt(self):
+        """After a failed _final_var, the correct variable is still retrievable."""
+        repl = CCRRepl()
+        repl.execute_code("answer = 'success'")
+        # First call with wrong name — should not clobber state
+        bad = repl._final_var("wrong_name")
+        assert str(bad).startswith("Error:")
+        # Now retrieve with the correct name
+        good = repl._final_var("answer")
+        assert good == "success"
+
+
+# ---------------------------------------------------------------------------
+# Bug A2: search_repo must forward file_glob to RepoIndex.search
+# ---------------------------------------------------------------------------
+
+
+class TestSearchRepoFileGlob:
+    """Verify that _search_repo forwards the file_glob parameter to the underlying
+    RepoIndex.search call so that callers can restrict results by extension."""
+
+    def test_search_repo_respects_file_glob(self):
+        """Only .py files should be returned when file_glob='*.py'.
+
+        Both a .py file and a .yaml file contain the keyword 'myuniquekeyword'.
+        After filtering with '*.py', only the Python file must appear.
+        Note: the indexer uses fnmatch for glob matching, which does not support
+        '**' recursive patterns — use single-level globs like '*.py' instead.
+        """
+        keyword = "myuniquekeyword"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Python file containing the keyword
+            py_path = os.path.join(tmpdir, "code.py")
+            with open(py_path, "w") as f:
+                f.write(f"# {keyword}\ndef foo():\n    pass\n")
+
+            # YAML file also containing the keyword — must be excluded
+            yaml_path = os.path.join(tmpdir, "config.yaml")
+            with open(yaml_path, "w") as f:
+                f.write(f"key: {keyword}\n")
+
+            idx = RepoIndex.build(tmpdir)
+            repl = CCRRepl(repo_index=idx)
+
+            results = repl._search_repo(keyword, file_glob="*.py")
+            result_paths = [r["path"] for r in results]
+
+            # The .yaml file must NOT appear
+            assert not any(p.endswith(".yaml") for p in result_paths), (
+                f"YAML file leaked through glob filter: {result_paths}"
+            )
+            # The .py file MUST appear
+            assert any(p.endswith(".py") for p in result_paths), (
+                f"Expected a .py file in results but got: {result_paths}"
+            )
+
+    def test_search_repo_no_glob_returns_all_types(self):
+        """With default file_glob='**/*' results include all file types."""
+        keyword = "sharedterm"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_path = os.path.join(tmpdir, "module.py")
+            with open(py_path, "w") as f:
+                f.write(f"# {keyword}\ndef bar():\n    pass\n")
+
+            yaml_path = os.path.join(tmpdir, "settings.yaml")
+            with open(yaml_path, "w") as f:
+                f.write(f"setting: {keyword}\n")
+
+            idx = RepoIndex.build(tmpdir)
+            repl = CCRRepl(repo_index=idx)
+
+            results = repl._search_repo(keyword)  # default glob
+            result_paths = [r["path"] for r in results]
+
+            # Both file types should be present (no filtering)
+            assert any(p.endswith(".py") for p in result_paths)
+            assert any(p.endswith(".yaml") for p in result_paths)
