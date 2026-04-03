@@ -315,7 +315,18 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
         lines.append(f"  A: {a.content[:100]}")
         lines.append(f"  B: {b.content[:100]}")
     text = "\n".join(lines)
-    return AceFindSimilarResult(pairs_found=len(pairs), scope=scope, message=text)
+    pairs_list = []
+    for a, b, sim in pairs[:25]:
+        score_a = a.effective_score() * (1.0 + a.grpo_advantage)
+        score_b = b.effective_score() * (1.0 + b.grpo_advantage)
+        pairs_list.append({
+            "a_id": a.id, "b_id": b.id,
+            "similarity": round(sim, 3),
+            "a_content": a.content[:120],
+            "b_content": b.content[:120],
+            "recommended_keep": a.id if score_a >= score_b else b.id,
+        })
+    return AceFindSimilarResult(pairs_found=len(pairs), scope=scope, pairs=pairs_list, message=text)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
@@ -346,13 +357,25 @@ def ace_prune(scope: str = "project") -> AcePruneResult:
             )
             save_fn()
         total = len(pruned) + len(budget_pruned)
+        removed_ids = [b.id for b in pruned] + [b.id for b in budget_pruned]
         parts = []
         if evolved:
             parts.append(f"Evolved {len(evolved)} new skill(s) from failure lessons.")
-        parts.append(f"Pruned {total} bullet(s) from {scope} playbook. Now has {len(pb.bullets)} bullets.")
+        parts.append(
+            f"Pruned {total} bullet(s) ({', '.join(removed_ids) if removed_ids else 'none'}) "
+            f"from {scope} playbook. Now has {len(pb.bullets)} bullets."
+        )
         text = " ".join(parts)
 
-        return AcePruneResult(removed=total, evolved=len(evolved), scope=scope, message=text)
+        result: AcePruneResult = {
+            "removed": total,
+            "evolved": len(evolved),
+            "scope": scope,
+            "message": text,
+        }
+        if removed_ids:
+            result["removed_ids"] = removed_ids
+        return result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -517,11 +540,12 @@ def _ace_curator(existing_bullets: list[str], candidates: list[str], sub_client)
     try:
         if not candidates:
             return []
-        existing_sample = "\n".join(f"- {b}" for b in existing_bullets[:10])
+        existing_sample = "\n".join(f"- {b}" for b in existing_bullets)
+        n_shown = len(existing_bullets)
         numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
         prompt = (
             "For each candidate strategy bullet, decide: ADD (novel), MERGE (similar to existing), SKIP (duplicate).\n\n"
-            f"Existing bullets (first 10):\n{existing_sample}\n\n"
+            f"Existing bullets (top {n_shown}):\n{existing_sample}\n\n"
             f"Candidates:\n{numbered}\n\n"
             'Respond with JSON: [{"bullet": "...", "action": "ADD"|"MERGE"|"SKIP", "merge_with": "existing bullet text if MERGE else null"}]'
         )
@@ -576,10 +600,13 @@ def _run_ace_pipeline(title: str, what: str, why: str, sub_client) -> None:
         if not filtered:
             return
 
-        # Step 3: Curator
+        # Step 3: Curator — pass up to 50 bullets sorted by grpo_advantage (matches ace_generate_bullets logic)
         with _srv._state_lock:
             pb = _srv._ensure_playbook()
-        existing_sample = [b.content for b in pb.bullets[:10]]
+        if len(pb.bullets) <= 50:
+            existing_sample = [b.content for b in pb.bullets]
+        else:
+            existing_sample = [b.content for b in sorted(pb.bullets, key=lambda b: b.grpo_advantage, reverse=True)[:50]]
         decisions = _ace_curator(existing_sample, filtered, sub_client)
 
         # Step 4: Apply decisions
@@ -941,6 +968,57 @@ def _apply_rollback(pb, schema, history, save_fn, sp, max_hist: int = 20) -> Ace
     )
 
 
+def _build_retrieval_proposals(metrics, schema, sc: int) -> list:
+    """Build schema proposals for retrieval tuning (ADJUST_SEARCH_THRESHOLD, ADJUST_SCAN_WINDOW).
+
+    Deduplicates the near-identical ALMA-inspired retrieval proposal blocks that appear
+    in both the apply_proposal path and the evaluation path of ace_evolve_schema.
+
+    Args:
+        metrics: SchemaMetrics with search_zero_rate and link_density populated.
+        schema: Current PlaybookSchema with link_semantic_threshold and link_scan_window.
+        sc: Number of search_calls from memory metrics (gates ADJUST_SCAN_WINDOW).
+
+    Returns:
+        List of SchemaProposal objects (0-1 entries).
+    """
+    from ccr.core.types import SchemaProposal
+    proposals = []
+    if metrics.search_zero_rate > 0.5 and schema.link_semantic_threshold > 0.05:
+        new_thresh = round(schema.link_semantic_threshold - 0.05, 2)
+        proposals.append(SchemaProposal(
+            change_type="ADJUST_SEARCH_THRESHOLD",
+            description=(
+                f"{metrics.search_zero_rate:.0%} of searches returned zero results. "
+                f"Propose lowering link_semantic_threshold from "
+                f"{schema.link_semantic_threshold} to {new_thresh} "
+                f"(more permissive matching)."
+            ),
+            details={
+                "old_threshold": schema.link_semantic_threshold,
+                "new_threshold": new_thresh,
+            },
+            confidence=min(1.0, (metrics.search_zero_rate - 0.5) / 0.3),
+        ))
+    elif metrics.link_density < 0.5 and sc > 0:
+        new_window = schema.link_scan_window + 5
+        proposals.append(SchemaProposal(
+            change_type="ADJUST_SCAN_WINDOW",
+            description=(
+                f"Link density is {metrics.link_density:.2f} links/commit (below 0.5). "
+                f"Propose increasing link_scan_window from "
+                f"{schema.link_scan_window} to {new_window} "
+                f"(scan more history for cross-links)."
+            ),
+            details={
+                "old_window": schema.link_scan_window,
+                "new_window": new_window,
+            },
+            confidence=min(1.0, (0.5 - metrics.link_density) / 0.3),
+        ))
+    return proposals
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 def ace_evolve_schema(
     scope: str = "project",
@@ -993,7 +1071,6 @@ def ace_evolve_schema(
 
             if apply_proposal is not None:
                 # Re-compute proposals to validate index
-                from ccr.core.types import SchemaProposal
                 proposals = pb.propose_schema_changes(
                     schema, metrics,
                     overflow_threshold=0.5,
@@ -1003,30 +1080,7 @@ def ace_evolve_schema(
                 )
                 # Append ALMA-inspired retrieval parameter proposals
                 if not proposals:
-                    if metrics.search_zero_rate > 0.5 and schema.link_semantic_threshold > 0.05:
-                        new_thresh = round(schema.link_semantic_threshold - 0.05, 2)
-                        proposals.append(SchemaProposal(
-                            change_type="ADJUST_SEARCH_THRESHOLD",
-                            description=(
-                                f"{metrics.search_zero_rate:.0%} of searches returned zero results. "
-                                f"Propose lowering link_semantic_threshold from "
-                                f"{schema.link_semantic_threshold} to {new_thresh}."
-                            ),
-                            details={"old_threshold": schema.link_semantic_threshold, "new_threshold": new_thresh},
-                            confidence=min(1.0, (metrics.search_zero_rate - 0.5) / 0.3),
-                        ))
-                    elif metrics.link_density < 0.5 and sc > 0:
-                        new_window = schema.link_scan_window + 5
-                        proposals.append(SchemaProposal(
-                            change_type="ADJUST_SCAN_WINDOW",
-                            description=(
-                                f"Link density is {metrics.link_density:.2f} links/commit. "
-                                f"Propose increasing link_scan_window from "
-                                f"{schema.link_scan_window} to {new_window}."
-                            ),
-                            details={"old_window": schema.link_scan_window, "new_window": new_window},
-                            confidence=min(1.0, (0.5 - metrics.link_density) / 0.3),
-                        ))
+                    proposals.extend(_build_retrieval_proposals(metrics, schema, sc))
                 idx = apply_proposal - 1
                 if idx < 0 or idx >= len(proposals):
                     return AceEvolveSchemaResult(
@@ -1145,41 +1199,9 @@ def ace_evolve_schema(
             )
 
             # ALMA-inspired: propose retrieval parameter adjustments from memory metrics
-            from ccr.core.types import SchemaProposal
+            # Only propose retrieval adjustments when no structural proposals pending
             if not proposals:
-                # Only propose retrieval adjustments when no structural proposals pending
-                if metrics.search_zero_rate > 0.5 and schema.link_semantic_threshold > 0.05:
-                    new_thresh = round(schema.link_semantic_threshold - 0.05, 2)
-                    proposals.append(SchemaProposal(
-                        change_type="ADJUST_SEARCH_THRESHOLD",
-                        description=(
-                            f"{metrics.search_zero_rate:.0%} of searches returned zero results. "
-                            f"Propose lowering link_semantic_threshold from "
-                            f"{schema.link_semantic_threshold} to {new_thresh} "
-                            f"(more permissive matching)."
-                        ),
-                        details={
-                            "old_threshold": schema.link_semantic_threshold,
-                            "new_threshold": new_thresh,
-                        },
-                        confidence=min(1.0, (metrics.search_zero_rate - 0.5) / 0.3),
-                    ))
-                elif metrics.link_density < 0.5 and sc > 0:
-                    new_window = schema.link_scan_window + 5
-                    proposals.append(SchemaProposal(
-                        change_type="ADJUST_SCAN_WINDOW",
-                        description=(
-                            f"Link density is {metrics.link_density:.2f} links/commit (below 0.5). "
-                            f"Propose increasing link_scan_window from "
-                            f"{schema.link_scan_window} to {new_window} "
-                            f"(scan more history for cross-links)."
-                        ),
-                        details={
-                            "old_window": schema.link_scan_window,
-                            "new_window": new_window,
-                        },
-                        confidence=min(1.0, (0.5 - metrics.link_density) / 0.3),
-                    ))
+                proposals.extend(_build_retrieval_proposals(metrics, schema, sc))
 
             parts = [
                 f"# Schema Health Report (v{schema.version})",

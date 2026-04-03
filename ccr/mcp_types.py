@@ -121,6 +121,7 @@ class AceUpdateCountersResult(TypedDict):
 class AceFindSimilarResult(TypedDict):
     pairs_found: int
     scope: str
+    pairs: NotRequired[list[dict]]
     message: str
 
 
@@ -128,6 +129,7 @@ class AcePruneResult(TypedDict):
     removed: int
     evolved: int
     scope: str
+    removed_ids: NotRequired[list[str]]
     message: str
 
 
@@ -157,6 +159,7 @@ class AceEvolveSchemaResult(TypedDict):
 class RlmInitResult(TypedDict):
     session_id: str
     file_count: int
+    session_replaced: bool
     message: str
 
 
@@ -184,4 +187,15 @@ class IndexBuildResult(TypedDict):
 class IndexSearchResult(TypedDict):
     result_count: int
     mode: str
+    message: str
+
+
+class IndexStatusResult(TypedDict):
+    built_at: str           # ISO timestamp or "never"
+    file_count: int
+    embeddings_available: bool
+    bm25_cache_built: bool
+    chunk_embeddings_available: bool
+    chunk_count: int
+    is_stale: bool
     message: str

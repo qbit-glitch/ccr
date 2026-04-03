@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
@@ -25,7 +26,7 @@ import ccr.mcp.server as _srv
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def rlm_init(task_prompt: str) -> RlmInitResult:
+def rlm_init(task_prompt: str, timeout_seconds: int = 30) -> RlmInitResult:
     """Initialize a sandboxed Python REPL for structured problem-solving.
 
     Provides the REPL execution component from the RLM paper (arXiv:2512.24601).
@@ -46,21 +47,31 @@ def rlm_init(task_prompt: str) -> RlmInitResult:
 
     Args:
         task_prompt: The problem or question to solve.
+        timeout_seconds: Maximum execution time per rlm_execute call, in seconds (default 30).
     """
     try:
         with _srv._state_lock:
             idx = _srv._ensure_index()
 
+            # Track whether we are replacing an active session
+            session_replaced = False
+
             # Clean up previous REPL if any
             if _srv._repl is not None:
                 _srv._repl.cleanup()
+                session_replaced = True
 
             # Kernel sandbox runs code in a subprocess, which means in-process tools
             # (search_repo, get_file, etc.) are NOT available there. Use Python-level
             # sandboxing (AST validation + restricted builtins) for the RLM REPL,
             # which needs these tools. The kernel sandbox is available for standalone
             # code execution via KernelSandbox directly.
-            _srv._repl = CCRRepl(repo_index=idx, project_root=_srv._project_root, use_kernel_sandbox=False)
+            _srv._repl = CCRRepl(
+                repo_index=idx,
+                project_root=_srv._project_root,
+                use_kernel_sandbox=False,
+                timeout_seconds=float(timeout_seconds),
+            )
             _srv._repl.locals["task_prompt"] = task_prompt
 
         # Load playbook as variable if available
@@ -78,8 +89,17 @@ def rlm_init(task_prompt: str) -> RlmInitResult:
             f"- context: repo metadata ({file_count} files indexed)\n"
             f"- Tools: get_file(), search_repo(), estimate_tokens(), FINAL_VAR(), SHOW_VARS()\n"
             f"\nUse rlm_execute to run code. Use rlm_finalize when done."
+            f" Timeout: {timeout_seconds}s."
         )
-        return RlmInitResult(session_id=f"rlm-{id(_srv._repl)}", file_count=file_count, message=text)
+        if session_replaced:
+            text = "Warning: Previous REPL session was replaced. " + text
+
+        return RlmInitResult(
+            session_id=f"rlm-{uuid.uuid4().hex[:12]}",
+            file_count=file_count,
+            session_replaced=session_replaced,
+            message=text,
+        )
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -116,7 +136,7 @@ def _summarize_stdout(stdout: str, threshold: int = 1000) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def rlm_execute(code: str, metadata_only: bool = True) -> RlmExecuteResult:
+def rlm_execute(code: str, metadata_only: bool = True, output_limit: int = 1000) -> RlmExecuteResult:
     """Execute Python code in the sandboxed REPL.
 
     The REPL persists variables across calls. Use it to:
@@ -130,9 +150,11 @@ def rlm_execute(code: str, metadata_only: bool = True) -> RlmExecuteResult:
 
     Args:
         code: Python code to execute.
-        metadata_only: If True (default), stdout exceeding 1000 chars is
+        metadata_only: If True (default), stdout exceeding output_limit chars is
             replaced with a metadata summary (line count, char count, first/last
             5 lines). Set to False to return full stdout regardless of length.
+        output_limit: Character threshold for stdout summarization when
+            metadata_only is True (default 1000).
     """
     try:
         with _srv._state_lock:
@@ -146,7 +168,7 @@ def rlm_execute(code: str, metadata_only: bool = True) -> RlmExecuteResult:
         if result.stdout.strip():
             stdout = result.stdout.strip()
             if metadata_only:
-                stdout = _summarize_stdout(stdout)
+                stdout = _summarize_stdout(stdout, threshold=output_limit)
             parts.append(f"stdout: {stdout}")
 
         if result.error:
@@ -157,7 +179,7 @@ def rlm_execute(code: str, metadata_only: bool = True) -> RlmExecuteResult:
 
         if result.locals_snapshot:
             var_summary = ", ".join(
-                f"{k}: {v[:60]}" for k, v in list(result.locals_snapshot.items())[:10]
+                f"{k}: {v[:60]}" for k, v in list(result.locals_snapshot.items())[:20]
             )
             parts.append(f"vars: {var_summary}")
 
@@ -178,14 +200,17 @@ def rlm_execute(code: str, metadata_only: bool = True) -> RlmExecuteResult:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
-def rlm_finalize(variable_name: str) -> RlmFinalizeResult:
+def rlm_finalize(variable_name: str, keep_session: bool = False) -> RlmFinalizeResult:
     """Finalize the REPL session and return a variable's value as the result.
 
     Calls FINAL_VAR internally to extract and serialize the named variable.
-    Cleans up the REPL after extraction.
+    By default, cleans up the REPL after extraction. Set keep_session=True
+    to extract a variable without destroying the session.
 
     Args:
         variable_name: Name of the variable to return.
+        keep_session: If True, preserve the REPL session after extraction so
+            that rlm_execute or rlm_finalize can be called again (default False).
     """
     try:
         with _srv._state_lock:
@@ -205,10 +230,15 @@ def rlm_finalize(variable_name: str) -> RlmFinalizeResult:
         if answer is None or str(answer).startswith("Error:"):
             raise ToolError(f"Variable '{variable_name}' not found in REPL session. Session preserved.")
 
-        # Only destroy session after confirming successful retrieval
-        with _srv._state_lock:
-            repl_ref.cleanup()
-            _srv._repl = None  # M4: Reset _repl after cleanup
+        # Only destroy session after confirming successful retrieval, and only when
+        # keep_session is False.
+        if not keep_session:
+            with _srv._state_lock:
+                repl_ref.cleanup()
+                _srv._repl = None  # M4: Reset _repl after cleanup
+
+        if keep_session:
+            answer = answer + " Session preserved — call rlm_finalize again or rlm_execute to continue."
 
         return RlmFinalizeResult(variable_name=variable_name, message=answer)
     except ValueError:

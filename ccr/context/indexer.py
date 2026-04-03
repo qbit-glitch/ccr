@@ -564,73 +564,83 @@ class RepoIndex:
         semantic_weight: float = 0.7,
         return_snippets: bool = False,
     ) -> list[dict]:
-        """Combine keyword + semantic scores (CCR's own score-fusion design).
+        """Combine keyword + semantic results via Reciprocal Rank Fusion (RRF).
 
-        Normalizes both score types to [0,1] and combines with weights.
         Uses ONNX embeddings if model + embeddings available, else BM25.
+        RRF k=60 is the standard constant from Cormack et al. (2009) —
+        avoids the normalisation instability of linear score combination.
 
         When return_snippets=True and chunk embeddings are available, uses
         chunk-level semantic search (A-RAG §3.2) and attaches snippet field
         to results.
 
-        Note: A-RAG (arXiv:2602.03442) uses agent-driven tool selection
-        (the agent chooses keyword_search vs semantic_search per step).
-        This mechanical score fusion is CCR's own approach.
+        Note: keyword_weight / semantic_weight params are kept for API
+        compatibility but are no longer used in scoring (RRF is rank-only).
         """
-        # Keyword scores
+        # Keyword ranked list
         kw_results = self.search(query, file_glob=file_glob)
-        max_kw = 9.0  # path(3) + symbol(5) + content(1)
-        kw_scores: dict[str, float] = {
-            r["path"]: r["score"] / max_kw for r in kw_results
-        }
 
         # Snippet map from chunk search (if requested)
         snippet_map: dict[str, str] = {}
 
-        # Semantic scores
-        sem_scores: dict[str, float] = {}
+        # Semantic ranked list
+        sem_results_ordered: list[dict] = []
         if return_snippets and model is not None and self._chunk_embeddings:
             # Use chunk-level semantic search (A-RAG §3.2)
             chunk_results = self.chunk_semantic_search(query, model, top_k=100)
+            seen_paths: dict[str, float] = {}
             for r in chunk_results:
                 path = r["path"]
                 score = r["score"]
-                # Keep best chunk score per file
-                if path not in sem_scores or score > sem_scores[path]:
-                    sem_scores[path] = score
-                # Keep snippet from best-scoring chunk per file
-                if path not in snippet_map or score > sem_scores.get(path, 0):
+                # Keep best chunk score per file (for de-duplication rank ordering)
+                if path not in seen_paths or score > seen_paths[path]:
+                    seen_paths[path] = score
                     snippet_map[path] = r["snippet"]
+            # Re-order by best chunk score so rank dict is meaningful
+            sem_results_ordered = sorted(
+                [{"path": p, "score": s} for p, s in seen_paths.items()],
+                key=lambda r: r["score"],
+                reverse=True,
+            )
         elif model is not None and self._embeddings:
-            sem_results = self.semantic_search(
+            sem_results_ordered = self.semantic_search(
                 query, model, top_k=100, file_glob=file_glob
             )
-            for r in sem_results:
-                sem_scores[r["path"]] = r["score"]
         else:
-            # BM25 fallback — normalize by max score
-            bm25_results = self.bm25_search(query, top_k=100, file_glob=file_glob)
-            if bm25_results:
-                max_bm25 = bm25_results[0]["score"]
-                if max_bm25 > 0:
-                    for r in bm25_results:
-                        sem_scores[r["path"]] = r["score"] / max_bm25
+            # BM25 fallback
+            sem_results_ordered = self.bm25_search(query, top_k=100, file_glob=file_glob)
 
-        # Combine
-        all_paths = set(kw_scores.keys()) | set(sem_scores.keys())
+        # Reciprocal Rank Fusion (RRF k=60, Cormack et al. 2009)
+        RRF_K = 60
+        kw_rank = {r["path"]: i for i, r in enumerate(kw_results)}
+        sem_rank = {r["path"]: i for i, r in enumerate(sem_results_ordered)}
+
+        all_paths = set(kw_rank) | set(sem_rank)
+        rrf_scores: dict[str, float] = {}
+        for path in all_paths:
+            score = 0.0
+            if path in kw_rank:
+                score += 1.0 / (RRF_K + kw_rank[path])
+            if path in sem_rank:
+                score += 1.0 / (RRF_K + sem_rank[path])
+            rrf_scores[path] = score
+
+        # Build merged result list, preserving all metadata
+        all_results_meta: dict[str, dict] = {r["path"]: r for r in kw_results}
+        for r in sem_results_ordered:
+            if r["path"] not in all_results_meta:
+                all_results_meta[r["path"]] = r
+
         combined: list[dict] = []
         for path in all_paths:
-            kw = kw_scores.get(path, 0.0)
-            sem = sem_scores.get(path, 0.0)
-            final = keyword_weight * kw + semantic_weight * sem
-            if final <= 0:
+            if rrf_scores[path] <= 0:
                 continue
             entry = self.files.get(path)
             if entry is None:
                 continue
             result: dict = {
                 "path": path,
-                "score": round(final, 4),
+                "score": round(rrf_scores[path], 6),
                 "language": entry.language,
                 "symbols": entry.symbols[:10],
                 "size": entry.size_bytes,
@@ -823,6 +833,7 @@ class RepoIndex:
         data = {
             "root": self.root,
             "built_at": self._built_at,
+            "mtime_sig": self._mtime_sig or "",
             "file_count": len(self.files),
             "files": {},
         }
@@ -896,6 +907,7 @@ class RepoIndex:
                     line_count=fdata.get("lines", 0),
                 )
             index._built_at = data.get("built_at")
+            index._mtime_sig = data.get("mtime_sig", "")
             return index
         except (json.JSONDecodeError, KeyError):
             return None

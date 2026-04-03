@@ -10,6 +10,7 @@ from ccr.mcp.server import mcp
 from ccr.mcp_types import (
     IndexBuildResult,
     IndexSearchResult,
+    IndexStatusResult,
 )
 
 # Import server module to access mutable globals via attribute
@@ -22,7 +23,10 @@ import ccr.mcp.server as _srv
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def index_build() -> IndexBuildResult:
+def index_build(
+    incremental: bool = False,
+    filter_extensions: str = "",
+) -> IndexBuildResult:
     """Build or rebuild the repo index.
 
     Scans the project directory for source files, extracts symbols (classes,
@@ -31,10 +35,52 @@ def index_build() -> IndexBuildResult:
 
     If onnxruntime + tokenizers are installed, also computes dense embeddings
     for semantic search (A-RAG §3.1). Otherwise, BM25 fallback is available.
+
+    Args:
+        incremental: If True, skip rebuild when file mtimes are unchanged
+            since the last index build. Useful for large repos on repeated
+            sessions. Falls through to full rebuild on any error.
+        filter_extensions: Comma-separated list of file extensions to index
+            (e.g. "py,ts,go"). Leading dots optional. Empty means all files.
     """
+    # Parse filter_extensions
+    exts: set[str] | None = None
+    if filter_extensions.strip():
+        exts = {
+            ("." + e.strip().lstrip("."))
+            for e in filter_extensions.split(",")
+            if e.strip()
+        } or None
+
     try:
+        # Incremental mode: skip rebuild if mtime signature unchanged
+        if incremental:
+            cache_json = None
+            try:
+                mem = _srv._ensure_memory()
+                cache_json = mem.load_index()
+            except Exception:
+                pass
+            if cache_json:
+                try:
+                    cached = RepoIndex.from_cache(_srv._project_root, cache_json)
+                    if cached is not None:
+                        live_sig = cached._compute_mtime_sig()
+                        if live_sig == cached._mtime_sig and cached._mtime_sig:
+                            with _srv._state_lock:
+                                _srv._repo_index = cached
+                            return IndexBuildResult(
+                                files_indexed=len(cached.files),
+                                message=(
+                                    f"Index up to date ({len(cached.files)} files,"
+                                    " no rebuild needed)."
+                                ),
+                            )
+                except Exception:
+                    pass  # Fall through to full rebuild
+
         with _srv._state_lock:  # H2: protect global state mutation
-            _srv._repo_index = RepoIndex.build(_srv._project_root)
+            _srv._repo_index = RepoIndex.build(_srv._project_root, extensions=exts)
 
             # Cache
             mem = _srv._ensure_memory()
@@ -149,3 +195,63 @@ def index_search(
             lines.append(f"  snippet: {r['snippet']}")
     text = "\n".join(lines)
     return IndexSearchResult(result_count=len(results), mode=mode, message=text)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def index_status() -> IndexStatusResult:
+    """Return current state of the repo index — staleness, embeddings, file count.
+
+    Use to check whether index_build is needed before running index_search.
+    Reports file count, build timestamp, embedding availability, and whether
+    the index is stale (file mtimes have changed since last build).
+    """
+    try:
+        idx = _srv._repo_index
+        if idx is None:
+            return IndexStatusResult(
+                built_at="never",
+                file_count=0,
+                embeddings_available=False,
+                bm25_cache_built=False,
+                chunk_embeddings_available=False,
+                chunk_count=0,
+                is_stale=True,
+                message="Index not built. Call index_build first.",
+            )
+
+        built_at = ""
+        if getattr(idx, "_built_at", None):
+            from datetime import datetime, timezone
+            built_at = datetime.fromtimestamp(idx._built_at, tz=timezone.utc).isoformat()
+
+        file_count = len(idx.files) if hasattr(idx, "files") else 0
+        embeddings_available = bool(getattr(idx, "_embeddings", {}))
+        bm25_cache_built = getattr(idx, "_bm25_cache", None) is not None
+        chunk_embeddings_available = bool(getattr(idx, "_chunk_embeddings", {}))
+        chunk_count = len(getattr(idx, "_chunk_embeddings", {}))
+
+        # Staleness: compare live mtime_sig to stored one
+        is_stale = True
+        if hasattr(idx, "_compute_mtime_sig") and hasattr(idx, "_mtime_sig"):
+            live_sig = idx._compute_mtime_sig()
+            is_stale = (live_sig != idx._mtime_sig) or not idx._mtime_sig
+
+        status = "stale" if is_stale else "up to date"
+        msg = (
+            f"Index {status}. {file_count} files indexed"
+            + (f", built at {built_at}" if built_at else "")
+            + (f". {chunk_count} chunk embeddings." if chunk_embeddings_available else ".")
+            + ("" if not is_stale else " Run index_build to refresh.")
+        )
+        return IndexStatusResult(
+            built_at=built_at,
+            file_count=file_count,
+            embeddings_available=embeddings_available,
+            bm25_cache_built=bm25_cache_built,
+            chunk_embeddings_available=chunk_embeddings_available,
+            chunk_count=chunk_count,
+            is_stale=is_stale,
+            message=msg,
+        )
+    except Exception as e:
+        raise ToolError(f"{type(e).__name__}: {e}") from e

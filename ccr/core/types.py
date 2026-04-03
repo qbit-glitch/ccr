@@ -236,7 +236,13 @@ class PatternEntry:
     commit_ids: list[str] = field(default_factory=list)
     occurrence_count: int = 1
     created_at: str = ""      # ISO-8601
+    last_seen: str = ""       # ISO-8601 timestamp of most recent occurrence
     promoted: bool = False    # True after promotion suggestion delivered
+    # Quality scoring (EvolveR-inspired, arXiv:2510.16079)
+    success_count: int = 0       # Times associated promoted bullet tagged helpful
+    failure_count: int = 0       # Times associated promoted bullet tagged harmful
+    quality_score: float = 0.5   # Bayesian: (success+1) / (success+failure+2)
+    last_quality_update: str = ""  # ISO-8601
 
     def to_dict(self) -> dict:
         return {
@@ -245,7 +251,12 @@ class PatternEntry:
             "commit_ids": list(self.commit_ids),
             "occurrence_count": self.occurrence_count,
             "created_at": self.created_at,
+            "last_seen": self.last_seen,
             "promoted": self.promoted,
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "quality_score": self.quality_score,
+            "last_quality_update": self.last_quality_update,
         }
 
     @classmethod
@@ -256,7 +267,12 @@ class PatternEntry:
             commit_ids=d.get("commit_ids", []),
             occurrence_count=d.get("occurrence_count", 1),
             created_at=d.get("created_at", ""),
+            last_seen=d.get("last_seen", ""),
             promoted=d.get("promoted", False),
+            success_count=d.get("success_count", 0),
+            failure_count=d.get("failure_count", 0),
+            quality_score=d.get("quality_score", 0.5),
+            last_quality_update=d.get("last_quality_update", ""),
         )
 
 
@@ -278,6 +294,10 @@ class SchemaMetrics:
     total_bullets: int = 0
     total_sections: int = 0
     timestamp: str = ""               # ISO-8601
+    # ALMA-inspired memory retrieval metrics (MCE §3.9)
+    search_zero_rate: float = 0.0     # Fraction of searches returning zero results
+    link_density: float = 0.0         # Average links per commit
+    embedding_coverage: float = 0.0   # Fraction of commits with embeddings
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -292,6 +312,9 @@ class SchemaMetrics:
             "total_bullets": self.total_bullets,
             "total_sections": self.total_sections,
             "timestamp": self.timestamp,
+            "search_zero_rate": self.search_zero_rate,
+            "link_density": self.link_density,
+            "embedding_coverage": self.embedding_coverage,
         }
 
     @classmethod
@@ -308,6 +331,9 @@ class SchemaMetrics:
             total_bullets=d.get("total_bullets", 0),
             total_sections=d.get("total_sections", 0),
             timestamp=d.get("timestamp", ""),
+            search_zero_rate=d.get("search_zero_rate", 0.0),
+            link_density=d.get("link_density", 0.0),
+            embedding_coverage=d.get("embedding_coverage", 0.0),
         )
 
 
@@ -360,6 +386,11 @@ class PlaybookSchema:
     change_description: str = ""
     created_at: str = ""
     baseline_metrics: SchemaMetrics | None = None
+    # ALMA-inspired memory retrieval parameters (MCE §3.9)
+    link_scan_window: int = 20
+    link_semantic_threshold: float = 0.3
+    context_level_default: int = 2
+    search_result_limit: int = 5
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -373,6 +404,10 @@ class PlaybookSchema:
             "parent_version": self.parent_version,
             "change_description": self.change_description,
             "created_at": self.created_at,
+            "link_scan_window": self.link_scan_window,
+            "link_semantic_threshold": self.link_semantic_threshold,
+            "context_level_default": self.context_level_default,
+            "search_result_limit": self.search_result_limit,
         }
         if self.baseline_metrics is not None:
             d["baseline_metrics"] = self.baseline_metrics.to_dict()
@@ -393,6 +428,10 @@ class PlaybookSchema:
             change_description=d.get("change_description", ""),
             created_at=d.get("created_at", ""),
             baseline_metrics=SchemaMetrics.from_dict(bm) if bm else None,
+            link_scan_window=d.get("link_scan_window", 20),
+            link_semantic_threshold=d.get("link_semantic_threshold", 0.3),
+            context_level_default=d.get("context_level_default", 2),
+            search_result_limit=d.get("search_result_limit", 5),
         )
 
     @classmethod

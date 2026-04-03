@@ -288,8 +288,8 @@ class CCRRepl:
 
     Tools available in the REPL:
         context           — repo index dict (file metadata, symbols, imports)
-        get_file(path)    — fetch full content of any indexed file
-        search_repo(q)    — search files by content/symbol/path
+        get_file(path, offset=0, limit=0) — fetch content of any indexed file (paginated)
+        search_repo(q, mode="keyword"|"bm25"|"semantic"|"hybrid") — search files
         estimate_tokens(t)— estimate token count of a string
         llm_query(prompt) — one-shot LLM call to the sub-model
         rlm_query(prompt) — recursive RLM sub-call (spawns child orchestrator)
@@ -456,21 +456,49 @@ class CCRRepl:
         """Batch RLM sub-calls — runs sequentially."""
         return [self._rlm_query(p, model) for p in prompts]
 
-    def _get_file(self, path: str) -> str:
-        """Get full content of an indexed file."""
+    def _get_file(self, path: str, offset: int = 0, limit: int = 0) -> str:
+        """Get content of an indexed file, with optional pagination.
+
+        Args:
+            path: Path to the file within the repo.
+            offset: Number of lines to skip from the start (default 0 — no skip).
+            limit: Maximum number of lines to return (default 0 — return all).
+        """
         if self.repo_index is None:
             return "Error: No repo index loaded"
         if hasattr(self.repo_index, "get_file"):
             content = self.repo_index.get_file(path)
-            return content if content is not None else f"Error: File not found: {path}"
+            if content is None:
+                return f"Error: File not found: {path}"
+            if offset > 0 or limit > 0:
+                lines = content.splitlines(keepends=True)
+                if offset > 0:
+                    lines = lines[offset:]
+                if limit > 0:
+                    lines = lines[:limit]
+                return "".join(lines)
+            return content
         return "Error: Repo index does not support get_file()"
 
-    def _search_repo(self, query: str, file_glob: str = "**/*") -> list[dict]:
-        """Search files by content, symbol, or path pattern."""
+    def _search_repo(self, query: str, file_glob: str = "**/*", mode: str = "keyword") -> list[dict]:
+        """Search files by content, symbol, or path pattern.
+
+        Args:
+            query: Search query string.
+            file_glob: Glob pattern to filter files (default "**/*").
+            mode: "keyword" (default), "bm25", "semantic", or "hybrid".
+        """
         if self.repo_index is None:
             return []
-        if hasattr(self.repo_index, "search"):
-            return self.repo_index.search(query, file_glob=file_glob)
+        idx = self.repo_index
+        if mode == "bm25" and hasattr(idx, "bm25_search"):
+            return idx.bm25_search(query, file_glob=file_glob)
+        if mode == "semantic" and hasattr(idx, "semantic_search"):
+            return idx.semantic_search(query, file_glob=file_glob)
+        if mode == "hybrid" and hasattr(idx, "hybrid_search"):
+            return idx.hybrid_search(query, file_glob=file_glob)
+        if hasattr(idx, "search"):
+            return idx.search(query, file_glob=file_glob)
         return []
 
     def _estimate_tokens(self, text: str) -> int:

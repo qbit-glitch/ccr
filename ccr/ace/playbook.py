@@ -146,6 +146,11 @@ class Bullet:
     when_to_apply: str = ""  # Applicability condition (SkillRL Table 5: "When to Apply")
     last_updated: str = ""  # ISO-8601 timestamp of last counter update (for temporal decay)
     grpo_advantage: float = 0.0  # group-relative advantage (SkillRL GRPO Eq.3)
+    trigger: str = ""  # ERL: When condition (e.g., "when adding API endpoints")
+    action: str = ""  # ERL: Then action (e.g., "add input validation first")
+    weighted_helpful: float = 0.0  # contribution-weighted helpful (AgentEvolver-inspired)
+    weighted_harmful: float = 0.0  # contribution-weighted harmful (AgentEvolver-inspired)
+    personal_decay_rate: float = 0.0  # 0.0 = use schema default; set by update_bullet_counts (SM-2 inspired)
     failure_lessons: list[FailureLesson] = field(default_factory=list)
 
     @property
@@ -154,22 +159,38 @@ class Bullet:
         return self.helpful - self.harmful
 
     def effective_score(self, decay_rate: float = 0.95) -> float:
-        """Net score with temporal decay: (helpful - harmful) * decay_rate^days_since_update.
+        """Net score with temporal decay: raw * rate^days_since_update.
+
+        When contribution-weighted counters are present (weighted_helpful or
+        weighted_harmful > 0), uses weighted values as raw score. Otherwise
+        falls back to integer helpful - harmful (backward compat).
+
+        Uses personal_decay_rate when set (> 0.0) — SM-2 inspired per-bullet
+        adaptive decay based on helpful/harmful history. Falls back to the
+        schema-level decay_rate parameter when personal_decay_rate is 0.0.
 
         Inspired by ACT-R memory decay / SYNAPSE spreading activation.
+        AgentEvolver-inspired contribution weighting for proportional credit.
         A bullet unused for 30 days retains ~21%, 90 days ~1%.
         """
+        # Use weighted counters when available, fall back to integer counts
+        if self.weighted_helpful > 0 or self.weighted_harmful > 0:
+            raw = self.weighted_helpful - self.weighted_harmful
+        else:
+            raw = float(self.score)
+
         if not self.last_updated:
-            return float(self.score)  # No timestamp = no decay
+            return raw  # No timestamp = no decay
         try:
             updated = datetime.fromisoformat(self.last_updated)
             if updated.tzinfo is None:
                 updated = updated.replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             days = (now - updated).total_seconds() / 86400
-            return self.score * (decay_rate ** days)
+            rate = self.personal_decay_rate if self.personal_decay_rate > 0.0 else decay_rate
+            return raw * (rate ** days)
         except (ValueError, TypeError):
-            return float(self.score)
+            return raw
 
     @property
     def is_problematic(self) -> bool:
@@ -211,6 +232,8 @@ class DeltaOperation:
     content: str
     bullet_id: str | None = None  # For UPDATE/REMOVE operations
     merge_target: str | None = None  # For MERGE: second bullet to merge into bullet_id
+    trigger: str = ""  # ERL: When condition for ADD operations
+    action: str = ""  # ERL: Then action for ADD operations
 
 
 @dataclass
@@ -250,6 +273,7 @@ class Playbook:
     def __init__(self, text: str | None = None, sections: list[str] | None = None):
         self._sections: list[str] = sections or list(DEFAULT_SECTIONS)
         self._bullets: list[Bullet] = []
+        self._id_index: dict[str, Bullet] = {}
         self._next_id: int = 1
 
         if text:
@@ -299,6 +323,7 @@ class Playbook:
                     max_id_num = max(max_id_num, int(id_num_match.group(1)))
 
         self._next_id = max_id_num + 1
+        self._id_index = {b.id: b for b in self._bullets}
 
     def serialize(self) -> str:
         """Serialize the playbook to text format."""
@@ -338,9 +363,14 @@ class Playbook:
         return self._next_id
 
     def get_bullet(self, bullet_id: str) -> Bullet | None:
-        """Find a bullet by ID."""
+        """Find a bullet by ID (O(1) via in-memory index, linear fallback)."""
+        result = self._id_index.get(bullet_id)
+        if result is not None:
+            return result
+        # Fallback: linear scan if index is stale or bypassed (e.g., tests)
         for b in self._bullets:
             if b.id == bullet_id:
+                self._id_index[b.id] = b  # repair index
                 return b
         return None
 
@@ -367,8 +397,14 @@ class Playbook:
                 "prevention_principle": "General rule to avoid this failure"
             }
 
+        An optional "weight" key (0.0-1.0) enables contribution-weighted counters
+        (AgentEvolver-inspired). When multiple strategies were active, each receives
+        proportional credit/blame. The integer counters always increment by 1
+        regardless of weight; the weight accumulates in weighted_helpful/weighted_harmful.
+
         Args:
-            bullet_tags: List of dicts with "id", "tag", and optional "failure_lesson".
+            bullet_tags: List of dicts with "id", "tag", optional "failure_lesson",
+                and optional "weight" (float 0.0-1.0, default 1.0).
 
         Returns:
             Number of bullets updated.
@@ -378,7 +414,17 @@ class Playbook:
             bid = tag.get("id") or tag.get("bullet", "")
             tag_val = tag.get("tag", "neutral")
             if bid:
-                tag_map[bid] = {"tag": tag_val, "failure_lesson": tag.get("failure_lesson")}
+                # Clamp weight to [0.0, 1.0], default 1.0
+                raw_weight = tag.get("weight", 1.0)
+                try:
+                    weight = max(0.0, min(1.0, float(raw_weight)))
+                except (TypeError, ValueError):
+                    weight = 1.0
+                tag_map[bid] = {
+                    "tag": tag_val,
+                    "failure_lesson": tag.get("failure_lesson"),
+                    "weight": weight,
+                }
 
         now_iso = datetime.now(timezone.utc).isoformat()
         updated = 0
@@ -386,12 +432,15 @@ class Playbook:
             if bullet.id in tag_map:
                 entry = tag_map[bullet.id]
                 tag = entry["tag"]
+                weight = entry["weight"]
                 if tag == "helpful":
                     bullet.helpful += 1
+                    bullet.weighted_helpful += weight
                     bullet.last_updated = now_iso
                     updated += 1
                 elif tag == "harmful":
                     bullet.harmful += 1
+                    bullet.weighted_harmful += weight
                     bullet.last_updated = now_iso
                     updated += 1
                     # Attach structured failure lesson if provided
@@ -399,6 +448,13 @@ class Playbook:
                     if isinstance(lesson_data, dict) and lesson_data:
                         lesson = FailureLesson.from_dict(lesson_data)
                         bullet.failure_lessons.append(lesson)
+                if tag in ("helpful", "harmful"):
+                    # SM-2 inspired: per-bullet adaptive decay rate
+                    # High helpful → slower decay (knowledge stays relevant longer)
+                    # High harmful → faster decay (discourage stale bad advice)
+                    bullet.personal_decay_rate = max(
+                        0.90, min(0.99, 0.95 + (bullet.helpful - bullet.harmful) * 0.002)
+                    )
         return updated
 
     def apply_delta(self, operations: list[DeltaOperation]) -> int:
@@ -460,8 +516,11 @@ class Playbook:
             content=op.content,
             section=section,
             last_updated=datetime.now(timezone.utc).isoformat(),
+            trigger=op.trigger,
+            action=op.action,
         )
         self._bullets.append(bullet)
+        self._id_index[bullet.id] = bullet
         return 1
 
     def _apply_update(self, op: DeltaOperation) -> int:
@@ -497,10 +556,22 @@ class Playbook:
         keeper.harmful += absorbed.harmful
         # Combine failure lessons from both bullets
         keeper.failure_lessons.extend(absorbed.failure_lessons)
+        # Combine trigger/action fields (ERL-inspired)
+        if absorbed.trigger:
+            if keeper.trigger and keeper.trigger != absorbed.trigger:
+                keeper.trigger = f"{keeper.trigger}; {absorbed.trigger}"
+            elif not keeper.trigger:
+                keeper.trigger = absorbed.trigger
+        if absorbed.action:
+            if keeper.action and keeper.action != absorbed.action:
+                keeper.action = f"{keeper.action}; {absorbed.action}"
+            elif not keeper.action:
+                keeper.action = absorbed.action
         # Use provided merged content
         keeper.content = op.content
         # Remove the absorbed bullet
         self._bullets = [b for b in self._bullets if b.id != op.merge_target]
+        self._id_index.pop(op.merge_target, None)
         return 1
 
     def _apply_remove(self, op: DeltaOperation) -> int:
@@ -509,38 +580,62 @@ class Playbook:
             return 0
         before = len(self._bullets)
         self._bullets = [b for b in self._bullets if b.id != op.bullet_id]
-        return 1 if len(self._bullets) < before else 0
+        if len(self._bullets) < before:
+            self._id_index.pop(op.bullet_id, None)
+            return 1
+        return 0
 
     def find_similar_pairs(self, threshold: float = 0.6) -> list[tuple[Bullet, Bullet, float]]:
         """Find bullet pairs with high text similarity.
 
-        Uses combined word-overlap Jaccard + character trigram similarity
-        for better paraphrase detection than word-only Jaccard.
+        Primary: ONNX cosine similarity (all-MiniLM-L6-v2).
+        Fallback: combined word-overlap Jaccard + character trigram similarity.
 
         Returns:
             List of (bullet_a, bullet_b, similarity_score) tuples.
         """
+        from ccr.context.embeddings import get_embedding_model
+
+        texts = [(a.content + " " + a.trigger).strip() for a in self._bullets]
+        model = get_embedding_model()
+        embeddings = None
+
+        # Try ONNX batch embedding for O(n) embed + O(n^2) dot product
+        if model is not None and len(texts) >= 2:
+            try:
+                non_empty = [t if len(t.split()) >= 2 else "empty" for t in texts]
+                embeddings = model.embed_batch(non_empty)
+            except Exception:
+                embeddings = None
+
         pairs = []
         for i, a in enumerate(self._bullets):
-            words_a = set(a.content.lower().split())
-            trigrams_a = self._char_trigrams(a.content.lower())
-            if len(words_a) < 2:
+            text_a = texts[i]
+            if len(text_a.split()) < 2:
                 continue
-            for b in self._bullets[i + 1:]:
-                words_b = set(b.content.lower().split())
-                trigrams_b = self._char_trigrams(b.content.lower())
-                if len(words_b) < 2:
+            for j in range(i + 1, len(self._bullets)):
+                b = self._bullets[j]
+                text_b = texts[j]
+                if len(text_b.split()) < 2:
                     continue
-                # Word Jaccard
-                word_inter = words_a & words_b
-                word_union = words_a | words_b
-                word_jaccard = len(word_inter) / len(word_union) if word_union else 0.0
-                # Trigram Jaccard
-                tri_inter = trigrams_a & trigrams_b
-                tri_union = trigrams_a | trigrams_b
-                tri_jaccard = len(tri_inter) / len(tri_union) if tri_union else 0.0
-                # Combined score (weighted average)
-                combined = 0.4 * word_jaccard + 0.6 * tri_jaccard
+
+                if embeddings is not None:
+                    # ONNX cosine (primary)
+                    combined = float(embeddings[i] @ embeddings[j])
+                else:
+                    # Jaccard + trigram fallback
+                    words_a = set(text_a.lower().split())
+                    words_b = set(text_b.lower().split())
+                    trigrams_a = self._char_trigrams(text_a.lower())
+                    trigrams_b = self._char_trigrams(text_b.lower())
+                    word_inter = words_a & words_b
+                    word_union = words_a | words_b
+                    word_jaccard = len(word_inter) / len(word_union) if word_union else 0.0
+                    tri_inter = trigrams_a & trigrams_b
+                    tri_union = trigrams_a | trigrams_b
+                    tri_jaccard = len(tri_inter) / len(tri_union) if tri_union else 0.0
+                    combined = 0.4 * word_jaccard + 0.6 * tri_jaccard
+
                 if combined >= threshold:
                     pairs.append((a, b, combined))
         pairs.sort(key=lambda x: x[2], reverse=True)
@@ -572,6 +667,8 @@ class Playbook:
             else:
                 kept.append(b)
         self._bullets = kept
+        for b in removed:
+            self._id_index.pop(b.id, None)
         return removed
 
     def enforce_token_budget(self, max_chars: int, decay_rate: float = 0.95) -> list[Bullet]:
@@ -591,8 +688,13 @@ class Playbook:
         current_size = len(self.serialize())
         if current_size <= max_chars:
             return removed
-        # Sort ascending by score (worst first)
-        ranked = sorted(self._bullets, key=lambda b: (b.effective_score(decay_rate), -b.harmful))
+        # Sort ascending: (worst_score, highest_harmful, oldest_timestamp) pruned first.
+        # ISO string comparison: "" < "2026-01-..." < "2026-04-..." so newly-evolved
+        # bullets (recent last_updated) sort LATER and are spared when over budget.
+        ranked = sorted(
+            self._bullets,
+            key=lambda b: (b.effective_score(decay_rate), -b.harmful, b.last_updated or ""),
+        )
         keep = set(id(b) for b in self._bullets)
         for bullet in ranked:
             if current_size <= max_chars:
@@ -602,6 +704,8 @@ class Playbook:
             # Estimate size reduction: format_line + newline + section header overhead
             current_size -= len(bullet.format_line()) + 1
         self._bullets = [b for b in self._bullets if id(b) in keep]
+        for b in removed:
+            self._id_index.pop(b.id, None)
         return removed
 
     def get_stats(self) -> PlaybookStats:
@@ -740,6 +844,7 @@ class Playbook:
                     when_to_apply=fl.task_context if fl.task_context else f"When facing issues similar to: {fl.failure_point[:80]}",
                 )
                 self._bullets.append(new_bullet)
+                self._id_index[new_bullet.id] = new_bullet
                 new_bullets.append(new_bullet)
                 fl.evolved = True  # N3: Mark as evolved
 
@@ -811,6 +916,16 @@ class Playbook:
                     bullet.when_to_apply = entry["when_to_apply"]
                 if "last_updated" in entry:
                     bullet.last_updated = entry["last_updated"]
+                # ERL: Restore trigger/action fields
+                if "trigger" in entry:
+                    bullet.trigger = entry["trigger"]
+                if "action" in entry:
+                    bullet.action = entry["action"]
+                # Restore contribution-weighted counters (AgentEvolver-inspired)
+                bullet.weighted_helpful = float(entry.get("weighted_helpful", 0.0))
+                bullet.weighted_harmful = float(entry.get("weighted_harmful", 0.0))
+                # Restore SM-2 adaptive decay rate
+                bullet.personal_decay_rate = float(entry.get("personal_decay_rate", 0.0))
             else:
                 continue
             if isinstance(lessons_raw, list):
@@ -841,6 +956,11 @@ class Playbook:
                 or bullet.scope != "general"
                 or bullet.when_to_apply
                 or bullet.last_updated
+                or bullet.trigger
+                or bullet.action
+                or bullet.weighted_helpful > 0
+                or bullet.weighted_harmful > 0
+                or bullet.personal_decay_rate > 0.0
             )
             if has_extended:
                 entry: dict[str, Any] = {}
@@ -853,6 +973,18 @@ class Playbook:
                     entry["when_to_apply"] = bullet.when_to_apply
                 if bullet.last_updated:
                     entry["last_updated"] = bullet.last_updated
+                if bullet.trigger:
+                    entry["trigger"] = bullet.trigger
+                if bullet.action:
+                    entry["action"] = bullet.action
+                # Persist contribution-weighted counters (AgentEvolver-inspired)
+                if bullet.weighted_helpful > 0:
+                    entry["weighted_helpful"] = bullet.weighted_helpful
+                if bullet.weighted_harmful > 0:
+                    entry["weighted_harmful"] = bullet.weighted_harmful
+                # Persist SM-2 adaptive decay rate
+                if bullet.personal_decay_rate > 0.0:
+                    entry["personal_decay_rate"] = bullet.personal_decay_rate
                 if entry:
                     data[bullet.id] = entry
 
@@ -959,21 +1091,46 @@ class Playbook:
     def get_policy_ranked(self, task_context: str = "", top_k: int = 10) -> list[Bullet]:
         """Return bullets ranked by effective_score * (1 + grpo_advantage) — GRPO policy-weighted.
 
-        When task_context is provided, filters to bullets with word-Jaccard overlap >= 0.1
-        against bullet content or when_to_apply. Returns top_k results.
+        When task_context is provided, filters to bullets with similarity >= 0.1
+        against bullet content, when_to_apply, or trigger. Primary: ONNX cosine.
+        Fallback: word-Jaccard. Trigger matches get a 1.5x weight boost
+        (ERL-inspired: structured trigger/action enables context-aware retrieval).
+        Returns top_k results.
         """
         candidates = list(self._bullets)
+        retrieval_scores: dict[str, float] = {}
 
         if task_context.strip():
+            from ccr.context.embeddings import quick_cosine
+
             filtered = []
             for b in candidates:
-                text = b.content + " " + b.when_to_apply
-                if self._word_jaccard_sim(task_context, text) >= 0.1:
+                # Try ONNX cosine first, fall back to word Jaccard
+                trigger_text = b.trigger if b.trigger else ""
+                content_text = b.content + " " + b.when_to_apply
+
+                trigger_sim_onnx = quick_cosine(task_context, trigger_text) if trigger_text else None
+                content_sim_onnx = quick_cosine(task_context, content_text)
+
+                if trigger_sim_onnx is not None:
+                    trigger_sim = trigger_sim_onnx
+                else:
+                    trigger_sim = self._word_jaccard_sim(task_context, trigger_text) if trigger_text else 0.0
+
+                if content_sim_onnx is not None:
+                    content_sim = content_sim_onnx
+                else:
+                    content_sim = self._word_jaccard_sim(task_context, content_text)
+
+                combined = max(trigger_sim * 1.5, content_sim)
+                if combined >= 0.1:
+                    retrieval_scores[b.id] = combined
                     filtered.append(b)
             candidates = filtered if filtered else candidates
 
         def policy_score(b: Bullet) -> float:
-            return b.effective_score() * (1.0 + b.grpo_advantage)
+            base = b.effective_score() * (1.0 + b.grpo_advantage)
+            return base * (1.0 + retrieval_scores.get(b.id, 0.0))
 
         candidates.sort(key=policy_score, reverse=True)
         return candidates[:top_k]
@@ -1454,6 +1611,8 @@ def parse_delta_operations(curator_output: dict[str, Any]) -> list[DeltaOperatio
                 op_type="ADD",
                 section=raw.get("section", "OTHERS"),
                 content=raw.get("content", ""),
+                trigger=raw.get("trigger", ""),
+                action=raw.get("action", ""),
             ))
         elif op_type == "UPDATE" and raw.get("bullet_id"):
             ops.append(DeltaOperation(

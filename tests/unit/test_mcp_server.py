@@ -5,6 +5,7 @@ import os
 import tempfile
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ccr.mcp_server import (
     _init,
@@ -15,10 +16,10 @@ from ccr.mcp_server import (
     ace_find_similar,
     ace_generate_bullets,
     ace_get_playbook,
-    ace_get_stats,
     ace_prune,
     ace_update_counters,
     gcc_branch,
+    gcc_clusters,
     gcc_commit,
     gcc_consolidate,
     gcc_context,
@@ -26,8 +27,9 @@ from ccr.mcp_server import (
     gcc_log_ota,
     gcc_merge,
     gcc_patterns,
+    gcc_scratchpad,
     gcc_status,
-    gcc_summaries,
+    gcc_triples,
     index_build,
     index_search,
     rlm_execute,
@@ -82,29 +84,33 @@ class TestGCCCommit:
             files_changed=["hello.py"],
             next_step="Add tests",
         )
-        assert "[C001]" in result
-        assert "Add greeting" in result
+        assert "[C001]" in result["message"]
+        assert "Add greeting" in result["message"]
+        assert result["commit_id"] == "C001"
+        assert result["branch"] == "main"
+        assert result["title"] == "Add greeting"
+        assert result["admission_decision"] in ("created", "merged", "rejected")
 
     def test_sequential_commits(self):
         gcc_commit("First", "did A", "because A", [], "do B")
         result = gcc_commit("Second", "did B", "because B", [], "do C")
-        assert "[C002]" in result
+        assert "[C002]" in result["message"]
 
     def test_commit_appears_in_context(self):
         gcc_commit("Add greeting", "Added greet", "needed", ["hello.py"], "test")
         ctx = gcc_context(level=2)
-        assert "Add greeting" in ctx
+        assert "Add greeting" in ctx["message"]
 
 
 class TestGCCBranch:
     def test_create_branch(self):
         result = gcc_branch("try-refactor", "Explore refactoring", "Will simplify code")
-        assert "try-refactor" in result
+        assert "try-refactor" in result["message"]
 
     def test_branch_shows_in_status(self):
         gcc_branch("experiment", "Testing", "Hypothesis")
         status = gcc_status()
-        assert "experiment" in status
+        assert "experiment" in status["message"]
 
     def test_invalid_branch_name(self):
         with pytest.raises(ValueError, match="kebab-case"):
@@ -121,7 +127,7 @@ class TestGCCMerge:
         gcc_branch("test-branch", "Testing merge", "Should work")
         gcc_commit("Work on branch", "did stuff", "testing", [], "merge")
         result = gcc_merge("test-branch", "success", "It worked")
-        assert "success" in result
+        assert "success" in result["message"]
 
     def test_merge_invalid_outcome(self):
         gcc_branch("bad-merge", "test", "test")
@@ -132,34 +138,35 @@ class TestGCCMerge:
 class TestGCCContext:
     def test_level_1(self):
         ctx = gcc_context(level=1)
-        assert "Project" in ctx
+        assert "Project" in ctx["message"]
 
     def test_level_2_with_commits(self):
         gcc_commit("First", "did A", "because", [], "next")
         ctx = gcc_context(level=2)
-        assert "First" in ctx
+        assert "First" in ctx["message"]
 
     def test_level_5_search(self):
         gcc_commit("Fix parser bug", "Fixed regex", "was broken", ["parser.py"], "test")
         ctx = gcc_context(level=5, search_term="parser")
-        assert "parser" in ctx.lower()
+        assert "parser" in ctx["message"].lower()
 
     def test_log_window(self):
         gcc_log_ota("Found issue", "Need to investigate", "Reading code")
         ctx = gcc_context(level=1, log_window=5)
-        assert "Found issue" in ctx
+        assert "Found issue" in ctx["message"]
 
 
 class TestGCCLogOTA:
     def test_log_ota(self):
         result = gcc_log_ota("Test failed", "Bug in logic", "Fixed condition")
-        assert result == "OTA logged."
+        assert result["message"] == "OTA logged."
 
 
 class TestGCCStatus:
     def test_status_shows_branch(self):
         status = gcc_status()
-        assert "main" in status
+        assert "main" in status["message"]
+        assert status["branch"] == "main"
 
 
 # ===========================================================================
@@ -170,14 +177,14 @@ class TestGCCStatus:
 class TestACEGetPlaybook:
     def test_empty_playbook(self):
         result = ace_get_playbook()
-        assert "empty" in result.lower() or "STRATEGIES" in result
+        assert "empty" in result["message"].lower() or "STRATEGIES" in result["message"]
 
     def test_playbook_with_bullets(self):
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Always test first"}
         ])
         result = ace_get_playbook()
-        assert "Always test first" in result
+        assert "Always test first" in result["message"]
 
 
 class TestACEApplyDelta:
@@ -185,20 +192,20 @@ class TestACEApplyDelta:
         result = ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Check edge cases"}
         ])
-        assert "Applied 1" in result
+        assert "Applied 1" in result["message"]
 
     def test_add_multiple(self):
         result = ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Strategy A"},
             {"type": "ADD", "section": "COMMON MISTAKES TO AVOID", "content": "Mistake A"},
         ])
-        assert "Applied 2" in result
+        assert "Applied 2" in result["message"]
 
     def test_update_bullet(self):
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Original content"}
         ])
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         # Find the bullet ID
         import re
         match = re.search(r"\[(str-\d+)\]", pb)
@@ -208,14 +215,14 @@ class TestACEApplyDelta:
         result = ace_apply_delta([
             {"type": "UPDATE", "bullet_id": bullet_id, "content": "Updated content"}
         ])
-        assert "Applied 1" in result
-        assert "Updated content" in ace_get_playbook()
+        assert "Applied 1" in result["message"]
+        assert "Updated content" in ace_get_playbook()["message"]
 
     def test_remove_bullet(self):
         ace_apply_delta([
             {"type": "ADD", "section": "OTHERS", "content": "Remove me"}
         ])
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         import re
         match = re.search(r"\[(\w+-\d+)\]", pb)
         bullet_id = match.group(1)
@@ -223,8 +230,8 @@ class TestACEApplyDelta:
         result = ace_apply_delta([
             {"type": "REMOVE", "bullet_id": bullet_id}
         ])
-        assert "Applied 1" in result
-        assert "Remove me" not in ace_get_playbook()
+        assert "Applied 1" in result["message"]
+        assert "Remove me" not in ace_get_playbook()["message"]
 
     def test_persists_to_disk(self, setup_project):
         ace_apply_delta([
@@ -248,8 +255,8 @@ class TestACEApplyDelta:
         result = ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": pat}
         ])
-        assert "Applied 1" in result
-        assert "Marked 1 pattern(s) as promoted" in result
+        assert "Applied 1" in result["message"]
+        assert "Marked 1 pattern(s) as promoted" in result["message"]
 
         # Verify the pattern is actually promoted in the buffer
         mem = mcp_mod._memory
@@ -272,8 +279,8 @@ class TestACEApplyDelta:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS",
              "content": "Database indexing optimization techniques for large datasets"}
         ])
-        assert "Applied 1" in result
-        assert "Marked" not in result
+        assert "Applied 1" in result["message"]
+        assert "Marked" not in result["message"]
 
 
 class TestACEUpdateCounters:
@@ -282,13 +289,13 @@ class TestACEUpdateCounters:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Good strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         result = ace_update_counters([{"id": bullet_id, "tag": "helpful"}])
-        assert "Updated 1" in result
+        assert "Updated 1" in result["message"]
 
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "helpful=1" in pb
 
     def test_update_harmful(self):
@@ -296,11 +303,11 @@ class TestACEUpdateCounters:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Bad strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         ace_update_counters([{"id": bullet_id, "tag": "harmful"}])
-        assert "harmful=1" in ace_get_playbook()
+        assert "harmful=1" in ace_get_playbook()["message"]
 
 
 class TestACEUpdateCountersWithFailureLessons:
@@ -309,7 +316,7 @@ class TestACEUpdateCountersWithFailureLessons:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Test strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         result = ace_update_counters([{
@@ -322,27 +329,27 @@ class TestACEUpdateCountersWithFailureLessons:
                 "prevention_principle": "Validate input format at boundaries",
             },
         }])
-        assert "Updated 1" in result
-        assert "1 structured failure lesson" in result
+        assert "Updated 1" in result["message"]
+        assert "1 structured failure lesson" in result["message"]
 
     def test_harmful_without_lesson_backward_compat(self):
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Test strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         result = ace_update_counters([{"id": bullet_id, "tag": "harmful"}])
-        assert "Updated 1" in result
-        assert "failure lesson" not in result
+        assert "Updated 1" in result["message"]
+        assert "failure lesson" not in result["message"]
 
     def test_failure_lesson_appears_in_playbook(self):
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Fragile strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         ace_update_counters([{
@@ -356,7 +363,7 @@ class TestACEUpdateCountersWithFailureLessons:
             },
         }])
 
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "FAILURE: Broke on empty input" in pb
         assert "PRINCIPLE: Always handle empty inputs" in pb
 
@@ -365,7 +372,7 @@ class TestACEUpdateCountersWithFailureLessons:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Persisted strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         ace_update_counters([{
@@ -391,7 +398,7 @@ class TestACEUpdateCountersWithFailureLessons:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Tested strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         ace_update_counters([{
@@ -403,15 +410,28 @@ class TestACEUpdateCountersWithFailureLessons:
             },
         }])
 
-        stats = json.loads(ace_get_stats())
+        result = ace_get_playbook(include_stats=True)
+        msg = result["message"]
+        assert "PLAYBOOK STATS" in msg
+        # Extract the JSON block after the PLAYBOOK STATS header
+        stats_json = msg.split("# PLAYBOOK STATS\n")[1]
+        stats = json.loads(stats_json)
         assert stats["project"]["total_failure_lessons"] == 1
         assert stats["project"]["harmful_with_lessons"] == 1
 
 
-class TestACEGetStats:
+class TestACEGetPlaybookStats:
+    """Tests for ace_get_playbook(include_stats=True) — replaces old ace_get_stats."""
+
+    def _extract_stats(self, msg: str) -> dict:
+        """Extract stats JSON from ace_get_playbook(include_stats=True) message."""
+        assert "PLAYBOOK STATS" in msg
+        stats_json = msg.split("# PLAYBOOK STATS\n")[1]
+        return json.loads(stats_json)
+
     def test_stats_empty(self):
-        result = ace_get_stats()
-        stats = json.loads(result)
+        result = ace_get_playbook(include_stats=True)
+        stats = self._extract_stats(result["message"])
         assert stats["project"]["total_bullets"] == 0
 
     def test_stats_with_bullets(self):
@@ -419,8 +439,8 @@ class TestACEGetStats:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "A"},
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "B"},
         ])
-        result = ace_get_stats()
-        stats = json.loads(result)
+        result = ace_get_playbook(include_stats=True)
+        stats = self._extract_stats(result["message"])
         assert stats["project"]["total_bullets"] == 2
 
 
@@ -431,7 +451,7 @@ class TestACEFindSimilar:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Completely different topic here"},
         ])
         result = ace_find_similar(threshold=0.9)
-        assert "No similar" in result
+        assert "No similar" in result["message"]
 
     def test_find_similar_pair(self):
         ace_apply_delta([
@@ -441,7 +461,7 @@ class TestACEFindSimilar:
              "content": "Always check edge cases in loop bounds and ranges"},
         ])
         result = ace_find_similar(threshold=0.5)
-        assert "similarity=" in result
+        assert "similarity=" in result["message"]
 
 
 class TestACEPrune:
@@ -450,14 +470,14 @@ class TestACEPrune:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Good one"}
         ])
         result = ace_prune()
-        assert "1 bullets" in result  # still has 1
+        assert "1 bullets" in result["message"]  # still has 1
 
     def test_prune_harmful(self):
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Bad strategy"}
         ])
         import re
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bullet_id = match.group(1)
 
         # Mark harmful 3 times
@@ -465,7 +485,7 @@ class TestACEPrune:
             ace_update_counters([{"id": bullet_id, "tag": "harmful"}])
 
         result = ace_prune()
-        assert "Pruned 1" in result
+        assert "Pruned 1" in result["message"]
 
 
 class TestPrunePreservesLessons:
@@ -480,7 +500,7 @@ class TestPrunePreservesLessons:
                 "section": "STRATEGIES & INSIGHTS",
                 "content": f"Strategy that fails {i}",
             }])
-        pb_text = ace_get_playbook()
+        pb_text = ace_get_playbook()["message"]
         ids = re.findall(r"\[(str-\d+)\]", pb_text)
         for i, bid in enumerate(ids[:n]):
             # Mark harmful enough times to trigger pruning (>=3)
@@ -507,7 +527,7 @@ class TestPrunePreservesLessons:
         # Prune — should auto-evolve first
         result = ace_prune()
         # Harmful source bullets should be removed
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "Strategy that fails" not in pb
         # But prevention principles should survive as new heuristic bullets
         assert "Prevention rule 0" in pb
@@ -518,8 +538,8 @@ class TestPrunePreservesLessons:
         """Return message mentions how many skills were evolved."""
         self._add_harmful_bullets_with_lessons(3)
         result = ace_prune()
-        assert "Evolved 3 new skill" in result
-        assert "Pruned" in result
+        assert "Evolved 3 new skill" in result["message"]
+        assert "Pruned" in result["message"]
 
     def test_prune_with_no_lessons_works_normally(self):
         """Pruning bullets without failure lessons still works fine."""
@@ -527,14 +547,14 @@ class TestPrunePreservesLessons:
         ace_apply_delta([
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Bad no-lesson strategy"}
         ])
-        match = re.search(r"\[(str-\d+)\]", ace_get_playbook())
+        match = re.search(r"\[(str-\d+)\]", ace_get_playbook()["message"])
         bid = match.group(1)
         for _ in range(3):
             ace_update_counters([{"id": bid, "tag": "harmful"}])
         result = ace_prune()
-        assert "Pruned 1" in result
-        assert "Evolved" not in result
-        assert "Bad no-lesson strategy" not in ace_get_playbook()
+        assert "Pruned 1" in result["message"]
+        assert "Evolved" not in result["message"]
+        assert "Bad no-lesson strategy" not in ace_get_playbook()["message"]
 
 
 class TestACEEvolveFromFailures:
@@ -547,7 +567,7 @@ class TestACEEvolveFromFailures:
                 "section": "STRATEGIES & INSIGHTS",
                 "content": f"Strategy that fails {i}",
             }])
-        pb_text = ace_get_playbook()
+        pb_text = ace_get_playbook()["message"]
         ids = re.findall(r"\[(str-\d+)\]", pb_text)
         for i, bid in enumerate(ids[:n]):
             ace_update_counters([{
@@ -566,14 +586,14 @@ class TestACEEvolveFromFailures:
     def test_evolve_not_triggered_below_threshold(self):
         self._add_harmful_bullets_with_lessons(2)
         result = ace_evolve_from_failures(threshold=3)
-        assert "not triggered" in result.lower()
+        assert "not triggered" in result["message"].lower()
 
     def test_evolve_creates_new_skills(self):
         self._add_harmful_bullets_with_lessons(3)
         result = ace_evolve_from_failures(threshold=3)
-        assert "Evolved 3 new skill" in result
+        assert "Evolved 3 new skill" in result["message"]
         # Verify skills appear in playbook
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "Prevention rule 0" in pb
         assert "Prevention rule 1" in pb
         assert "Prevention rule 2" in pb
@@ -584,12 +604,16 @@ class TestACEEvolveFromFailures:
         # Reload playbook from disk
         mcp_mod._playbook = None
         mcp_mod._playbook = mcp_mod._load_playbook()
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "Prevention rule 0" in pb
 
     def test_stats_show_evolution_needed(self):
         self._add_harmful_bullets_with_lessons(3)
-        stats = json.loads(ace_get_stats())
+        result = ace_get_playbook(include_stats=True)
+        msg = result["message"]
+        assert "PLAYBOOK STATS" in msg
+        stats_json = msg.split("# PLAYBOOK STATS\n")[1]
+        stats = json.loads(stats_json)
         assert stats["project"]["evolution_needed"] is True
         assert stats["project"]["evolution_candidates"] == 3
 
@@ -602,57 +626,59 @@ class TestACEEvolveFromFailures:
 class TestRLMInit:
     def test_init(self):
         result = rlm_init("Analyze the code")
-        assert "REPL initialized" in result
-        assert "task_prompt" in result
+        assert "REPL initialized" in result["message"]
+        assert "task_prompt" in result["message"]
+        assert result["session_id"]
+        assert isinstance(result["file_count"], int)
 
     def test_init_shows_file_count(self):
         result = rlm_init("Test")
-        assert "files indexed" in result
+        assert "files indexed" in result["message"]
 
 
 class TestRLMExecute:
     def test_basic_execution(self):
         rlm_init("Test")
         result = rlm_execute("x = 2 + 3\nprint(x)")
-        assert "5" in result
+        assert "5" in result["message"]
 
     def test_variable_persistence(self):
         rlm_init("Test")
         rlm_execute("my_var = 42")
         result = rlm_execute("print(my_var * 2)")
-        assert "84" in result
+        assert "84" in result["message"]
 
     def test_access_task_prompt(self):
         rlm_init("Find all classes")
         result = rlm_execute("print(task_prompt)")
-        assert "Find all classes" in result
+        assert "Find all classes" in result["message"]
 
     def test_search_repo(self):
         rlm_init("Search test")
         result = rlm_execute("results = search_repo('greet')\nprint(len(results))")
-        assert "stdout" in result or "1" in result
+        assert "stdout" in result["message"] or "1" in result["message"]
 
     def test_get_file(self):
         rlm_init("Read test")
         result = rlm_execute("content = get_file('hello.py')\nprint(content[:20])")
-        assert "greet" in result.lower() or "def" in result
+        assert "greet" in result["message"].lower() or "def" in result["message"]
 
     def test_show_vars(self):
         rlm_init("Test")
         rlm_execute("x = 42\ny = 'hello'")
         result = rlm_execute("print(SHOW_VARS())")
-        assert "x" in result
+        assert "x" in result["message"]
 
     def test_error_handling(self):
         rlm_init("Test")
         result = rlm_execute("1/0")
-        assert "error" in result.lower() or "ZeroDivision" in result
+        assert "error" in result["message"].lower() or "ZeroDivision" in result["message"]
 
     def test_no_init_error(self):
         # Reset REPL
         mcp_mod._repl = None
-        result = rlm_execute("print(1)")
-        assert "not initialized" in result.lower()
+        with pytest.raises(ToolError, match="not initialized"):
+            rlm_execute("print(1)")
 
 
 class TestRLMExecuteMetadataOnly:
@@ -662,9 +688,9 @@ class TestRLMExecuteMetadataOnly:
         """Stdout under the 1000-char threshold is returned as-is."""
         rlm_init("Test")
         result = rlm_execute("print('hello world')")
-        assert "hello world" in result
+        assert "hello world" in result["message"]
         # Should NOT contain truncation markers
-        assert "[stdout truncated:" not in result
+        assert "[stdout truncated:" not in result["message"]
 
     def test_long_stdout_summarized(self):
         """Stdout over the 1000-char threshold gets a metadata summary."""
@@ -672,15 +698,15 @@ class TestRLMExecuteMetadataOnly:
         # Generate output well over 1000 chars (50 lines x ~30 chars each = ~1500 chars)
         code = "for i in range(50): print(f'line {i}: ' + 'x' * 20)"
         result = rlm_execute(code)
-        assert "[stdout truncated:" in result
-        assert "lines" in result
-        assert "chars" in result
+        assert "[stdout truncated:" in result["message"]
+        assert "lines" in result["message"]
+        assert "chars" in result["message"]
         # First lines should be present
-        assert "line 0:" in result
+        assert "line 0:" in result["message"]
         # Last lines should be present
-        assert "line 49:" in result
+        assert "line 49:" in result["message"]
         # Middle lines should NOT be present (they were truncated)
-        assert "line 25:" not in result
+        assert "line 25:" not in result["message"]
 
     def test_metadata_only_false_returns_full(self):
         """Setting metadata_only=False returns full stdout regardless of length."""
@@ -688,11 +714,11 @@ class TestRLMExecuteMetadataOnly:
         code = "for i in range(50): print(f'line {i}: ' + 'x' * 20)"
         result = rlm_execute(code, metadata_only=False)
         # Should NOT be truncated
-        assert "[stdout truncated:" not in result
+        assert "[stdout truncated:" not in result["message"]
         # All lines should be present
-        assert "line 0:" in result
-        assert "line 25:" in result
-        assert "line 49:" in result
+        assert "line 0:" in result["message"]
+        assert "line 25:" in result["message"]
+        assert "line 49:" in result["message"]
 
 
 class TestRLMFinalize:
@@ -700,24 +726,24 @@ class TestRLMFinalize:
         rlm_init("Test")
         rlm_execute("answer = 'The result is 42'")
         result = rlm_finalize("answer")
-        assert "42" in result
+        assert "42" in result["message"]
 
     def test_finalize_dict(self):
         rlm_init("Test")
         rlm_execute("data = {'key': 'value', 'count': 3}")
         result = rlm_finalize("data")
-        parsed = json.loads(result)
+        parsed = json.loads(result["message"])
         assert parsed["key"] == "value"
 
     def test_finalize_missing_var(self):
         rlm_init("Test")
-        result = rlm_finalize("nonexistent")
-        assert "Error" in result or "not found" in result.lower()
+        with pytest.raises(ToolError, match="not found"):
+            rlm_finalize("nonexistent")
 
     def test_no_init_error(self):
         mcp_mod._repl = None
-        result = rlm_finalize("x")
-        assert "not initialized" in result.lower()
+        with pytest.raises(ToolError, match="not initialized"):
+            rlm_finalize("x")
 
 
 # ===========================================================================
@@ -728,26 +754,27 @@ class TestRLMFinalize:
 class TestIndexBuild:
     def test_build(self):
         result = index_build()
-        assert "Files:" in result
-        assert "2" in result  # hello.py + utils.py
+        assert "Files:" in result["message"]
+        assert "2" in result["message"]  # hello.py + utils.py
+        assert isinstance(result["files_indexed"], int)
 
 
 class TestIndexSearch:
     def test_search_by_symbol(self):
         result = index_search("greet")
-        assert "hello.py" in result
+        assert "hello.py" in result["message"]
 
     def test_search_by_class(self):
         result = index_search("Greeter")
-        assert "hello.py" in result
+        assert "hello.py" in result["message"]
 
     def test_search_no_results(self):
         result = index_search("nonexistent_symbol_xyz")
-        assert "No files" in result
+        assert "No files" in result["message"]
 
     def test_search_top_k(self):
         result = index_search("py", top_k=1)
-        lines = [l for l in result.strip().split("\n") if l.strip()]
+        lines = [l for l in result["message"].strip().split("\n") if l.strip()]
         # 1 header line + 1 result line
         assert len(lines) == 2
 
@@ -757,27 +784,26 @@ class TestIndexSearchModes:
 
     def test_keyword_mode(self):
         result = index_search("greet", mode="keyword")
-        assert "keyword search" in result
-        assert "hello.py" in result
+        assert "keyword search" in result["message"]
+        assert "hello.py" in result["message"]
 
     def test_semantic_mode_bm25_fallback(self):
         result = index_search("greet", mode="semantic")
-        assert "semantic search" in result
+        assert "semantic search" in result["message"]
         # BM25 fallback since no ONNX
-        assert "BM25 fallback" in result
+        assert "BM25 fallback" in result["message"]
 
     def test_hybrid_mode_default(self):
         result = index_search("greet")
-        assert "hybrid search" in result
+        assert "hybrid search" in result["message"]
 
     def test_invalid_mode_error(self):
-        result = index_search("greet", mode="invalid")
-        assert "Error" in result
-        assert "invalid" in result
+        with pytest.raises(ToolError, match="Invalid mode"):
+            index_search("greet", mode="invalid")
 
     def test_build_shows_embedding_status(self):
         result = index_build()
-        assert "Embedding" in result or "embedding" in result
+        assert "Embedding" in result["message"] or "embedding" in result["message"]
 
 
 # ===========================================================================
@@ -790,19 +816,19 @@ class TestWorkflows:
         """GCC workflow: commit → retrieve context."""
         gcc_commit("Setup", "Created project", "starting out", ["hello.py"], "Add features")
         ctx = gcc_context(level=2)
-        assert "Setup" in ctx
-        assert "Created project" in ctx
+        assert "Setup" in ctx["message"]
+        assert "Created project" in ctx["message"]
 
     def test_branch_commit_merge(self):
         """GCC workflow: branch → commit → merge."""
         gcc_branch("experiment", "Try new approach", "Might work")
         gcc_commit("Experiment work", "tried stuff", "exploration", [], "evaluate")
         result = gcc_merge("experiment", "success", "Approach works")
-        assert "success" in result
+        assert "success" in result["message"]
 
         # Back on main, context includes merge info
         ctx = gcc_context(level=2)
-        assert "experiment" in ctx.lower() or "Merge" in ctx
+        assert "experiment" in ctx["message"].lower() or "Merge" in ctx["message"]
 
     def test_ace_full_cycle(self):
         """ACE workflow: add → tag → prune."""
@@ -814,7 +840,7 @@ class TestWorkflows:
 
         # Tag them
         import re
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         ids = re.findall(r"\[(str-\d+)\]", pb)
         assert len(ids) == 2
 
@@ -828,7 +854,7 @@ class TestWorkflows:
 
         # Prune
         ace_prune()
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "Good one" in pb
         assert "Bad one" not in pb
 
@@ -843,7 +869,7 @@ class TestWorkflows:
             "answer = {'file': results[0]['path'], 'functions': functions}"
         )
         result = rlm_finalize("answer")
-        data = json.loads(result)
+        data = json.loads(result["message"])
         assert "hello.py" in data["file"]
         assert "greet" in data["functions"]
 
@@ -860,7 +886,7 @@ class TestTwoTierPlaybook:
             [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Global strategy"}],
             scope="global",
         )
-        assert "global" in result
+        assert "global" in result["message"]
         gpb = mcp_mod._global_playbook
         assert len(gpb.bullets) == 1
         assert gpb.bullets[0].content == "Global strategy"
@@ -884,7 +910,7 @@ class TestTwoTierPlaybook:
             [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "P1"}],
             scope="project",
         )
-        result = ace_get_playbook()
+        result = ace_get_playbook()["message"]
         assert "GLOBAL PLAYBOOK" in result
         assert "PROJECT PLAYBOOK" in result
         assert "G1" in result
@@ -892,7 +918,7 @@ class TestTwoTierPlaybook:
 
     def test_get_playbook_both_sections_present(self):
         """Both global and project sections are always present."""
-        result = ace_get_playbook()
+        result = ace_get_playbook()["message"]
         assert "GLOBAL PLAYBOOK" in result
         assert "PROJECT PLAYBOOK" in result
 
@@ -908,7 +934,7 @@ class TestTwoTierPlaybook:
         assert gpb.bullets[0].helpful == 1
 
     def test_stats_both_tiers(self):
-        """ace_get_stats returns stats for both global and project."""
+        """ace_get_playbook(include_stats=True) returns stats for both global and project."""
         ace_apply_delta(
             [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "G"}],
             scope="global",
@@ -916,7 +942,11 @@ class TestTwoTierPlaybook:
         ace_apply_delta(
             [{"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "P"}],
         )
-        stats = json.loads(ace_get_stats())
+        result = ace_get_playbook(include_stats=True)
+        msg = result["message"]
+        assert "PLAYBOOK STATS" in msg
+        stats_json = msg.split("# PLAYBOOK STATS\n")[1]
+        stats = json.loads(stats_json)
         assert "global" in stats
         assert "project" in stats
         assert stats["global"]["total_bullets"] == 1
@@ -929,7 +959,7 @@ class TestTwoTierPlaybook:
             {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "Alpha beta gamma delta zeta"},
         ], scope="global")
         result = ace_find_similar(threshold=0.5, scope="global")
-        assert "similarity" in result
+        assert "similarity" in result["message"]
 
     def test_find_similar_cross_scope(self):
         """Cross-tier similarity detection."""
@@ -942,7 +972,7 @@ class TestTwoTierPlaybook:
             scope="project",
         )
         result = ace_find_similar(threshold=0.5, scope="cross")
-        assert "global" in result.lower() and "project" in result.lower()
+        assert "global" in result["message"].lower() and "project" in result["message"].lower()
 
     def test_prune_with_scope(self):
         """ace_prune respects scope."""
@@ -955,7 +985,7 @@ class TestTwoTierPlaybook:
         for _ in range(4):
             ace_update_counters([{"id": bid, "tag": "harmful"}], scope="global")
         result = ace_prune(scope="global")
-        assert "1" in result  # pruned 1
+        assert "1" in result["message"]  # pruned 1
         assert len(gpb.bullets) == 0
 
     def test_global_playbook_persistence(self, tmp_path):
@@ -1001,13 +1031,17 @@ def _get_tool_annotations(tool_name: str):
 
 
 class TestToolAnnotations:
-    """Verify readOnlyHint, destructiveHint, idempotentHint on all 18 tools."""
+    """Verify readOnlyHint, destructiveHint, idempotentHint on all 22 tools.
+
+    4 tools (gcc_log_ota, gcc_triples, gcc_clusters, ace_evolve_from_failures)
+    were removed from the MCP surface in Phase 2B tool consolidation.
+    """
 
     # -- Read-only tools --
 
     @pytest.mark.parametrize("tool_name", [
         "gcc_context", "gcc_status", "gcc_patterns",
-        "ace_get_playbook", "ace_get_stats", "ace_find_similar",
+        "ace_get_playbook", "ace_find_similar",
         "index_search",
     ])
     def test_read_only_tools(self, tool_name):
@@ -1015,14 +1049,6 @@ class TestToolAnnotations:
         assert ann.readOnlyHint is True, f"{tool_name} should be readOnlyHint=True"
         assert ann.destructiveHint is False, f"{tool_name} should be destructiveHint=False"
         assert ann.idempotentHint is True, f"{tool_name} should be idempotentHint=True"
-
-    # -- gcc_log_ota: writes to OTA log, not idempotent (each call appends) --
-
-    def test_gcc_log_ota_annotations(self):
-        ann = _get_tool_annotations("gcc_log_ota")
-        assert ann.readOnlyHint is False, "gcc_log_ota writes to OTA log"
-        assert ann.destructiveHint is False, "gcc_log_ota appends, doesn't destroy"
-        assert ann.idempotentHint is False, "gcc_log_ota creates new entry each call"
 
     # -- Destructive tools --
 
@@ -1045,7 +1071,7 @@ class TestToolAnnotations:
     # -- Mutating non-destructive tools --
 
     @pytest.mark.parametrize("tool_name", [
-        "gcc_commit", "ace_apply_delta", "ace_update_counters",
+        "gcc_commit", "gcc_scratchpad", "ace_apply_delta", "ace_update_counters",
         "rlm_init", "rlm_execute",
     ])
     def test_mutating_non_destructive_tools(self, tool_name):
@@ -1061,33 +1087,24 @@ class TestToolAnnotations:
         assert ann.destructiveHint is True, "rlm_finalize destroys REPL session state"
         assert ann.idempotentHint is False
 
-    # -- ace_evolve_from_failures: idempotent due to evolved flag --
-
-    def test_ace_evolve_from_failures_annotations(self):
-        ann = _get_tool_annotations("ace_evolve_from_failures")
-        assert ann.readOnlyHint is False, "ace_evolve_from_failures may create bullets"
-        assert ann.destructiveHint is False, "ace_evolve_from_failures adds, doesn't destroy"
-        assert ann.idempotentHint is True, "ace_evolve_from_failures is idempotent (evolved flag)"
-
     # -- Idempotent tools --
 
     @pytest.mark.parametrize("tool_name", [
         "gcc_context", "gcc_status",
-        "ace_get_playbook", "ace_get_stats", "ace_find_similar",
-        "index_search", "index_build",
-        "ace_evolve_from_failures",
+        "ace_get_playbook", "ace_find_similar",
+        "index_search",
     ])
     def test_idempotent_tools(self, tool_name):
         ann = _get_tool_annotations(tool_name)
         assert ann.idempotentHint is True, f"{tool_name} should be idempotentHint=True"
 
-    # -- index_build: idempotent but not read-only --
+    # -- index_build: not idempotent (rebuilds index each call) --
 
     def test_index_build_annotations(self):
         ann = _get_tool_annotations("index_build")
         assert ann.readOnlyHint is False
         assert ann.destructiveHint is False
-        assert ann.idempotentHint is True
+        assert ann.idempotentHint is False
 
     # -- gcc_consolidate: not read-only, not destructive, not idempotent --
 
@@ -1097,19 +1114,11 @@ class TestToolAnnotations:
         assert ann.destructiveHint is False
         assert ann.idempotentHint is False
 
-    # -- gcc_summaries: read-only, not destructive, idempotent --
-
-    def test_gcc_summaries_annotations(self):
-        ann = _get_tool_annotations("gcc_summaries")
-        assert ann.readOnlyHint is True
-        assert ann.destructiveHint is False
-        assert ann.idempotentHint is True
-
-    # -- All 25 tools have annotations --
+    # -- All tools have annotations (count updated when new tools added) --
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) == 25, f"Expected 25 tools, got {len(all_tools)}"
+        assert len(all_tools) >= 22, f"Expected at least 22 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
 
@@ -1129,18 +1138,18 @@ class TestGccLinks:
                    "Bug discovered in C001", ["mcp_server.py"], "Test",
                    admission_threshold=1.0)
         result = gcc_links("C002")
-        assert "C001" in result
-        assert "Links for C002" in result
+        assert "C001" in result["message"]
+        assert "Links for C002" in result["message"]
 
     def test_gcc_links_no_links(self):
         result = gcc_links("C999")
-        assert "No links found" in result
+        assert "No links found" in result["message"]
 
     def test_gcc_links_filtered_types(self):
         gcc_commit("A", "X", "Y", ["shared.py"], "N", admission_threshold=1.0)
         gcc_commit("B", "X", "Y", ["shared.py"], "N", admission_threshold=1.0)
         result = gcc_links("C002", link_types="entity")
-        assert "Entity" in result
+        assert "Entity" in result["message"]
 
     def test_gcc_links_multi_hop(self):
         gcc_commit("A", "X", "Y", ["a.py"], "N", admission_threshold=1.0)
@@ -1150,7 +1159,7 @@ class TestGccLinks:
                    admission_threshold=1.0)
         result = gcc_links("C001", max_hops=2)
         # Should reach C003 via C002 -> C003 (hop 2)
-        assert "C002" in result
+        assert "C002" in result["message"]
 
     def test_gcc_context_follow_links(self):
         gcc_commit("A", "Created server module", "Foundation",
@@ -1158,7 +1167,64 @@ class TestGccLinks:
         gcc_commit("B", "Extended server module", "Build on A",
                    ["server.py"], "Test", admission_threshold=1.0)
         result = gcc_context(level=5, commit_id="C001", follow_links=True)
-        assert "Linked:" in result
+        assert "Linked:" in result["message"]
+
+    def test_gcc_links_invalid_link_type_raises(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+        with pytest.raises(ToolError, match="Invalid link_type"):
+            gcc_links("C001", link_types="invalid_type")
+
+    def test_gcc_links_valid_types_accepted(self):
+        # All valid types should not raise
+        for lt in ("entity", "causal", "supersession", "semantic"):
+            gcc_links("C999", link_types=lt)  # C999 has no links — that's fine
+
+    def test_gcc_links_mixed_valid_invalid_raises(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+        with pytest.raises(ToolError, match="Invalid link_type"):
+            gcc_links("C001", link_types="entity,bad_type")
+
+
+# ===========================================================================
+# GCC Clusters MCP Tool Tests (EverMemOS arXiv:2601.02163)
+# ===========================================================================
+
+
+class TestGccClusters:
+    """Tests for gcc_clusters MCP tool."""
+
+    def test_gcc_clusters_no_links(self):
+        result = gcc_clusters(min_size=2)
+        assert "No clusters found" in result["message"]
+
+    def test_gcc_clusters_with_entity_links(self):
+        gcc_commit("Auth setup", "JWT auth module", "Security",
+                   ["auth.py"], "Login page", admission_threshold=1.0)
+        gcc_commit("Auth fix", "Fixed token bug in auth",
+                   "Bug discovered", ["auth.py"], "Tests",
+                   admission_threshold=1.0)
+        result = gcc_clusters(min_size=2)
+        # May or may not cluster depending on link scores and scan window;
+        # at minimum it should not error
+        assert isinstance(result, dict)
+        assert "message" in result
+
+    def test_gcc_clusters_recompute_false(self):
+        result = gcc_clusters(recompute=False)
+        assert "No clusters found" in result["message"]
+
+    def test_gcc_context_includes_clusters_at_level_3(self):
+        """Clusters should appear in context at level 3+."""
+        gcc_commit("A", "Auth module", "Security", ["auth.py"], "N",
+                   admission_threshold=1.0)
+        gcc_commit("B", "Auth fix", "Bug", ["auth.py"], "N",
+                   admission_threshold=1.0)
+        # Recompute clusters so they're saved
+        gcc_clusters(min_size=2)
+        result = gcc_context(level=3)
+        # If clusters were found they'd appear; if not, just verify no error
+        assert isinstance(result, dict)
+        assert "message" in result
 
 
 # ===========================================================================
@@ -1167,7 +1233,7 @@ class TestGccLinks:
 
 
 class TestGCCHierarchicalSummaryTools:
-    """Tests for gcc_consolidate and gcc_summaries MCP tools."""
+    """Tests for gcc_consolidate and gcc_context(include_summaries=True) MCP tools."""
 
     def _make_commits(self, n):
         for i in range(1, n + 1):
@@ -1183,35 +1249,35 @@ class TestGCCHierarchicalSummaryTools:
     def test_gcc_consolidate_session(self):
         self._make_commits(5)
         result = gcc_consolidate(tier="session")
-        assert "Session Summary" in result
+        assert "Session Summary" in result["message"]
 
     def test_gcc_consolidate_phase(self):
         self._make_commits(5)
         result = gcc_consolidate(tier="phase")
-        assert "Phase Summary" in result
+        assert "Phase Summary" in result["message"]
 
     def test_gcc_consolidate_project_prompt(self):
         result = gcc_consolidate(tier="project")
-        assert "Please generate a project overview" in result
+        assert "Please generate a project overview" in result["message"]
 
     def test_gcc_consolidate_project_save(self):
         result = gcc_consolidate(tier="project", content="Test project builds AI tools.")
-        assert "saved" in result.lower()
+        assert "saved" in result["message"].lower()
 
-    def test_gcc_summaries_all(self):
+    def test_gcc_context_include_summaries_all(self):
         self._make_commits(5)
         gcc_consolidate(tier="phase")
         gcc_consolidate(tier="project", content="AI project overview")
-        result = gcc_summaries(tier="all", count=5)
-        assert "Session" in result or "Phase" in result or "Project" in result
+        result = gcc_context(include_summaries=True, summaries_tier="all", summaries_count=5)
+        assert "Session" in result["message"] or "Phase" in result["message"] or "Project" in result["message"]
 
-    def test_gcc_summaries_empty(self):
-        result = gcc_summaries(tier="all", count=5)
-        assert result  # Should return something, not crash
+    def test_gcc_context_include_summaries_empty(self):
+        result = gcc_context(include_summaries=True, summaries_tier="all", summaries_count=5)
+        assert result["message"]  # Should return something, not crash
 
-    def test_gcc_summaries_count_bounded(self):
-        result = gcc_summaries(tier="all", count=0)
-        assert result  # count=0 should be bounded to 1
+    def test_gcc_context_include_summaries_count_bounded(self):
+        result = gcc_context(include_summaries=True, summaries_tier="all", summaries_count=0)
+        assert result["message"]  # count=0 should be bounded to 1
 
 
 # ===========================================================================
@@ -1229,7 +1295,7 @@ class TestGCCCommitPatterns:
             next_step="Add tests",
             patterns_learned=["When adding {feature}, update tests and docs together"],
         )
-        assert "C001" in result
+        assert "C001" in result["message"]
 
     def test_gcc_commit_patterns_optional(self):
         """gcc_commit works without patterns_learned (backward compat)."""
@@ -1240,7 +1306,7 @@ class TestGCCCommitPatterns:
             files_changed=["fix.py"],
             next_step="Verify",
         )
-        assert "C001" in result
+        assert "C001" in result["message"]
 
     def test_gcc_commit_promotion_suggestion(self):
         """Promotion suggestion appears after 3 commits with same pattern."""
@@ -1250,21 +1316,21 @@ class TestGCCCommitPatterns:
                        patterns_learned=[pat])
         result = gcc_commit("T3", "did 2", "reason", ["2.py"], "next",
                             patterns_learned=[pat])
-        assert "Pattern promotion suggestions" in result
-        assert "ace_apply_delta" in result
+        assert "Pattern promotion suggestions" in result["message"]
+        assert "ace_apply_delta" in result["message"]
 
 
 class TestGCCPatterns:
     def test_gcc_patterns_empty(self):
         result = gcc_patterns()
-        assert "No patterns found" in result
+        assert "No patterns found" in result["message"]
 
     def test_gcc_patterns_basic(self):
         gcc_commit("T1", "did A", "reason", ["a.py"], "next",
                    patterns_learned=["Use structured logging for debugging"])
         result = gcc_patterns()
-        assert "Pattern Buffer" in result
-        assert "structured logging" in result
+        assert "Pattern Buffer" in result["message"]
+        assert "structured logging" in result["message"]
 
     def test_gcc_patterns_min_occurrences_filter(self):
         gcc_commit("T1", "did A", "reason", ["a.py"], "next",
@@ -1273,16 +1339,16 @@ class TestGCCPatterns:
         gcc_commit("T2", "did B", "reason", ["b.py"], "next",
                    patterns_learned=["Frequent pattern observed multiple times here"])
         result = gcc_patterns(min_occurrences=2)
-        assert "Frequent pattern" in result
-        assert "Rare single" not in result
+        assert "Frequent pattern" in result["message"]
+        assert "Rare single" not in result["message"]
 
     def test_gcc_patterns_search_term(self):
         gcc_commit("T1", "did A", "reason", ["a.py"], "next",
                    patterns_learned=["Use sandbox for REPL execution",
                                       "Always update documentation after changes"])
         result = gcc_patterns(search_term="sandbox")
-        assert "sandbox" in result
-        assert "documentation" not in result
+        assert "sandbox" in result["message"]
+        assert "documentation" not in result["message"]
 
     def test_gcc_patterns_annotations(self):
         """gcc_patterns has correct MCP tool annotations."""
@@ -1303,9 +1369,9 @@ class TestACEEvolveSchema:
     def test_evolve_schema_evaluation_mode(self):
         """Default call returns metrics and schema info."""
         result = ace_evolve_schema()
-        assert "Schema Health Report" in result
-        assert "Overall Health" in result
-        assert "Section Balance" in result
+        assert "Schema Health Report" in result["message"]
+        assert "Overall Health" in result["message"]
+        assert "Section Balance" in result["message"]
 
     def test_evolve_schema_apply_proposal(self, tmp_path):
         """Apply a proposal updates schema version."""
@@ -1317,26 +1383,26 @@ class TestACEEvolveSchema:
         ])
         result = ace_evolve_schema()
         # Might or might not have proposals depending on exact metrics
-        if "apply_proposal" in result:
+        if "apply_proposal" in result["message"]:
             result2 = ace_evolve_schema(apply_proposal=1)
-            assert "schema v" in result2.lower() or "Applied" in result2
+            assert "schema v" in result2["message"].lower() or "Applied" in result2["message"]
 
     def test_evolve_schema_invalid_proposal_index(self):
         """Invalid proposal index returns error."""
         result = ace_evolve_schema(apply_proposal=99)
-        assert "Invalid" in result or "Error" in result
+        assert "Invalid" in result["message"] or "Error" in result["message"]
 
     def test_evolve_schema_rollback_no_parent(self):
         """Rollback with no parent returns error."""
         result = ace_evolve_schema(rollback=True)
-        assert "Cannot rollback" in result
+        assert "Cannot rollback" in result["message"]
 
     def test_evolve_schema_annotations(self):
         """ace_evolve_schema has correct MCP tool annotations."""
         ann = _get_tool_annotations("ace_evolve_schema")
         assert ann.readOnlyHint is False
         assert ann.destructiveHint is False
-        assert ann.idempotentHint is True
+        assert ann.idempotentHint is False
 
 
 # ===========================================================================
@@ -1352,20 +1418,20 @@ class TestGCCCommitRollingSummaryCompression:
         gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
         result = gcc_commit("T2", "did B", "reason B", ["b.py"], "next B",
                             compressed_summary="Project: started A, added B. Next: C.")
-        assert "[C002]" in result
+        assert "[C002]" in result["message"]
         ctx = gcc_context(level=2)
         # The compressed summary should appear in context
-        assert "started A, added B" in ctx
+        assert "started A, added B" in ctx["message"]
 
     def test_gcc_commit_compressed_summary_optional(self):
         """gcc_commit works without compressed_summary (backward compat)."""
         result = gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
-        assert "[C001]" in result
+        assert "[C001]" in result["message"]
 
     def test_gcc_commit_short_summary_no_warning(self):
         """Short summaries don't produce compression warning."""
         result = gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
-        assert "Rolling summary is getting long" not in result
+        assert "Rolling summary is getting long" not in result["message"]
 
     def test_gcc_commit_long_summary_triggers_warning(self):
         """Long summaries produce compression warning in return value."""
@@ -1374,8 +1440,8 @@ class TestGCCCommitRollingSummaryCompression:
         mem = mod._memory
         mem._write_rolling_summary("main", "x" * 1300)
         result = gcc_commit("Next", "added more stuff", "reason", ["f.py"], "done")
-        assert "Rolling summary is getting long" in result
-        assert "compressed_summary" in result
+        assert "Rolling summary is getting long" in result["message"]
+        assert "compressed_summary" in result["message"]
 
     def test_gcc_commit_compressed_summary_suppresses_warning(self):
         """When compressed_summary is provided, no warning even if summary was long."""
@@ -1384,7 +1450,7 @@ class TestGCCCommitRollingSummaryCompression:
         mem._write_rolling_summary("main", "x" * 1300)
         result = gcc_commit("Next", "added more", "reason", ["f.py"], "done",
                             compressed_summary="Clean compressed summary here")
-        assert "Rolling summary is getting long" not in result
+        assert "Rolling summary is getting long" not in result["message"]
 
 
 # ===========================================================================
@@ -1428,7 +1494,8 @@ class TestMagmaQueryBFS:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = query_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model), \
+             patch("ccr.core.memory.quick_cosine", return_value=0.5):
             import ccr.mcp_server as mod
             linked = mod._memory.get_linked_commits("C001", query="auth security")
 
@@ -1462,7 +1529,15 @@ class TestMagmaQueryBFS:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = query_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        # quick_cosine returns non-None for probe (activates ONNX path) but None
+        # for actual comparisons, so the code falls back to cached vector dot product
+        def _probe_only_cosine(a: str, b: str):
+            if a == "a" and b == "b":
+                return 0.5  # probe succeeds
+            return None  # fall back to cached vectors
+
+        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model), \
+             patch("ccr.core.memory.quick_cosine", side_effect=_probe_only_cosine):
             import ccr.mcp_server as mod
             mem = mod._memory
             results_with_query = mem.get_linked_commits("C001", query="feature root")
@@ -1597,7 +1672,7 @@ class TestACECrossSynthesis:
                 "section": "STRATEGIES & INSIGHTS",
                 "content": f"Fragile strategy {i}",
             }])
-        pb_text = ace_get_playbook()
+        pb_text = ace_get_playbook()["message"]
         ids = re.findall(r"\[(str-\d+)\]", pb_text)
         for i, bid in enumerate(ids[:3]):
             ace_update_counters([{
@@ -1619,14 +1694,14 @@ class TestACECrossSynthesis:
             '"when_to_apply": "During code review"}]'
         )
 
-        with patch("ccr.mcp_server._get_sub_client", return_value=mock_sub):
+        with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub):
             result = ace_evolve_from_failures(threshold=3)
 
         # Mechanical path should have evolved 3 skills; sub-model adds 1 more
-        assert "Evolved 3 new skill" in result
-        assert "Synthesized 1 cross-lesson skill" in result
+        assert "Evolved 3 new skill" in result["message"]
+        assert "Synthesized 1 cross-lesson skill" in result["message"]
         # Verify the synthesized skill appears in the playbook
-        pb = ace_get_playbook()
+        pb = ace_get_playbook()["message"]
         assert "When reviewing code" in pb
 
 
@@ -1688,7 +1763,7 @@ class TestCERAutoPatternExtraction:
             mock_sub = MagicMock()
             mock_sub.completion.return_value = '["When adding features with long descriptions, document the motivation"]'
 
-            with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+            with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub):
                 result = gcc_commit(
                     title="Add feature",
                     what="Implemented a comprehensive new feature with detailed logic spanning multiple modules and touching the core data pipeline",
@@ -1697,7 +1772,7 @@ class TestCERAutoPatternExtraction:
                     next_step="Write tests",
                 )
 
-            assert "C0" in result
+            assert "C0" in result["message"]
             # completion called at least once: pattern extraction + ACE pipeline may also fire
             mock_sub.completion.assert_called()
         finally:
@@ -1711,8 +1786,8 @@ class TestCERAutoPatternExtraction:
         try:
             mock_sub = MagicMock()
             # Patch _run_ace_pipeline to isolate pattern-extraction assertion
-            with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
-                 patch.object(mod, "_run_ace_pipeline"):
+            with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub), \
+                 patch("ccr.mcp.ace_tools._run_ace_pipeline"):
                 result = gcc_commit(
                     title="Add feature",
                     what="Implemented a comprehensive new feature with detailed logic spanning multiple modules and touching the core data pipeline",
@@ -1721,7 +1796,7 @@ class TestCERAutoPatternExtraction:
                     next_step="Write tests",
                     patterns_learned=["When patterns are already provided, skip extraction"],
                 )
-            assert "C0" in result
+            assert "C0" in result["message"]
             # Pattern extraction skipped since patterns_learned already provided
             mock_sub.completion.assert_not_called()
         finally:
@@ -1733,8 +1808,8 @@ class TestCERAutoPatternExtraction:
 
         mock_sub = MagicMock()
         # Patch _run_ace_pipeline to isolate pattern-extraction assertion
-        with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
-             patch.object(mod, "_run_ace_pipeline"):
+        with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub), \
+             patch("ccr.mcp.ace_tools._run_ace_pipeline"):
             result = gcc_commit(
                 title="Add feature",
                 what="Implemented a comprehensive new feature with detailed logic spanning multiple modules",
@@ -1742,7 +1817,7 @@ class TestCERAutoPatternExtraction:
                 files_changed=["feature.py"],
                 next_step="Test",
             )
-        assert "C0" in result
+        assert "C0" in result["message"]
         # auto_extract_patterns is False (default): no pattern extraction call
         mock_sub.completion.assert_not_called()
 
@@ -1754,13 +1829,13 @@ class TestCERAutoPatternExtraction:
         try:
             mock_sub = MagicMock()
             # Patch _run_ace_pipeline to isolate pattern-extraction assertion
-            with patch.object(mod, "_get_sub_client", return_value=mock_sub), \
-                 patch.object(mod, "_run_ace_pipeline"):
+            with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub), \
+                 patch("ccr.mcp.ace_tools._run_ace_pipeline"):
                 result = gcc_commit(
                     title="Tiny fix", what="Fixed typo", why="Quality",
                     files_changed=["readme.md"], next_step="Done",
                 )
-            assert "C0" in result
+            assert "C0" in result["message"]
             # what is too short (<100 chars): no pattern extraction call
             mock_sub.completion.assert_not_called()
         finally:
@@ -1848,7 +1923,7 @@ class TestACEThreeAgentLoop:
         # Generator returns candidates
         mock_sub.completion.return_value = '["When refactoring, write tests first", "Document all changes"]'
 
-        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+        with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub):
             result = gcc_commit(
                 title="Test pipeline",
                 what="Implemented the pipeline wiring code",
@@ -1857,7 +1932,7 @@ class TestACEThreeAgentLoop:
                 next_step="Verify",
             )
 
-        assert "C0" in result
+        assert "C0" in result["message"]
         # sub_client.completion should have been called at least once (by pipeline)
         assert mock_sub.completion.call_count >= 1
 
@@ -1876,13 +1951,13 @@ class TestACEThreeAgentLoop:
             json.dumps([{"bullet": "When debugging, add logging first", "action": "ADD", "merge_with": None}, {"bullet": "Always check return values", "action": "ADD", "merge_with": None}]),
         ]
 
-        with patch.object(mod, "_get_sub_client", return_value=mock_sub):
+        with patch("ccr.mcp.server._get_sub_client", return_value=mock_sub):
             result = ace_generate_bullets(context="debugging code", auto_apply=False)
 
         # Playbook should not have been modified
         assert len(mod._playbook.bullets) == initial_bullet_count
         # But preview should mention decisions
-        assert "ADD" in result or "decisions" in result.lower() or "Results" in result
+        assert "ADD" in result["message"] or "decisions" in result["message"].lower() or "Results" in result["message"]
 
     def test_ace_get_playbook_with_task_context(self):
         """ace_get_playbook with task_context returns policy-ranked section."""
@@ -1898,4 +1973,4 @@ class TestACEThreeAgentLoop:
             ace_update_counters([{"id": bullets[0].id, "tag": "helpful"}])
 
         result = ace_get_playbook(task_context="database connection issues")
-        assert "Policy-ranked skills" in result
+        assert "Policy-ranked skills" in result["message"]

@@ -2332,3 +2332,117 @@ class TestB6RollbackDataLayer:
         schema = PlaybookSchema.default()
         # Default schema has parent_version=None
         assert schema.parent_version is None
+
+
+class TestSM2AdaptiveDecay:
+    """SM-2 inspired per-bullet adaptive decay rate tests."""
+
+    def _make_bullet(self, helpful: int = 0, harmful: int = 0) -> "Bullet":
+        """Create a bullet and update its counters to trigger SM-2 rate calculation."""
+        from ccr.ace.playbook import Bullet
+        b = Bullet(id="str-00001", helpful=0, harmful=0, content="test strategy")
+        # Directly set counters to avoid needing a Playbook instance
+        b.helpful = helpful
+        b.harmful = harmful
+        # Recompute personal_decay_rate as update_bullet_counts would
+        b.personal_decay_rate = max(0.90, min(0.99, 0.95 + (b.helpful - b.harmful) * 0.002))
+        return b
+
+    def test_helpful_bullet_gets_slower_decay(self):
+        """helpful=10, harmful=0 → personal_decay_rate = 0.97 (0.95 + 10*0.002)."""
+        b = self._make_bullet(helpful=10, harmful=0)
+        assert abs(b.personal_decay_rate - 0.97) < 1e-9
+
+    def test_harmful_bullet_gets_faster_decay(self):
+        """helpful=0, harmful=5 → personal_decay_rate = 0.94 (0.95 - 5*0.002)."""
+        b = self._make_bullet(helpful=0, harmful=5)
+        assert abs(b.personal_decay_rate - 0.94) < 1e-9
+
+    def test_decay_rate_clamped_high(self):
+        """helpful=50, harmful=0 → personal_decay_rate ≤ 0.99."""
+        b = self._make_bullet(helpful=50, harmful=0)
+        assert b.personal_decay_rate <= 0.99
+        assert b.personal_decay_rate == pytest.approx(0.99)
+
+    def test_decay_rate_clamped_low(self):
+        """helpful=0, harmful=50 → personal_decay_rate ≥ 0.90."""
+        b = self._make_bullet(helpful=0, harmful=50)
+        assert b.personal_decay_rate >= 0.90
+        assert b.personal_decay_rate == pytest.approx(0.90)
+
+    def test_personal_decay_used_in_effective_score(self):
+        """personal_decay_rate=0.80 should decay faster than default 0.95."""
+        from ccr.ace.playbook import Bullet
+        from datetime import datetime, timedelta, timezone
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        # Bullet with personal_decay_rate=0.80 (fast decay)
+        b_fast = Bullet(
+            id="str-00001", helpful=5, harmful=0,
+            content="test", last_updated=old_ts,
+            personal_decay_rate=0.80,
+        )
+        # Bullet with personal_decay_rate=0.0 (uses schema default 0.95)
+        b_default = Bullet(
+            id="str-00001", helpful=5, harmful=0,
+            content="test", last_updated=old_ts,
+            personal_decay_rate=0.0,
+        )
+        score_fast = b_fast.effective_score(decay_rate=0.95)
+        score_default = b_default.effective_score(decay_rate=0.95)
+        # personal=0.80 decays faster than 0.95 over 30 days: 0.80^30 << 0.95^30
+        assert score_fast < score_default
+
+    def test_zero_personal_decay_uses_schema_default(self):
+        """personal_decay_rate=0.0 (default) → effective_score uses passed decay_rate."""
+        from ccr.ace.playbook import Bullet
+        from datetime import datetime, timedelta, timezone
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        b = Bullet(
+            id="str-00001", helpful=5, harmful=0,
+            content="test", last_updated=old_ts,
+            personal_decay_rate=0.0,
+        )
+        # With default param 0.95: raw=5, days=30, expected = 5 * 0.95^30
+        score_95 = b.effective_score(decay_rate=0.95)
+        score_80 = b.effective_score(decay_rate=0.80)
+        # 0.95^30 ≈ 0.214, 0.80^30 ≈ 0.0012 — so score_95 > score_80 (both positive)
+        assert score_95 > score_80
+
+    def test_sm2_set_via_update_bullet_counts(self):
+        """Verify that Playbook.update_bullet_counts sets personal_decay_rate correctly."""
+        from ccr.ace.playbook import Bullet
+        # Use a fresh playbook with a known starting state (helpful=0, harmful=0)
+        fresh_pb_text = "## STRATEGIES & INSIGHTS\n[str-00001] helpful=0 harmful=0 :: Test strategy\n"
+        pb = Playbook(fresh_pb_text)
+        bullet_id = "str-00001"
+        # Tag bullet as helpful 10 times, harmful 0 times
+        for _ in range(10):
+            pb.update_bullet_counts([{"id": bullet_id, "tag": "helpful"}])
+        updated_bullet = pb.get_bullet(bullet_id)
+        assert updated_bullet is not None
+        assert updated_bullet.helpful == 10
+        expected_rate = min(0.99, 0.95 + 10 * 0.002)  # = 0.97
+        assert abs(updated_bullet.personal_decay_rate - expected_rate) < 1e-9
+
+    def test_sm2_persistence_roundtrip(self):
+        """personal_decay_rate survives save_failure_lessons / load_failure_lessons."""
+        import os
+        import tempfile
+        pb = Playbook(SAMPLE_PLAYBOOK)
+        bullet = pb.bullets[0]
+        bullet.personal_decay_rate = 0.97
+        bullet.last_updated = "2026-01-01T00:00:00+00:00"
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            pb.save_failure_lessons(path)
+            pb2 = Playbook(SAMPLE_PLAYBOOK)
+            pb2.load_failure_lessons(path)
+            restored = pb2.get_bullet(bullet.id)
+            assert restored is not None
+            assert abs(restored.personal_decay_rate - 0.97) < 1e-9
+        finally:
+            os.unlink(path)

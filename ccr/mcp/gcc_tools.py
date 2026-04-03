@@ -324,10 +324,17 @@ def gcc_links(
                is weighted by query relevance (MAGMA intent-aware traversal, Alg. 1).
                Example: query="why was the auth system changed"
     """
+    _VALID_LINK_TYPES = {"entity", "causal", "supersession", "semantic"}
     max_hops = max(1, min(max_hops, 5))
     with _srv._state_lock:
         mem = _srv._ensure_memory()
-    types = [t.strip() for t in link_types.split(",")] if link_types else None
+    types = None
+    if link_types:
+        parsed = [t.strip().lower() for t in link_types.split(",") if t.strip()]
+        invalid = [t for t in parsed if t not in _VALID_LINK_TYPES]
+        if invalid:
+            raise ToolError(f"Invalid link_type(s): {invalid!r}. Valid: {sorted(_VALID_LINK_TYPES)}")
+        types = parsed if parsed else None
     linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops, query=query)
     if not linked:
         # Still show direct link summary even if BFS returned nothing
