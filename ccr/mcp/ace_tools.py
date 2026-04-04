@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
@@ -15,6 +17,31 @@ from ccr.mcp.server import mcp
 import ccr.mcp.server as _srv
 
 # All server functions/globals accessed via _srv to support test patching.
+
+# ---------------------------------------------------------------------------
+# Module-level idempotency key store (B3)
+# ---------------------------------------------------------------------------
+
+_applied_idempotency_keys: set[str] = set()
+
+
+# ---------------------------------------------------------------------------
+# Helper: resolve .ccr/ directory for a given scope (B2, B6)
+# ---------------------------------------------------------------------------
+
+
+def _get_playbook_dir(scope: str) -> str:
+    """Return the .ccr/ directory path for the given scope."""
+    if scope == "global":
+        return os.path.expanduser("~/.ccr")
+    # Project scope: derive from _playbook_path
+    pp = _srv._playbook_path
+    if pp:
+        return os.path.dirname(pp)
+    # Fallback: use project root
+    return os.path.join(_srv._project_root, ".ccr")
+
+
 from ccr.mcp_types import (
     AceApplyDeltaResult,
     AceEvolveFromFailuresResult,
@@ -143,6 +170,8 @@ def ace_apply_delta(
     operations: list[dict],
     scope: str = "project",
     dry_run: bool = False,
+    atomic: bool = False,
+    author: str = "",
 ) -> AceApplyDeltaResult:
     """Apply delta operations to the playbook.
 
@@ -168,6 +197,8 @@ def ace_apply_delta(
         dry_run: If True, preview what would happen without modifying the playbook.
             Reports which bullet_ids would be found/missing, counts ADDs/UPDATEs/MERGEs/REMOVEs,
             and shows new playbook size — without actually saving any changes.
+        atomic: If True, roll back all changes on any exception during apply.
+        author: Optional author identifier recorded in the history log.
     """
     try:
         with _srv._state_lock:
@@ -203,8 +234,25 @@ def ace_apply_delta(
                     result["failed_ids"] = failed_ids
                 return result
 
-            applied = pb.apply_delta(ops)
-            save_fn()
+            # Atomic snapshot before apply (B2)
+            snapshot: str | None = None
+            if atomic:
+                snapshot = pb.serialize()
+
+            try:
+                applied = pb.apply_delta(ops)
+                save_fn()
+            except Exception:
+                if atomic and snapshot is not None:
+                    # Rollback: restore playbook from snapshot
+                    try:
+                        restored = Playbook(snapshot)
+                        pb._bullets = restored._bullets  # type: ignore[attr-defined]
+                        pb._next_id = restored._next_id  # type: ignore[attr-defined]
+                        save_fn()
+                    except Exception:
+                        pass
+                raise
 
         # Mark matching patterns as promoted (CER buffer close-the-loop)
         promoted_count = 0
@@ -222,9 +270,44 @@ def ace_apply_delta(
             text += f" Marked {promoted_count} pattern(s) as promoted in CER buffer."
         if failed_ids:
             text += f"\nWarning: {len(failed_ids)} operation(s) referenced missing bullet ID(s): {failed_ids}"
+
+        # Write history log (B2)
+        history_path: str | None = None
+        try:
+            ccr_dir = _get_playbook_dir(scope)
+            history_path = os.path.join(ccr_dir, "playbook_history.json")
+            existing: list[dict] = []
+            if os.path.isfile(history_path):
+                try:
+                    with open(history_path, "r", encoding="utf-8") as fh:
+                        existing = json.load(fh)
+                    if not isinstance(existing, list):
+                        existing = []
+                except Exception:
+                    existing = []
+            entry: dict = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "author": author,
+                "ops_count": len(ops),
+                "scope": scope,
+                "applied": applied,
+                "failed_ids": failed_ids,
+            }
+            existing.append(entry)
+            tmp_path = history_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh, indent=2)
+            os.replace(tmp_path, history_path)
+        except Exception:
+            pass  # Never fail the apply operation
+
         result: AceApplyDeltaResult = {"applied": applied, "scope": scope, "message": text}
         if failed_ids:
             result["failed_ids"] = failed_ids
+        if history_path:
+            result["delta_history_path"] = history_path
+        if author:
+            result["author"] = author
         return result
     except ValueError:
         raise  # User input validation — let MCP propagate
@@ -233,7 +316,11 @@ def ace_apply_delta(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> AceUpdateCountersResult:
+def ace_update_counters(
+    bullet_tags: list[dict],
+    scope: str = "project",
+    idempotency_key: str = "",
+) -> AceUpdateCountersResult:
     """Update helpful/harmful counters for playbook bullets.
 
     After completing a task, reflect on which strategies helped or hurt,
@@ -258,7 +345,31 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> AceU
                 "prevention_principle": "General rule to avoid this failure"
               }
         scope: "project" (default) or "global".
+        idempotency_key: If non-empty, prevents double-applying the same update.
+            A second call with the same key returns early without modifying the playbook.
     """
+    # Idempotency check (B3)
+    if idempotency_key and idempotency_key in _applied_idempotency_keys:
+        return AceUpdateCountersResult(
+            updated=0,
+            scope=scope,
+            message=f"Already applied (idempotency_key: {idempotency_key!r}). Skipped.",
+        )
+
+    # Validate failure_lesson dicts — collect warnings, don't block (B3)
+    _required_lesson_keys = {
+        "failure_point", "flawed_reasoning", "counterfactual", "prevention_principle"
+    }
+    validation_warnings: list[str] = []
+    for i, tag_entry in enumerate(bullet_tags):
+        lesson = tag_entry.get("failure_lesson")
+        if isinstance(lesson, dict) and lesson:
+            missing_keys = _required_lesson_keys - set(lesson.keys())
+            if missing_keys:
+                validation_warnings.append(
+                    f"failure_lesson[{i}] missing keys: {sorted(missing_keys)}"
+                )
+
     try:
         with _srv._state_lock:
             pb, save_fn = _srv._resolve_playbook(scope)
@@ -266,6 +377,10 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> AceU
             # Recompute GRPO advantages after counter update (SkillRL Eq.3)
             pb.recompute_grpo_advantages()
             save_fn()
+
+        # Mark idempotency key as used after successful update (B3)
+        if idempotency_key:
+            _applied_idempotency_keys.add(idempotency_key)
 
         # Propagate quality feedback to source patterns (EvolveR-inspired)
         quality_propagated = 0
@@ -303,6 +418,8 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> AceU
             parts.append(f"Recorded {lessons_added} structured failure lesson(s).")
         if quality_propagated:
             parts.append(f"Propagated quality to {quality_propagated} source pattern(s).")
+        if validation_warnings:
+            parts.append("Validation warnings: " + "; ".join(validation_warnings))
         text = " ".join(parts)
         result: AceUpdateCountersResult = {"updated": updated, "scope": scope, "message": text}
         if missing:
@@ -316,7 +433,12 @@ def ace_update_counters(bullet_tags: list[dict], scope: str = "project") -> AceU
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindSimilarResult:
+def ace_find_similar(
+    threshold: float = 0.6,
+    scope: str = "project",
+    section: str = "",
+    auto_merge_above: float | None = None,
+) -> AceFindSimilarResult:
     """Find similar bullet pairs that may be candidates for merging.
 
     Uses Jaccard + trigram similarity. Returns pairs above the threshold
@@ -325,6 +447,10 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
     Args:
         threshold: Similarity threshold (0.0-1.0, default 0.6).
         scope: "project" (default), "global", or "cross" (find duplicates between tiers).
+        section: Optional section filter. Only pairs where at least one bullet's
+            section contains this string (case-insensitive) are returned.
+        auto_merge_above: If set, pairs with similarity >= this value are
+            automatically merged (MERGE delta op). Count returned in message.
     """
     threshold = max(0.0, min(threshold, 1.0))
     if scope == "cross":
@@ -370,6 +496,15 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
                 if combined >= threshold:
                     pairs.append((gb, pb_bullet, combined))
         pairs.sort(key=lambda x: x[2], reverse=True)
+
+        # Section filter (B5)
+        if section:
+            sec_lower = section.lower()
+            pairs = [
+                (a, b, sim) for a, b, sim in pairs
+                if sec_lower in a.section.lower() or sec_lower in b.section.lower()
+            ]
+
         if not pairs:
             return AceFindSimilarResult(pairs_found=0, scope=scope, message="No cross-tier similar bullet pairs found.")
         lines = ["Cross-tier similarities (global vs project):"]
@@ -380,8 +515,46 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
         text = "\n".join(lines)
         return AceFindSimilarResult(pairs_found=len(pairs), scope=scope, message=text)
 
-    pb, _ = _srv._resolve_playbook(scope)
+    pb, save_fn = _srv._resolve_playbook(scope)
     pairs = pb.find_similar_pairs(threshold)
+
+    # Section filter (B5)
+    if section:
+        sec_lower = section.lower()
+        pairs = [
+            (a, b, sim) for a, b, sim in pairs
+            if sec_lower in a.section.lower() or sec_lower in b.section.lower()
+        ]
+
+    # Auto-merge pairs above threshold (B5)
+    auto_merged_count = 0
+    if auto_merge_above is not None:
+        for a, b, sim in pairs:
+            if sim >= auto_merge_above:
+                try:
+                    merged_content = (
+                        a.content if a.helpful >= b.helpful else b.content
+                    )
+                    keeper_id = a.id if a.helpful >= b.helpful else b.id
+                    absorbed_id = b.id if keeper_id == a.id else a.id
+                    merge_op = DeltaOperation(
+                        op_type="MERGE",
+                        section="",
+                        content=merged_content,
+                        bullet_id=keeper_id,
+                        merge_target=absorbed_id,
+                    )
+                    with _srv._state_lock:
+                        pb.apply_delta([merge_op])
+                    auto_merged_count += 1
+                except Exception:
+                    pass  # Never fail the find operation
+        if auto_merged_count:
+            try:
+                save_fn()
+            except Exception:
+                pass
+
     if not pairs:
         text = f"No similar bullet pairs found in {scope} playbook."
         return AceFindSimilarResult(pairs_found=0, scope=scope, message=text)
@@ -390,6 +563,8 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
         lines.append(f"[{a.id}] vs [{b.id}] (similarity={sim:.2f})")
         lines.append(f"  A: {a.content[:100]}")
         lines.append(f"  B: {b.content[:100]}")
+    if auto_merged_count:
+        lines.append(f"\nAuto-merged {auto_merged_count} pair(s) above threshold {auto_merge_above}.")
     text = "\n".join(lines)
     pairs_list = []
     for a, b, sim in pairs[:25]:
@@ -406,7 +581,7 @@ def ace_find_similar(threshold: float = 0.6, scope: str = "project") -> AceFindS
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
-def ace_prune(scope: str = "project") -> AcePruneResult:
+def ace_prune(scope: str = "project", archive: bool = True) -> AcePruneResult:
     """Prune problematic bullets and enforce token budget.
 
     First evolves failure lessons into new skills (threshold=1, aggressive),
@@ -418,6 +593,8 @@ def ace_prune(scope: str = "project") -> AcePruneResult:
 
     Args:
         scope: "project" (default) or "global".
+        archive: If True (default), write pruned bullets to .ccr/archived_bullets.json
+            before removing them.
     """
     try:
         with _srv._state_lock:
@@ -428,13 +605,66 @@ def ace_prune(scope: str = "project") -> AcePruneResult:
             if sp and not os.path.isfile(sp):
                 _schema_warn = f" (schema file not found at {sp}; using defaults)"
             schema = _srv._load_schema(sp) if sp else PlaybookSchema.default()
+
+            # Snapshot bullets that will be pruned BEFORE pruning (B6)
+            prune_candidates = {
+                b.id: {
+                    "content": b.content,
+                    "section": b.section,
+                    "score": b.effective_score(),
+                }
+                for b in pb.bullets
+                if b.harmful >= schema.prune_min_harmful and b.harmful >= b.helpful
+            }
+
             # Evolve failure lessons BEFORE pruning to prevent permanent loss
             evolved = pb.evolve_from_failures(threshold=max(1, schema.evolution_threshold - 2))
             pruned = pb.prune_problematic(min_harmful=schema.prune_min_harmful)
             budget_pruned = pb.enforce_token_budget(
                 max_chars=schema.token_budget, decay_rate=schema.decay_rate,
             )
+
+            # Capture budget-pruned bullets for archive too (B6)
+            for b in budget_pruned:
+                if b.id not in prune_candidates:
+                    prune_candidates[b.id] = {
+                        "content": b.content,
+                        "section": b.section,
+                        "score": b.effective_score(),
+                    }
+
             save_fn()
+
+        # Archive pruned bullets (B6)
+        if archive and prune_candidates:
+            try:
+                ccr_dir = _get_playbook_dir(scope)
+                archive_path = os.path.join(ccr_dir, "archived_bullets.json")
+                entry = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reason": "pruned",
+                    "bullets": [
+                        {"id": bid, **data}
+                        for bid, data in prune_candidates.items()
+                    ],
+                }
+                existing_archive: list[dict] = []
+                if os.path.isfile(archive_path):
+                    try:
+                        with open(archive_path, "r", encoding="utf-8") as fh:
+                            existing_archive = json.load(fh)
+                        if not isinstance(existing_archive, list):
+                            existing_archive = []
+                    except Exception:
+                        existing_archive = []
+                existing_archive.append(entry)
+                tmp_archive_path = archive_path + ".tmp"
+                with open(tmp_archive_path, "w", encoding="utf-8") as fh:
+                    json.dump(existing_archive, fh, indent=2)
+                os.replace(tmp_archive_path, archive_path)
+            except Exception:
+                pass  # Never fail the prune operation
+
         total = len(pruned) + len(budget_pruned)
         removed_ids = [b.id for b in pruned] + [b.id for b in budget_pruned]
         parts = []
@@ -740,7 +970,11 @@ def _run_ace_pipeline(title: str, what: str, why: str, sub_client) -> None:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def ace_generate_bullets(context: str, auto_apply: bool = False) -> AceGenerateBulletsResult:
+def ace_generate_bullets(
+    context: str,
+    auto_apply: bool = False,
+    confirm_indices: list[int] | None = None,
+) -> AceGenerateBulletsResult:
     """Generate and optionally apply strategy bullets via the ACE 3-agent pipeline.
 
     Runs Generator -> Reflector -> Curator to produce candidate playbook bullets
@@ -749,6 +983,9 @@ def ace_generate_bullets(context: str, auto_apply: bool = False) -> AceGenerateB
     Args:
         context: Task context or trajectory to generate bullets from.
         auto_apply: If True, automatically apply ADD decisions. Default False (preview only).
+        confirm_indices: Optional list of decision indices (0-based) to apply.
+            When provided with auto_apply=True, only the specified decisions are applied.
+            When auto_apply=False, populates pending_decisions in the result.
     """
     try:
         sub = _srv._get_sub_client()
@@ -779,21 +1016,41 @@ def ace_generate_bullets(context: str, auto_apply: bool = False) -> AceGenerateB
         if not decisions:
             return AceGenerateBulletsResult(decisions=0, applied=0, message="Curator produced no decisions.")
 
+        # Build pending_decisions list for preview / confirm_indices (B4)
+        pending_decisions: list[dict] = []
+        for i, d in enumerate(decisions):
+            action = d.get("action", "ADD")
+            bullet_text = d.get("bullet", "")
+            pending_decisions.append({
+                "index": i,
+                "op_type": action,
+                "content": bullet_text,
+            })
+
         lines = ["# ACE Pipeline Results"]
         applied_count = 0
         if auto_apply:
+            # When confirm_indices given, restrict to those indices only (B4)
+            indices_to_apply: set[int] | None = None
+            if confirm_indices is not None:
+                indices_to_apply = set(confirm_indices)
+
             with _srv._state_lock:
                 pb = _srv._ensure_playbook()
-                for decision in decisions:
+                for i, decision in enumerate(decisions):
+                    if indices_to_apply is not None and i not in indices_to_apply:
+                        continue
                     action = decision.get("action", "ADD")
                     bullet_text = decision.get("bullet", "").strip()
                     if not bullet_text:
                         continue
                     if action == "ADD":
+                        # Append audit tag to bullet content (B4)
+                        tagged_content = bullet_text + " [_generated_by: ace_generate]"
                         op = DeltaOperation(
                             op_type="ADD",
                             section="STRATEGIES & INSIGHTS",
-                            content=bullet_text,
+                            content=tagged_content,
                         )
                         pb.apply_delta([op])
                         applied_count += 1
@@ -841,7 +1098,15 @@ def ace_generate_bullets(context: str, auto_apply: bool = False) -> AceGenerateB
                 lines.append(f"- [{action}] {bullet}")
 
         text = "\n".join(lines)
-        return AceGenerateBulletsResult(decisions=len(decisions), applied=applied_count, message=text)
+        result: AceGenerateBulletsResult = {
+            "decisions": len(decisions),
+            "applied": applied_count,
+            "message": text,
+        }
+        # Always populate pending_decisions when auto_apply is False or confirm_indices given (B4)
+        if not auto_apply or confirm_indices is not None:
+            result["pending_decisions"] = pending_decisions
+        return result
     except Exception as e:
         raise ToolError(f"{type(e).__name__}: {e}") from e
 

@@ -108,6 +108,8 @@ class AceApplyDeltaResult(TypedDict):
     scope: str
     message: str
     failed_ids: NotRequired[list[str]]
+    delta_history_path: NotRequired[str]
+    author: NotRequired[str]
 
 
 class AceUpdateCountersResult(TypedDict):
@@ -138,6 +140,7 @@ class AceGenerateBulletsResult(TypedDict):
     decisions: int
     applied: int
     message: str
+    pending_decisions: NotRequired[list[dict]]
 
 
 class AceEvolveFromFailuresResult(TypedDict):
@@ -173,6 +176,7 @@ class RlmExecuteResult(TypedDict):
 class RlmFinalizeResult(TypedDict):
     variable_name: str
     message: str
+    variables: NotRequired[dict]
 
 
 # ===========================================================================

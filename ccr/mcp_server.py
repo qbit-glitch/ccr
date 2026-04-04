@@ -74,6 +74,9 @@ from ccr.mcp.rlm_tools import (  # noqa: F401
     rlm_execute,
     rlm_finalize,
     _summarize_stdout,
+    _get_repl_for_session,
+    _get_session_age_warning,
+    _cleanup_session,
 )
 
 # Re-export all Index tool functions
@@ -105,6 +108,7 @@ for _name in (
     "_project_root", "_memory", "_playbook", "_playbook_path",
     "_failure_lessons_path", "_global_playbook", "_global_playbook_path",
     "_global_failure_lessons_path", "_repo_index", "_repl",
+    "_repl_sessions", "_repl_sessions_lock", "_repl_session_ttl",
     "_schema_path", "_global_schema_path", "_embedding_model",
     "_embeddings_path", "_chunk_embeddings_path", "_scratchpad",
     "_triple_store", "_state_lock",
@@ -126,7 +130,12 @@ for _name in (
     _PROXIED_ATTRS[_name] = _ace_mod
 
 # RLM helpers → ccr.mcp.rlm_tools
-for _name in ("_summarize_stdout",):
+for _name in (
+    "_summarize_stdout",
+    "_get_repl_for_session",
+    "_get_session_age_warning",
+    "_cleanup_session",
+):
     _PROXIED_ATTRS[_name] = _rlm_mod
 
 

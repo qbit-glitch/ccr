@@ -28,6 +28,7 @@ def index_build(
     filter_extensions: str = "",
     force: bool = False,
     max_file_size_kb: int = 500,
+    progress_interval: int = 100,
 ) -> IndexBuildResult:
     """Build or rebuild the repo index.
 
@@ -51,6 +52,7 @@ def index_build(
             (path, language, size) but content and symbols are skipped (default
             500 KB). Increase for repos with large generated files you want
             to search; decrease to speed up indexing.
+        progress_interval: Log a progress message every N files indexed (default 100).
     """
     # Parse filter_extensions
     exts: set[str] | None = None
@@ -93,6 +95,7 @@ def index_build(
                 _srv._project_root,
                 extensions=exts,
                 max_file_size_kb=max(1, max_file_size_kb),
+                progress_interval=progress_interval,
             )
 
             # Cache
@@ -147,6 +150,7 @@ def index_search(
     file_glob: str = "**/*",
     min_score: float = 0.0,
     symbols_only: bool = False,
+    mode_hint: bool = False,
 ) -> IndexSearchResult:
     """Search the repo index for files matching a query.
 
@@ -172,12 +176,26 @@ def index_search(
         symbols_only: If True, only return files where the query matches a symbol
             name (function, class). Filters out pure content/path matches.
             Best for "find all implementations of AuthService" queries.
+        mode_hint: If True, appends a recommended mode suggestion based on the query
+            shape (long query → semantic, path/extension → keyword, else → hybrid).
     """
     if mode not in ("keyword", "semantic", "hybrid"):
         raise ToolError(f"Invalid mode '{mode}'. Use 'keyword', 'semantic', or 'hybrid'.")
 
     top_k = max(1, min(top_k, 100))  # M3: bound top_k to prevent excessive results
     idx = _srv._ensure_index()
+
+    # Compute mode_hint suggestion upfront (independent of search results)
+    hint_suffix = ""
+    if mode_hint:
+        _file_extensions = {".py", ".ts", ".js", ".go", ".rs", ".yaml", ".json", ".md"}
+        if len(query) > 50:
+            suggestion = "semantic"
+        elif "/" in query or any(query.endswith(ext) for ext in _file_extensions):
+            suggestion = "keyword"
+        else:
+            suggestion = "hybrid"
+        hint_suffix = f"\n[mode_hint: recommended mode is '{suggestion}']"
 
     suffix = ""
     if return_snippets and mode != "hybrid":
@@ -219,7 +237,16 @@ def index_search(
             text += f" (min_score={min_score} may be filtering results)"
         if symbols_only:
             text += " (symbols_only=True: no symbol matched query)"
+        if hint_suffix:
+            text += hint_suffix
         return IndexSearchResult(result_count=0, mode=mode, message=text)
+
+    # Normalize scores to [0.0, 1.0] relative to top result
+    max_score = max((r.get("score", 0) for r in results), default=1)
+    if max_score == 0:
+        max_score = 1
+    for r in results:
+        r["score"] = round(r.get("score", 0) / max_score, 4)
 
     lines = [f"# {mode} search{suffix}"]
     for r in results:
@@ -231,6 +258,8 @@ def index_search(
         lines.append(line)
         if return_snippets and "snippet" in r:
             lines.append(f"  snippet: {r['snippet']}")
+    if hint_suffix:
+        lines.append(hint_suffix)
     text = "\n".join(lines)
     return IndexSearchResult(result_count=len(results), mode=mode, message=text)
 

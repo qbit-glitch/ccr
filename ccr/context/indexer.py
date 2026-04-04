@@ -7,6 +7,7 @@ Semantic search via optional ONNX embeddings (A-RAG §3.2) or BM25 fallback (CCR
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -139,6 +140,8 @@ class RepoIndex:
         self.files: dict[str, FileEntry] = {}
         self._built_at: float | None = None
         self._mtime_sig: str = ""
+        # SHA-256 hash cache for incremental skip (16-char hex prefix per file)
+        self._file_hashes: dict[str, str] = {}
         # Semantic search state
         self._embeddings: dict[str, list[float]] = {}
         self._bm25_cache: dict | None = None
@@ -153,8 +156,18 @@ class RepoIndex:
         max_file_size_kb: int = 500,
         extensions: set[str] | None = None,
         max_files: int = 50000,
+        progress_interval: int = 100,
     ) -> RepoIndex:
-        """Build index from filesystem. No LLM calls."""
+        """Build index from filesystem. No LLM calls.
+
+        Args:
+            root: Project root directory to index.
+            ignore_patterns: Additional glob patterns to ignore.
+            max_file_size_kb: Max file size in KB to index content (default 500).
+            extensions: If set, only index files with these extensions.
+            max_files: Max total files to index (default 50000).
+            progress_interval: Log a progress message every N files (default 100).
+        """
         index = cls(root)
         ignores = (ignore_patterns or []) + DEFAULT_IGNORES
         ignores += cls._load_gitignore(root)
@@ -197,6 +210,8 @@ class RepoIndex:
                     _content="",
                 )
                 file_count += 1
+                if file_count % progress_interval == 0 and file_count > 0:
+                    logger.info("Index progress: %d files indexed", file_count)
                 continue
 
             language = LANGUAGE_MAP.get(ext, ext.lstrip(".") or "unknown")
@@ -207,6 +222,10 @@ class RepoIndex:
             except (OSError, UnicodeDecodeError) as e:
                 logger.debug("Skipping unreadable file %s: %s", rel, e)
                 continue
+
+            # Compute SHA-256 hash (16-char prefix — adequate for cache dedup)
+            sha256 = hashlib.sha256(content.encode()).hexdigest()[:16]
+            index._file_hashes[rel] = sha256
 
             symbols = cls._extract_symbols(content, language)
             imports = cls._extract_imports(content, language)
@@ -227,6 +246,8 @@ class RepoIndex:
                 entry.chunks = cls._split_into_chunks(content, rel, max_tokens=800)
             index.files[rel] = entry
             file_count += 1
+            if file_count % progress_interval == 0 and file_count > 0:
+                logger.info("Index progress: %d files indexed", file_count)
 
         index._built_at = time.time()
         index._mtime_sig = index._compute_mtime_sig()
@@ -841,6 +862,7 @@ class RepoIndex:
             "built_at": self._built_at,
             "mtime_sig": self._mtime_sig or "",
             "file_count": len(self.files),
+            "file_hashes": self._file_hashes,
             "files": {},
         }
         for rel, entry in self.files.items():
@@ -899,6 +921,8 @@ class RepoIndex:
         try:
             data = json.loads(cache_json)
             index = cls(root)
+            # Backward compat: old caches won't have file_hashes
+            index._file_hashes = data.get("file_hashes", {})
             for rel, fdata in data.get("files", {}).items():
                 abs_path = os.path.join(root, rel)
                 if not os.path.isfile(abs_path):
