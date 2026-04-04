@@ -296,12 +296,12 @@ def gcc_context(
         if summaries_text.strip():
             result += "\n\n" + summaries_text
 
-    # Apply token budget if specified
+    # Apply token budget AFTER all sections appended (prevents silent overflow from clusters/summaries)
     if max_tokens is not None and max_tokens > 0:
-        budget_chars = max_tokens * 4  # rough 4 chars/token estimate
+        budget_chars = max_tokens * 4  # ~4 chars/token heuristic (matches estimate_tokens)
         if len(result) > budget_chars:
             result = result[:budget_chars]
-            result += f"\n\n[Context truncated to ~{max_tokens} tokens. Use level=2 or a lower level for targeted retrieval.]"
+            result += f"\n\n[Context truncated to ~{max_tokens} tokens. Use level=2 or sections filter for targeted retrieval.]"
 
     if _level_warnings:
         result = "\n".join(f"[Warning: {w}]" for w in _level_warnings) + "\n\n" + result

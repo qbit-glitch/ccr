@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 
 from mcp.types import ToolAnnotations
@@ -33,7 +34,12 @@ from ccr.utils.parsing import extract_json_string
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def ace_get_playbook(task_context: str = "", include_stats: bool = False) -> AcePlaybookResult:
+def ace_get_playbook(
+    task_context: str = "",
+    include_stats: bool = False,
+    section: str = "",
+    keyword: str = "",
+) -> AcePlaybookResult:
     """Get the current ACE playbook — both global and project-specific strategies.
 
     Returns two tiers:
@@ -47,6 +53,11 @@ def ace_get_playbook(task_context: str = "", include_stats: bool = False) -> Ace
             policy-ranked top-5 section weighted by relevance to your task.
         include_stats: If True, append per-bullet stats (counts, decay,
             section breakdown, evolution triggers). Replaces ace_get_stats.
+        section: Optional section name filter (e.g., "STRATEGIES & INSIGHTS").
+            Only bullets from this section are returned. Case-insensitive.
+        keyword: Optional keyword filter on bullet content. Only bullets
+            containing this keyword (case-insensitive) are returned.
+            Combine with section= for targeted retrieval.
     """
     gpb = _srv._ensure_global_playbook()
     ppb = _srv._ensure_playbook()
@@ -76,17 +87,40 @@ def ace_get_playbook(task_context: str = "", include_stats: bool = False) -> Ace
                 ranked_lines.append(line)
             parts.append("\n".join(ranked_lines))
 
-    g_text = _srv._serialize_playbook(gpb)
-    if g_text.strip():
-        parts.append(f"# GLOBAL PLAYBOOK (applies to all projects)\n{g_text}")
-    else:
-        parts.append("# GLOBAL PLAYBOOK (applies to all projects)\n(empty)")
+    # Apply section/keyword filters to bullet lists if requested
+    _sec_lower = section.strip().lower()
+    _kw_lower = keyword.strip().lower()
 
-    p_text = _srv._serialize_playbook(ppb)
-    if p_text.strip():
-        parts.append(f"# PROJECT PLAYBOOK (this project only)\n{p_text}")
+    def _filter_bullets(pb_obj) -> list:
+        """Return filtered bullet list if section/keyword filters active."""
+        bullets = pb_obj.bullets
+        if _sec_lower:
+            bullets = [b for b in bullets if _sec_lower in b.section.lower()]
+        if _kw_lower:
+            bullets = [b for b in bullets if _kw_lower in b.content.lower()]
+        return bullets
+
+    if _sec_lower or _kw_lower:
+        # Filtered mode: render only matching bullets
+        g_bullets = _filter_bullets(gpb)
+        g_lines = "\n".join(b.format_line() for b in g_bullets)
+        filter_desc = " | ".join(f for f in [f"section={section!r}" if section else "", f"keyword={keyword!r}" if keyword else ""] if f)
+        p_bullets = _filter_bullets(ppb)
+        p_lines = "\n".join(b.format_line() for b in p_bullets)
+        parts.append(f"# GLOBAL PLAYBOOK [filtered: {filter_desc}] ({len(g_bullets)} bullets)\n{g_lines or '(no matches)'}")
+        parts.append(f"# PROJECT PLAYBOOK [filtered: {filter_desc}] ({len(p_bullets)} bullets)\n{p_lines or '(no matches)'}")
     else:
-        parts.append("# PROJECT PLAYBOOK (this project only)\n(empty)")
+        g_text = _srv._serialize_playbook(gpb)
+        if g_text.strip():
+            parts.append(f"# GLOBAL PLAYBOOK (applies to all projects)\n{g_text}")
+        else:
+            parts.append("# GLOBAL PLAYBOOK (applies to all projects)\n(empty)")
+
+        p_text = _srv._serialize_playbook(ppb)
+        if p_text.strip():
+            parts.append(f"# PROJECT PLAYBOOK (this project only)\n{p_text}")
+        else:
+            parts.append("# PROJECT PLAYBOOK (this project only)\n(empty)")
 
     # Append stats if requested (replaces standalone ace_get_stats)
     if include_stats:
@@ -105,7 +139,11 @@ def ace_get_playbook(task_context: str = "", include_stats: bool = False) -> Ace
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def ace_apply_delta(operations: list[dict], scope: str = "project") -> AceApplyDeltaResult:
+def ace_apply_delta(
+    operations: list[dict],
+    scope: str = "project",
+    dry_run: bool = False,
+) -> AceApplyDeltaResult:
     """Apply delta operations to the playbook.
 
     Supported operations:
@@ -127,6 +165,9 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> AceApplyD
     Args:
         operations: List of delta operation dicts.
         scope: "project" (default) or "global". Global bullets apply across all projects.
+        dry_run: If True, preview what would happen without modifying the playbook.
+            Reports which bullet_ids would be found/missing, counts ADDs/UPDATEs/MERGEs/REMOVEs,
+            and shows new playbook size — without actually saving any changes.
     """
     try:
         with _srv._state_lock:
@@ -141,6 +182,27 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> AceApplyD
                 and op.bullet_id
                 and op.bullet_id not in bullet_ids_before
             ]
+
+            if dry_run:
+                # Preview mode: show what would happen without modifying
+                by_type: dict[str, int] = {}
+                for op in ops:
+                    by_type[op.op_type] = by_type.get(op.op_type, 0) + 1
+                n_adds = by_type.get("ADD", 0)
+                n_removes = by_type.get("REMOVE", 0)
+                estimated_new_count = len(pb.bullets) + n_adds - n_removes
+                lines = [f"[dry_run] Would apply {len(ops)} operation(s) to {scope} playbook."]
+                for op_type, count in sorted(by_type.items()):
+                    lines.append(f"  {op_type}: {count}")
+                if failed_ids:
+                    lines.append(f"  WARN: {len(failed_ids)} operation(s) would fail (missing bullet_id): {failed_ids}")
+                lines.append(f"  Estimated bullet count after: {estimated_new_count} (currently {len(pb.bullets)})")
+                lines.append("No changes made. Remove dry_run=True to apply.")
+                result: AceApplyDeltaResult = {"applied": 0, "scope": scope, "message": "\n".join(lines)}
+                if failed_ids:
+                    result["failed_ids"] = failed_ids
+                return result
+
             applied = pb.apply_delta(ops)
             save_fn()
 
@@ -362,6 +424,9 @@ def ace_prune(scope: str = "project") -> AcePruneResult:
             pb, save_fn = _srv._resolve_playbook(scope)
             # Load schema for parameterized thresholds (MCE)
             sp = _srv._schema_path if scope == "project" else _srv._global_schema_path
+            _schema_warn = ""
+            if sp and not os.path.isfile(sp):
+                _schema_warn = f" (schema file not found at {sp}; using defaults)"
             schema = _srv._load_schema(sp) if sp else PlaybookSchema.default()
             # Evolve failure lessons BEFORE pruning to prevent permanent loss
             evolved = pb.evolve_from_failures(threshold=max(1, schema.evolution_threshold - 2))
@@ -380,6 +445,8 @@ def ace_prune(scope: str = "project") -> AcePruneResult:
             f"from {scope} playbook. Now has {len(pb.bullets)} bullets."
         )
         text = " ".join(parts)
+        if _schema_warn:
+            text += _schema_warn
 
         result: AcePruneResult = {
             "removed": total,
