@@ -89,7 +89,7 @@ class TestGccPatternsAutoPromote:
     """A1: auto_promote calls ace_apply_delta for promotion candidates."""
 
     def test_auto_promote_calls_ace_apply_delta(self, monkeypatch):
-        """When auto_promote=True and candidates exist, ace_apply_delta is called."""
+        """When auto_promote=True and candidates exist, ace_apply_delta is called with ADD ops."""
         import ccr.mcp.ace_tools as _ace_mod
 
         calls = []
@@ -101,8 +101,9 @@ class TestGccPatternsAutoPromote:
 
         monkeypatch.setattr(_ace_mod, "ace_apply_delta", mock_apply_delta)
 
-        # Create commits with patterns to build up promotion candidates
-        # (threshold is typically 3, so we add the same pattern 3+ times)
+        # Create 4 commits with the same pattern — threshold is 3, so occurrence_count=4 >= 3
+        # Each commit gets a unique ID (C001..C004), so each adds a new entry to commit_ids.
+        # admission_threshold=1.0 disables A-MAC commit dedup (not pattern dedup).
         for i in range(4):
             gcc_commit(
                 title=f"Commit {i}",
@@ -111,13 +112,35 @@ class TestGccPatternsAutoPromote:
                 files_changed=[],
                 next_step="next",
                 patterns_learned=["Always write tests before coding"],
-                admission_threshold=1.0,  # disable dedup to get separate commits
+                admission_threshold=1.0,  # disable commit-level dedup to get separate commits
             )
 
         # Now call patterns with auto_promote
         result = gcc_patterns(min_occurrences=1, auto_promote=True)
-        # Should not raise
-        assert result["total"] >= 0
+
+        # ace_apply_delta must have been called at least once
+        assert len(calls) >= 1, (
+            f"Expected ace_apply_delta to be called at least once, but calls={calls}. "
+            f"Pattern total={result['total']}, message={result['message'][:200]}"
+        )
+
+        # Every call must contain at least one ADD op targeting STRATEGIES & INSIGHTS
+        for call_ops in calls:
+            assert isinstance(call_ops, list), f"ops must be a list, got {type(call_ops)}"
+            assert len(call_ops) >= 1, "ops list must not be empty"
+            for op in call_ops:
+                assert op.get("type") == "ADD", f"Expected ADD op, got {op}"
+                assert op.get("section") == "STRATEGIES & INSIGHTS", (
+                    f"Expected section 'STRATEGIES & INSIGHTS', got {op.get('section')}"
+                )
+                assert "Always write tests before coding" in op.get("content", ""), (
+                    f"Expected pattern text in content, got {op.get('content')}"
+                )
+
+        # The return value must still be structurally valid
+        assert result["total"] >= 1
+        assert result["matching"] >= 1
+        assert "Auto-promoted" in result["message"]
 
     def test_auto_promote_no_error_on_failure(self, monkeypatch):
         """auto_promote=True must not raise even if ace_apply_delta fails."""
@@ -145,6 +168,45 @@ class TestGccPatternsAutoPromote:
 
         gcc_patterns(auto_promote=False)
         assert len(calls) == 0
+
+    def test_auto_promote_lazy_import_uses_module_attribute(self, monkeypatch):
+        """Lazy import path: patching ccr.mcp.ace_tools.ace_apply_delta must be respected.
+
+        The gcc_patterns implementation does `import ccr.mcp.ace_tools as _ace_tools_mod`
+        inside the function body and calls `_ace_tools_mod.ace_apply_delta(ops)`.
+        Patching the attribute on the already-imported module object is effective because
+        both references point to the same object in sys.modules.
+        """
+        import ccr.mcp.ace_tools as _ace_mod
+
+        intercepted_ops: list = []
+
+        def intercept(ops):
+            intercepted_ops.extend(ops)
+
+        monkeypatch.setattr(_ace_mod, "ace_apply_delta", intercept)
+
+        # Add 4 commits so the pattern reaches promotion-candidate threshold (>= 3)
+        for i in range(4):
+            gcc_commit(
+                title=f"LazyImport {i}",
+                what=f"Work {i}",
+                why="lazy-import test",
+                files_changed=[],
+                next_step="next",
+                patterns_learned=["Document every public API immediately"],
+                admission_threshold=1.0,
+            )
+
+        gcc_patterns(min_occurrences=1, auto_promote=True)
+
+        # The lazy import inside gcc_patterns must have routed to our interceptor
+        assert len(intercepted_ops) >= 1, (
+            "Lazy import did not route to the patched ace_apply_delta — "
+            "check that gcc_patterns uses `import ccr.mcp.ace_tools as _ace_tools_mod` "
+            "and calls `_ace_tools_mod.ace_apply_delta(ops)` (not a cached local reference)."
+        )
+        assert all(op["type"] == "ADD" for op in intercepted_ops)
 
 
 # ===========================================================================
