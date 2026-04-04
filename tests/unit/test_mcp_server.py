@@ -1494,8 +1494,8 @@ class TestMagmaQueryBFS:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = query_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model), \
-             patch("ccr.core.memory.quick_cosine", return_value=0.5):
+        with patch("ccr.core.memory_pkg.memory_links.get_embedding_model", return_value=mock_model), \
+             patch("ccr.core.memory_pkg.memory_links.quick_cosine", return_value=0.5):
             import ccr.mcp_server as mod
             linked = mod._memory.get_linked_commits("C001", query="auth security")
 
@@ -1536,8 +1536,8 @@ class TestMagmaQueryBFS:
                 return 0.5  # probe succeeds
             return None  # fall back to cached vectors
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model), \
-             patch("ccr.core.memory.quick_cosine", side_effect=_probe_only_cosine):
+        with patch("ccr.core.memory_pkg.memory_links.get_embedding_model", return_value=mock_model), \
+             patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=_probe_only_cosine):
             import ccr.mcp_server as mod
             mem = mod._memory
             results_with_query = mem.get_linked_commits("C001", query="feature root")

@@ -20,7 +20,7 @@ COMMITS_TEMPLATE = """# Branch: {branch}
 {hypothesis}
 
 ## Conclusion
-(Fill in at merge time -- success/failure/partial)
+(Fill in at merge time — success/failure/partial)
 
 ## Rolling Summary
 (none yet)

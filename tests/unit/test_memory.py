@@ -1603,7 +1603,7 @@ class TestCommitEmbeddings:
 
     def test_embed_commit_no_op_when_model_unavailable(self, memory):
         """When no ONNX model, _embed_commit returns None without error."""
-        with patch("ccr.core.memory.get_embedding_model", return_value=None):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=None):
             result = memory._embed_commit("C001", "some text")
         assert result is None
 
@@ -1617,7 +1617,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = fake_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             result = memory._embed_commit("C001", "test text")
 
         assert result is not None
@@ -1637,7 +1637,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.side_effect = [make_vec(), make_vec(), make_vec()]
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             memory._embed_commit("C001", "a")
             memory._embed_commit("C002", "b")
             memory._embed_commit("C003", "c")
@@ -1659,7 +1659,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.side_effect = [make_vec() for _ in range(cap + 5)]
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             for i in range(cap + 5):
                 memory._embed_commit(f"C{i:03d}", f"text {i}")
 
@@ -1682,7 +1682,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = fake_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             memory._embed_commit("C001", "text")
 
         result = memory._load_commit_embeddings(["C001"])
@@ -1752,7 +1752,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = fake_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             with patch.object(memory, "_compute_links", wraps=memory._compute_links) as mock_cl:
                 memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
 
@@ -1785,7 +1785,7 @@ class TestCommitEmbeddings:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = fake_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_embeddings.get_embedding_model", return_value=mock_model):
             # First commit -- keyword-rich with rare Greek letters, file "f.py"
             memory.commit(
                 "alpha beta gamma delta epsilon sigma",
@@ -2455,7 +2455,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] commit text for {cid}"
 
-        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2493,7 +2493,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] text"
 
-        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2507,7 +2507,7 @@ class TestAdaptiveTraversal:
         """When quick_cosine returns None (no ONNX), BFS fallback works identically."""
         self._setup_links(memory, "C001", ["C002", "C003"])
 
-        with patch("ccr.core.memory.quick_cosine", return_value=None), \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", return_value=None), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results = memory.get_linked_commits("C001", query="test query")
 
@@ -2523,7 +2523,7 @@ class TestAdaptiveTraversal:
         """When query is None/empty, plain BFS is used (no quick_cosine calls)."""
         self._setup_links(memory, "C001", ["C002", "C003"])
 
-        with patch("ccr.core.memory.quick_cosine") as mock_qc, \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine") as mock_qc, \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results_no_query = memory.get_linked_commits("C001")
 
@@ -2592,7 +2592,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] text"
 
-        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2626,7 +2626,7 @@ class TestAdaptiveTraversal:
         """If quick_cosine probe raises an exception, BFS fallback is used."""
         self._setup_links(memory, "C001", ["C002"])
 
-        with patch("ccr.core.memory.quick_cosine", side_effect=RuntimeError("ONNX crash")), \
+        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=RuntimeError("ONNX crash")), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results = memory.get_linked_commits("C001", query="test")
 

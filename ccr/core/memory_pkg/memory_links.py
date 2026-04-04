@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +24,43 @@ logger = logging.getLogger(__name__)
 
 class LinksMixin:
     """Cross-linking, clustering, and embedding methods for MemoryManager."""
+
+    # --- Class-level constants (shared with PatternsMixin via self/cls lookup) ---
+
+    _LINK_TYPES = ("entity", "causal", "supersession", "semantic")
+
+    _STOP_WORDS = frozenset({
+        # Articles & determiners
+        "the", "a", "an", "this", "that", "these", "those", "some", "any",
+        "each", "every", "all", "both", "few", "more", "most", "other",
+        # Prepositions
+        "to", "for", "of", "in", "on", "at", "by", "from", "into", "about",
+        "between", "through", "during", "before", "after", "above", "below",
+        "up", "out", "off", "over", "under", "again", "further", "then",
+        # Conjunctions
+        "and", "or", "but", "nor", "yet", "so", "if", "when", "while",
+        "because", "although", "than",
+        # Pronouns
+        "it", "its", "they", "them", "their", "we", "our", "you", "your",
+        "he", "she", "his", "her", "who", "which", "what", "how",
+        # Be/have/do
+        "is", "are", "was", "were", "be", "been", "being",
+        "has", "have", "had", "having",
+        "do", "does", "did", "doing",
+        # Modals
+        "will", "would", "can", "could", "shall", "should", "may", "might",
+        "must",
+        # Common adverbs/adjectives
+        "not", "no", "just", "also", "very", "only", "now", "here", "there",
+        "where", "still", "already",
+        # Common verbs (too generic for keywords)
+        "get", "got", "set", "use", "used", "using", "make", "made",
+    })
+    _SUPERSESSION_KEYWORDS = re.compile(
+        r"(?:replaced|superseded|reverted|refactored\s+from|deprecated|reworked|improved\s+upon)",
+        re.IGNORECASE,
+    )
+    _COMMIT_ID_RE = re.compile(r"\b(C\d{3,})\b")
 
     # --- Static helpers used by both links and admission ---
 
@@ -744,15 +781,14 @@ class LinksMixin:
             if node in visited:
                 continue
             component: list[str] = []
-            queue = [node]
+            queue: deque[str] = deque([node])
+            visited.add(node)  # Mark at enqueue — prevents duplicate queue entries
             while queue:
-                n = queue.pop(0)
-                if n in visited:
-                    continue
-                visited.add(n)
+                n = queue.popleft()
                 component.append(n)
                 for neighbor in adjacency.get(n, set()):
                     if neighbor not in visited:
+                        visited.add(neighbor)  # Mark at enqueue, not at pop
                         queue.append(neighbor)
             if len(component) >= min_cluster_size:
                 components.append(sorted(component))

@@ -12,7 +12,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ccr.context.embeddings import quick_cosine
 
@@ -308,17 +308,21 @@ class PatternsMixin:
         min_occurrences: int = 1,
         include_promoted: bool = True,
         search_term: str | None = None,
+        max_age_hours: int | None = None,
     ) -> dict:
         """Query the pattern buffer. Returns dict for MCP tool formatting.
 
         CER-inspired recency-weighted retrieval: patterns seen recently
         are ranked higher. Combines quality_score with temporal decay
-        on last_seen timestamp (lambda=0.005/hour, half-life ~139h).
+        on last_seen timestamp (λ=0.005/hour, half-life ~139h).
         """
         data = self._load_patterns()
         results = []
         # Snapshot current time once to avoid floating point drift between entries
         now = datetime.now(timezone.utc)
+        age_cutoff = (
+            now - timedelta(hours=max_age_hours) if max_age_hours is not None else None
+        )
 
         for pid, entry in data.get("patterns", {}).items():
             if entry.get("occurrence_count", 1) < min_occurrences:
@@ -328,6 +332,17 @@ class PatternsMixin:
             if search_term:
                 if search_term.lower() not in entry["text"].lower():
                     continue
+            if age_cutoff is not None:
+                last_seen = entry.get("last_seen", entry.get("created_at", ""))
+                if last_seen:
+                    try:
+                        ts = datetime.fromisoformat(last_seen.strip().replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        if ts < age_cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass  # Skip age check for unparseable timestamps
             # CER recency-weighted retrieval: compute effective score
             quality = entry.get("quality_score", 0.5)
             last_seen = entry.get("last_seen", entry.get("created_at", ""))
@@ -358,6 +373,17 @@ class PatternsMixin:
         """
         if not timestamp_str:
             return 0.5  # Default moderate weight for undated patterns
+        # Try ISO-8601 first (modern format used by datetime.now().isoformat())
+        # Replace 'Z' suffix for Python < 3.11 compat (fromisoformat rejects 'Z' before 3.11)
+        try:
+            ts = datetime.fromisoformat(timestamp_str.strip().replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            hours = (now - ts).total_seconds() / 3600.0
+            return math.exp(-0.005 * max(0.0, hours))
+        except (ValueError, TypeError):
+            pass
+        # Legacy fallback: "%Y-%m-%d %H:%M" format
         try:
             ts = datetime.strptime(timestamp_str.strip(), "%Y-%m-%d %H:%M")
             if ts.tzinfo is None:

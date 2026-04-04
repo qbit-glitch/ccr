@@ -280,7 +280,7 @@ class TestGitCommitIntegration:
     """8. Git commit integration (mock subprocess)."""
 
     def test_git_commit_called_on_commit(self, mem):
-        with patch("ccr.core.memory.subprocess") as mock_sp:
+        with patch("ccr.core.memory_pkg.memory_file_io.subprocess") as mock_sp:
             # Simulate not a git repo (no .git dir)
             result = mem.commit("Test", "what", "why", [], "next")
             # Should not call subprocess since no .git dir
@@ -290,7 +290,7 @@ class TestGitCommitIntegration:
         # Create fake .git directory
         os.makedirs(os.path.join(mem.project_root, ".git"), exist_ok=True)
 
-        with patch("ccr.core.memory.subprocess") as mock_sp:
+        with patch("ccr.core.memory_pkg.memory_file_io.subprocess") as mock_sp:
             mock_sp.run.return_value = MagicMock(returncode=0)
             mem.commit("Test", "what", "why", [], "next")
             # Should have called git add and git commit
@@ -300,7 +300,7 @@ class TestGitCommitIntegration:
         os.makedirs(os.path.join(mem.project_root, ".git"), exist_ok=True)
 
         mem.create_branch("feature", "test", "test")
-        with patch("ccr.core.memory.subprocess") as mock_sp:
+        with patch("ccr.core.memory_pkg.memory_file_io.subprocess") as mock_sp:
             mock_sp.run.return_value = MagicMock(returncode=0)
             mem.merge("feature", "success", "done")
             # Should have called git add + git commit
@@ -308,7 +308,7 @@ class TestGitCommitIntegration:
 
     def test_git_commit_returns_false_on_failure(self, mem):
         os.makedirs(os.path.join(mem.project_root, ".git"), exist_ok=True)
-        with patch("ccr.core.memory.subprocess") as mock_sp:
+        with patch("ccr.core.memory_pkg.memory_file_io.subprocess") as mock_sp:
             mock_sp.run.return_value = MagicMock(returncode=1)
             result = mem._git_commit("test message")
             assert result is False

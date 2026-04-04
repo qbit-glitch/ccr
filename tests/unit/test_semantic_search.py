@@ -166,7 +166,7 @@ class TestSemanticSearch:
 
     def test_search_falls_through_to_bm25_without_onnx(self, mem):
         """When ONNX unavailable and no exact match, BM25 kicks in."""
-        with patch("ccr.core.memory.get_embedding_model", return_value=None):
+        with patch("ccr.core.memory_pkg.memory_context.get_embedding_model", return_value=None):
             # "database indexes optimization queries" won't exact-match a single
             # commit but BM25 should find C005 (indexes + optimization + query)
             result = mem._search_commits(
@@ -214,7 +214,7 @@ class TestSemanticSearch:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = query_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_context.get_embedding_model", return_value=mock_model):
             # Use a term that won't substring-match anything
             result = mem._search_commits(
                 "main", "zzz_no_substring_match_zzz", max_results=3
@@ -248,7 +248,7 @@ class TestSemanticSearch:
         mock_model = MagicMock()
         mock_model.embed_query.return_value = query_vec
 
-        with patch("ccr.core.memory.get_embedding_model", return_value=mock_model):
+        with patch("ccr.core.memory_pkg.memory_context.get_embedding_model", return_value=mock_model):
             # "authentication" exact-matches C001; semantic should NOT duplicate it
             result = mem._search_commits("main", "authentication", max_results=5)
             # Count how many times C001 appears
@@ -257,7 +257,7 @@ class TestSemanticSearch:
 
     def test_bm25_only_when_no_exact_and_no_semantic(self, mem):
         """BM25 fires only when both exact and semantic find nothing."""
-        with patch("ccr.core.memory.get_embedding_model", return_value=None):
+        with patch("ccr.core.memory_pkg.memory_context.get_embedding_model", return_value=None):
             # "authentication" has exact matches, so BM25 should NOT run
             result = mem._search_commits("main", "authentication", max_results=5)
             assert "C001" in result
