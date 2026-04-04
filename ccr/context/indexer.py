@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,8 @@ from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ccr.context.embeddings import EmbeddingModel
@@ -180,6 +183,8 @@ class RepoIndex:
                 continue
             if stat.st_size > max_bytes:
                 # Index metadata for large files but skip content/symbols
+                logger.debug("Skipping content for large file %s (%d KB > %d KB)",
+                             rel, stat.st_size // 1024, max_file_size_kb)
                 language = LANGUAGE_MAP.get(ext, ext.lstrip(".") or "unknown")
                 index.files[rel] = FileEntry(
                     rel_path=rel,
@@ -199,7 +204,8 @@ class RepoIndex:
             try:
                 with open(entry.path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as e:
+                logger.debug("Skipping unreadable file %s: %s", rel, e)
                 continue
 
             symbols = cls._extract_symbols(content, language)
@@ -979,7 +985,7 @@ class RepoIndex:
         elif language == "go":
             for m in re.finditer(r'"([^"]+)"', content[:2000]):  # imports are at top
                 imports.append(m.group(1))
-        return imports[:20]  # cap
+        return imports[:50]  # cap (raised from 20 — large files can have many imports)
 
     def _compute_mtime_sig(self) -> str:
         """Quick signature of file mtimes for cache validation."""

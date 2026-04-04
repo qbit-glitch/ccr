@@ -1,28 +1,59 @@
 [project]
-name = "ccr"
-version = "0.1.0"
-description = "Claude Context Reducer — token-efficient middleware for Claude Code"
+name = "ccr-memory"
+version = "0.2.0"
+description = "Persistent memory, self-evolving playbooks, and sandboxed REPL for Claude Code"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "CCR Team" }]
+keywords = ["claude", "mcp", "memory", "context", "llm", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/qbit-glitch/ccr"
+Repository = "https://github.com/qbit-glitch/ccr"
+Documentation = "https://github.com/qbit-glitch/ccr#readme"
 
 dependencies = [
-    "anthropic>=0.40.0",
-    "openai>=1.50.0",
     "click>=8.1.0",
     "pyyaml>=6.0",
-    "tiktoken>=0.7.0",
-    "httpx>=0.27.0",
     "rich>=13.0.0",
     "python-dotenv>=1.0.0",
     "mcp[cli]>=1.0.0",
 ]
 
 [project.optional-dependencies]
+models = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "httpx>=0.27.0",
+    "tiktoken>=0.7.0",
+]
 semantic = [
     "onnxruntime>=1.17.0",
     "tokenizers>=0.15.0",
     "numpy>=1.24.0",
+]
+vector = [
+    "sqlite-vec>=0.1.0",
+]
+watch = [
+    "watchdog>=4.0.0",
+]
+full = [
+    "ccr-memory[models]",
+    "ccr-memory[semantic]",
+    "ccr-memory[vector]",
 ]
 
 [project.scripts]

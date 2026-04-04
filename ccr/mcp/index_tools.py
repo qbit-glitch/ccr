@@ -26,6 +26,8 @@ import ccr.mcp.server as _srv
 def index_build(
     incremental: bool = False,
     filter_extensions: str = "",
+    force: bool = False,
+    max_file_size_kb: int = 500,
 ) -> IndexBuildResult:
     """Build or rebuild the repo index.
 
@@ -42,6 +44,13 @@ def index_build(
             sessions. Falls through to full rebuild on any error.
         filter_extensions: Comma-separated list of file extensions to index
             (e.g. "py,ts,go"). Leading dots optional. Empty means all files.
+        force: If True, bypass incremental check and always do a full rebuild.
+            Overrides incremental=True. Use when index may be corrupt or stale
+            despite unchanged mtimes (e.g., after manual .ccr/ edits).
+        max_file_size_kb: Files larger than this are indexed for metadata only
+            (path, language, size) but content and symbols are skipped (default
+            500 KB). Increase for repos with large generated files you want
+            to search; decrease to speed up indexing.
     """
     # Parse filter_extensions
     exts: set[str] | None = None
@@ -54,7 +63,7 @@ def index_build(
 
     try:
         # Incremental mode: skip rebuild if mtime signature unchanged
-        if incremental:
+        if incremental and not force:
             cache_json = None
             try:
                 mem = _srv._ensure_memory()
@@ -80,7 +89,11 @@ def index_build(
                     pass  # Fall through to full rebuild
 
         with _srv._state_lock:  # H2: protect global state mutation
-            _srv._repo_index = RepoIndex.build(_srv._project_root, extensions=exts)
+            _srv._repo_index = RepoIndex.build(
+                _srv._project_root,
+                extensions=exts,
+                max_file_size_kb=max(1, max_file_size_kb),
+            )
 
             # Cache
             mem = _srv._ensure_memory()
@@ -132,6 +145,8 @@ def index_search(
     top_k: int = 10,
     return_snippets: bool = False,
     file_glob: str = "**/*",
+    min_score: float = 0.0,
+    symbols_only: bool = False,
 ) -> IndexSearchResult:
     """Search the repo index for files matching a query.
 
@@ -152,6 +167,11 @@ def index_search(
             falls back to BM25-derived snippets otherwise).
         file_glob: Glob pattern to restrict results (e.g. "**/*.py"). Defaults
             to "**/*" (all files).
+        min_score: Minimum score threshold to include in results (default 0.0 =
+            no filtering). Useful to suppress low-confidence matches.
+        symbols_only: If True, only return files where the query matches a symbol
+            name (function, class). Filters out pure content/path matches.
+            Best for "find all implementations of AuthService" queries.
     """
     if mode not in ("keyword", "semantic", "hybrid"):
         raise ToolError(f"Invalid mode '{mode}'. Use 'keyword', 'semantic', or 'hybrid'.")
@@ -160,6 +180,8 @@ def index_search(
     idx = _srv._ensure_index()
 
     suffix = ""
+    if return_snippets and mode != "hybrid":
+        suffix = f" (note: return_snippets only supported in hybrid mode; ignored for {mode})"
     if mode == "keyword":
         results = idx.search(query, file_glob=file_glob)[:top_k]
     elif mode == "semantic":
@@ -179,8 +201,24 @@ def index_search(
         if _srv._embedding_model is None or not idx._embeddings:
             suffix = " (BM25 fallback)"
 
+    # Apply min_score filter
+    if min_score > 0.0:
+        results = [r for r in results if r.get("score", 0.0) >= min_score]
+
+    # Apply symbols_only filter: keep results where query matches a symbol name
+    if symbols_only:
+        q_lower = query.lower()
+        results = [
+            r for r in results
+            if any(q_lower in s.lower() for s in r.get("symbols", []))
+        ]
+
     if not results:
         text = f"No files matching '{query}' ({mode} mode)."
+        if min_score > 0.0:
+            text += f" (min_score={min_score} may be filtering results)"
+        if symbols_only:
+            text += " (symbols_only=True: no symbol matched query)"
         return IndexSearchResult(result_count=0, mode=mode, message=text)
 
     lines = [f"# {mode} search{suffix}"]

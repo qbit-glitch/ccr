@@ -170,6 +170,22 @@ if SEMANTIC_AVAILABLE:
             return doc_vecs @ query_vec
 
 
+def quick_cosine(text_a: str, text_b: str) -> float | None:
+    """Compute cosine similarity between two texts using ONNX embeddings.
+
+    Returns float in [-1, 1] if ONNX available, None otherwise.
+    Callers should fall back to word Jaccard when None is returned.
+    """
+    model = get_embedding_model()
+    if model is None:
+        return None
+    try:
+        vecs = model.embed_batch([text_a, text_b])
+        return float(vecs[0] @ vecs[1])
+    except Exception:
+        return None
+
+
 def save_embeddings(embeddings: dict[str, list[float]], path: str) -> None:
     """Save embeddings to gzip-compressed JSON."""
     tmp = path + ".tmp"
@@ -191,3 +207,27 @@ def load_embeddings(path: str) -> dict[str, list[float]]:
             return json.loads(f.read())
     except (OSError, json.JSONDecodeError, gzip.BadGzipFile):
         return {}
+
+
+def migrate_gzip_to_sqlite(
+    gzip_path: str, db_path: str, namespace: str = "commit", dim: int = 384
+) -> int:
+    """Migrate embeddings from gzip JSON to sqlite-vec store.
+
+    Returns number of vectors migrated. Skips if sqlite-vec unavailable.
+    """
+    from ccr.context.vec_store import SQLITE_VEC_AVAILABLE, get_vec_store
+
+    if not SQLITE_VEC_AVAILABLE:
+        return 0
+    store = get_vec_store(db_path, dim=dim)
+    if store is None:
+        return 0
+    cache = load_embeddings(gzip_path)
+    if not cache:
+        return 0
+    count = 0
+    for id_, vec in cache.items():
+        store.upsert(id_, vec if isinstance(vec, list) else list(vec), namespace)
+        count += 1
+    return count

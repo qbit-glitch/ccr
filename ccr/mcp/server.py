@@ -145,8 +145,20 @@ def _init(project_root: str | None = None) -> None:
     # Triple store (Memori-inspired semantic triple extraction)
     _triple_store = TripleStore(os.path.join(_project_root, ".ccr", "triples.json"))
 
-    # Build repo index
-    _repo_index = RepoIndex.build(_project_root)
+    # Build repo index — try incremental load first (skip rebuild if mtimes unchanged)
+    _repo_index = None
+    try:
+        cache_json = _memory.load_index()
+        if cache_json:
+            cached = RepoIndex.from_cache(_project_root, cache_json)
+            if cached is not None:
+                live_sig = cached._compute_mtime_sig()
+                if live_sig == cached._mtime_sig and cached._mtime_sig:
+                    _repo_index = cached
+    except Exception:
+        pass
+    if _repo_index is None:
+        _repo_index = RepoIndex.build(_project_root)
 
     # Load cached embeddings if available
     if os.path.isfile(_embeddings_path):
@@ -156,11 +168,12 @@ def _init(project_root: str | None = None) -> None:
     if os.path.isfile(_chunk_embeddings_path):
         _repo_index.load_chunk_embeddings(_chunk_embeddings_path)
 
-    # Cache index
-    try:
-        _memory.save_index(_repo_index.to_json())
-    except Exception:
-        pass
+    # Cache index (only when freshly built — incremental load already has a valid cache)
+    if not (hasattr(_repo_index, "_mtime_sig") and _repo_index._mtime_sig):
+        try:
+            _memory.save_index(_repo_index.to_json())
+        except Exception:
+            pass
 
     # Configure audit logging
     ccr_root = os.path.join(_project_root, ".ccr")

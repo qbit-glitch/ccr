@@ -1590,6 +1590,12 @@ class TestRollingSummaryCompressionPrompt:
 class TestCommitEmbeddings:
     """Tests for ONNX commit embedding cache."""
 
+    @pytest.fixture(autouse=True)
+    def _disable_vec_store(self):
+        """Disable sqlite-vec so tests exercise the gzip JSON fallback path."""
+        with patch("ccr.context.vec_store.get_vec_store", return_value=None):
+            yield
+
     def test_get_commit_embeddings_path(self, memory):
         path = memory._get_commit_embeddings_path()
         assert path.endswith("commit_embeddings.json.gz")
@@ -2390,3 +2396,261 @@ class TestContextFollowLinksEmbeddingScore:
         assert "emb: 0.88" in output
         # Must NOT fall back to the raw score label when embedding_score is present
         assert "score: 0.50" not in output
+
+
+# ===========================================================================
+# Tests for MAGMA-inspired adaptive (heapq) traversal in get_linked_commits()
+# ===========================================================================
+
+
+class TestAdaptiveTraversal:
+    """Tests for priority-queue traversal with quick_cosine edge scoring."""
+
+    def _setup_links(self, memory, src: str, targets: list[str], link_type: str = "semantic") -> None:
+        """Write a minimal commit_links.json with links from src -> each target."""
+        links_data: dict = {"version": 1, "links": {src: {}}}
+        entries = []
+        for i, tgt in enumerate(targets):
+            entries.append({"target": tgt, "score": 0.5 - i * 0.1})
+        links_data["links"][src][link_type] = entries
+        memory._save_links(links_data)
+
+    def _setup_links_multihop(self, memory, graph: dict[str, list[str]]) -> None:
+        """Write a link graph for multi-hop traversal tests.
+
+        graph: mapping from src -> list of targets (all semantic links).
+        """
+        links_data: dict = {"version": 1, "links": {}}
+        for src, targets in graph.items():
+            entries = [{"target": tgt, "score": 0.5} for tgt in targets]
+            links_data["links"][src] = {"semantic": entries}
+        memory._save_links(links_data)
+
+    def test_query_with_onnx_sorts_by_quick_cosine(self, memory):
+        """When query is provided and ONNX available, results are sorted by cosine relevance."""
+        self._setup_links(memory, "C001", ["C002", "C003", "C004"])
+
+        # quick_cosine returns controlled scores: C004 most relevant, C002 least
+        cosine_map = {"C002": 0.2, "C003": 0.7, "C004": 0.95}
+        call_count = {"probe": 0}
+
+        def mock_quick_cosine(text_a: str, text_b: str) -> float:
+            # The first call is the ONNX probe ("a", "b")
+            if text_a == "a" and text_b == "b":
+                call_count["probe"] += 1
+                return 0.5
+            for cid, score in cosine_map.items():
+                if cid in text_b:
+                    return score
+            return 0.1
+
+        # Mock _parse_commit_block to return recognizable what text
+        def mock_parse(text: str) -> dict:
+            for cid in ("C002", "C003", "C004"):
+                if cid in text:
+                    return {"title": f"{cid} title", "what": f"text about {cid}"}
+            return {}
+
+        # Mock _find_commit_by_id to return text containing commit ID
+        def mock_find(branch: str, cid: str) -> str:
+            return f"[{cid}] commit text for {cid}"
+
+        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+             patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
+             patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", query="test query")
+
+        assert len(results) == 3
+        # Highest cosine first (post-traversal sort by query_score)
+        assert results[0]["id"] == "C004"
+        assert results[1]["id"] == "C003"
+        assert results[2]["id"] == "C002"
+        # query_score field present on all results
+        for r in results:
+            assert "query_score" in r
+
+    def test_query_scores_reflect_cosine_values(self, memory):
+        """query_score values match the quick_cosine return values."""
+        self._setup_links(memory, "C001", ["C002", "C003"])
+
+        cosine_map = {"C002": 0.35, "C003": 0.88}
+
+        def mock_quick_cosine(text_a: str, text_b: str) -> float:
+            if text_a == "a" and text_b == "b":
+                return 0.5  # probe
+            for cid, score in cosine_map.items():
+                if cid in text_b:
+                    return score
+            return 0.0
+
+        def mock_parse(text: str) -> dict:
+            for cid in cosine_map:
+                if cid in text:
+                    return {"what": f"text about {cid}"}
+            return {}
+
+        def mock_find(branch: str, cid: str) -> str:
+            return f"[{cid}] text"
+
+        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+             patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
+             patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", query="find relevant")
+
+        by_id = {r["id"]: r for r in results}
+        assert abs(by_id["C002"]["query_score"] - 0.35) < 1e-5
+        assert abs(by_id["C003"]["query_score"] - 0.88) < 1e-5
+
+    def test_bfs_fallback_when_onnx_unavailable(self, memory):
+        """When quick_cosine returns None (no ONNX), BFS fallback works identically."""
+        self._setup_links(memory, "C001", ["C002", "C003"])
+
+        with patch("ccr.core.memory.quick_cosine", return_value=None), \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", query="test query")
+
+        # All linked commits are still returned (BFS fallback)
+        assert len(results) == 2
+        ids = {r["id"] for r in results}
+        assert ids == {"C002", "C003"}
+        # No query_score since ONNX was unavailable
+        for r in results:
+            assert "query_score" not in r
+
+    def test_bfs_fallback_when_no_query(self, memory):
+        """When query is None/empty, plain BFS is used (no quick_cosine calls)."""
+        self._setup_links(memory, "C001", ["C002", "C003"])
+
+        with patch("ccr.core.memory.quick_cosine") as mock_qc, \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results_no_query = memory.get_linked_commits("C001")
+
+        # quick_cosine should never be called when no query
+        mock_qc.assert_not_called()
+        assert len(results_no_query) == 2
+        for r in results_no_query:
+            assert "query_score" not in r
+
+    def test_max_results_parameter(self, memory):
+        """max_results parameter limits returned results."""
+        self._setup_links(memory, "C001", ["C002", "C003", "C004", "C005"])
+
+        with patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", max_results=2)
+
+        assert len(results) == 2
+
+    def test_max_results_defaults_to_config(self, memory):
+        """When max_results is None, config.link_max_results is used."""
+        memory.config.link_max_results = 3
+        self._setup_links(memory, "C001", ["C002", "C003", "C004", "C005", "C006"])
+
+        with patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001")
+
+        assert len(results) == 3
+
+    def test_max_results_overrides_config(self, memory):
+        """Explicit max_results overrides config.link_max_results."""
+        memory.config.link_max_results = 10
+        self._setup_links(memory, "C001", ["C002", "C003", "C004"])
+
+        with patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", max_results=1)
+
+        assert len(results) == 1
+
+    def test_heap_explores_highest_score_first_multihop(self, memory):
+        """Priority queue explores highest-scored edges first across hops."""
+        # Graph: C001 -> C002 (low score), C003 (high score)
+        #        C003 -> C004
+        self._setup_links_multihop(memory, {
+            "C001": ["C002", "C003"],
+            "C003": ["C004"],
+        })
+
+        # C003 scores highest, so it gets expanded first and C004 appears
+        def mock_quick_cosine(text_a: str, text_b: str) -> float:
+            if text_a == "a" and text_b == "b":
+                return 0.5  # probe
+            if "C003" in text_b:
+                return 0.9
+            if "C002" in text_b:
+                return 0.1
+            if "C004" in text_b:
+                return 0.85
+            return 0.0
+
+        def mock_parse(text: str) -> dict:
+            for cid in ("C002", "C003", "C004"):
+                if cid in text:
+                    return {"what": f"about {cid}"}
+            return {}
+
+        def mock_find(branch: str, cid: str) -> str:
+            return f"[{cid}] text"
+
+        with patch("ccr.core.memory.quick_cosine", side_effect=mock_quick_cosine), \
+             patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
+             patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits(
+                "C001", max_hops=2, query="find important", max_results=10,
+            )
+
+        ids = [r["id"] for r in results]
+        assert "C003" in ids
+        assert "C004" in ids
+        assert "C002" in ids
+        # C003 (0.9) should appear before C002 (0.1) in results
+        assert ids.index("C003") < ids.index("C002")
+
+    def test_visited_nodes_not_revisited(self, memory):
+        """Nodes already visited are never re-added to results."""
+        # Cycle: C001 -> C002, C002 -> C001
+        self._setup_links_multihop(memory, {
+            "C001": ["C002"],
+            "C002": ["C001"],
+        })
+
+        with patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", max_hops=3)
+
+        ids = [r["id"] for r in results]
+        assert ids.count("C001") == 0  # Starting node never in results
+        assert ids.count("C002") == 1  # Visited exactly once
+
+    def test_quick_cosine_exception_falls_back_gracefully(self, memory):
+        """If quick_cosine probe raises an exception, BFS fallback is used."""
+        self._setup_links(memory, "C001", ["C002"])
+
+        with patch("ccr.core.memory.quick_cosine", side_effect=RuntimeError("ONNX crash")), \
+             patch.object(memory, "_load_commit_embeddings", return_value={}):
+            results = memory.get_linked_commits("C001", query="test")
+
+        # Still returns results via BFS fallback
+        assert len(results) == 1
+        assert results[0]["id"] == "C002"
+        assert "query_score" not in results[0]
+
+    def test_embedding_score_still_added_post_traversal(self, memory):
+        """embedding_score from cached vectors is still added after heap traversal."""
+        import numpy as np
+
+        src_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        tgt_vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        self._setup_links(memory, "C001", ["C002"])
+
+        with patch.object(
+            memory,
+            "_load_commit_embeddings",
+            return_value={"C001": src_vec, "C002": tgt_vec},
+        ):
+            results = memory.get_linked_commits("C001")
+
+        assert len(results) == 1
+        assert "embedding_score" in results[0]
+        assert abs(results[0]["embedding_score"] - 0.0) < 1e-5

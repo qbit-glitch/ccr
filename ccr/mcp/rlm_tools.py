@@ -228,7 +228,8 @@ def rlm_finalize(variable_name: str, keep_session: bool = False) -> RlmFinalizeR
         # A1 fix: check result BEFORE destroying the session so that a typo in
         # variable_name does not silently wipe all computed state.
         if answer is None or str(answer).startswith("Error:"):
-            raise ToolError(f"Variable '{variable_name}' not found in REPL session. Session preserved.")
+            session_note = "Session preserved." if keep_session else "Call rlm_init to start a new session."
+            raise ToolError(f"Variable '{variable_name}' not found in REPL session. {session_note}")
 
         # Only destroy session after confirming successful retrieval, and only when
         # keep_session is False.

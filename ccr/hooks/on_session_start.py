@@ -47,6 +47,9 @@ def main():
     first_prompt = _is_first_prompt(mem.ccr_root)
 
     if first_prompt:
+        # Initialize fresh session state for auto-commit accumulation
+        from ccr.hooks.state_accumulator import initialize_state
+        initialize_state(mem.ccr_root)
         _handle_session_start(mem)
     else:
         _handle_subsequent_prompt(mem)
@@ -91,22 +94,14 @@ def _handle_session_start(mem):
             pb_parts.append(f"# PROJECT STRATEGIES (this project)\n{playbook_text}")
         parts.append(f"<ace_playbook>\n{chr(10).join(pb_parts)}\n</ace_playbook>")
 
-    # Strong session-start directive
+    # Session-start directive (concise — detailed guidance is in CLAUDE.md)
     parts.append("""<MANDATORY_CCR_ACTIONS>
-You have 18 CCR MCP tools (gcc_*, ace_*, rlm_*, index_*) available RIGHT NOW.
+You have CCR MCP tools (gcc_*, ace_*, rlm_*, index_*) available.
 
-IMMEDIATE ACTION REQUIRED — before responding to the user's message:
-1. Call gcc_context(level=2) to load full project memory
-2. Call gcc_status to check memory state
-
-ONGOING REQUIREMENTS for this entire session:
-- After completing ANY task: call gcc_commit with what/why/files_changed/next_step
-- After significant work: call ace_get_playbook, then ace_update_counters
-- If you learn something new: call ace_apply_delta with ADD
-- Before context gets large: call gcc_commit to preserve state
-- Do NOT wait for the user to ask — commit proactively after each milestone
-
-These are MCP tools you call directly, not theoretical concepts. Use them NOW.
+Before responding: call gcc_context(level=2) and gcc_status to load project memory.
+After each task: call gcc_commit with what/why/files_changed/next_step.
+After significant work: call ace_get_playbook then ace_update_counters.
+New insight? Call ace_apply_delta with ADD. Commit proactively before context grows.
 </MANDATORY_CCR_ACTIONS>""")
 
     if parts:

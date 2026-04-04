@@ -648,4 +648,5 @@ class TestAMEMMemoryEvolution:
             import ccr.mcp_server as srv
             result = srv.gcc_evolve_memory(commit_id=None)
 
-        assert "Sub-model not available" in result or "not available" in result.lower()
+        msg = result["message"]
+        assert "Sub-model not available" in msg or "not available" in msg.lower()
