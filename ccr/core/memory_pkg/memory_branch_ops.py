@@ -92,7 +92,15 @@ class BranchOpsMixin:
         SUMMARY_TEMPLATE: str
     """
 
-    def create_branch(self, name: str, purpose: str, hypothesis: str) -> str:
+    def create_branch(
+        self,
+        name: str,
+        purpose: str,
+        hypothesis: str,
+        linked_issue: str = "",
+        team_owner: str = "",
+        priority: str = "",
+    ) -> str:
         """Create a new exploration branch. Must be on main."""
         # Validate kebab-case
         if not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", name):
@@ -139,6 +147,25 @@ class BranchOpsMixin:
         # Update metadata.yaml
         self._update_metadata_branch(name, "active", now, "main")
 
+        # Store optional metadata fields (linked_issue, team_owner, priority)
+        if linked_issue or team_owner or priority:
+            meta = self._load_metadata()
+            for b in meta.get("branches", []):
+                if b.get("name") == name:
+                    if linked_issue:
+                        b["linked_issue"] = linked_issue
+                    if team_owner:
+                        b["team_owner"] = team_owner
+                    if priority:
+                        b["priority"] = priority
+                    break
+            meta_path = os.path.join(self.ccr_root, "metadata.yaml")
+            try:
+                import yaml as _yaml
+                self._write_file(meta_path, _yaml.dump(meta, default_flow_style=False))
+            except Exception:
+                pass  # Metadata enrichment is supplementary
+
         # Log with OTA format
         self._append_log(name, self._format_ota_log(
             "branch-create", name, "OK",
@@ -149,11 +176,17 @@ class BranchOpsMixin:
 
         return f"Created branch '{name}' — purpose: {purpose}"
 
-    def merge(self, branch_name: str, outcome: str, conclusion: str) -> str:
+    def merge(
+        self,
+        branch_name: str,
+        outcome: str,
+        conclusion: str,
+        allow_custom_outcome: bool = False,
+    ) -> str:
         """Merge a branch back into main."""
         if branch_name == "main":
             raise ValueError("Cannot merge main into itself.")
-        if outcome not in ("success", "failure", "partial"):
+        if not allow_custom_outcome and outcome not in ("success", "failure", "partial"):
             raise ValueError(f"Outcome must be success/failure/partial, got: {outcome}")
 
         active = self.get_active_branch()

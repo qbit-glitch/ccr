@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
@@ -45,6 +46,8 @@ def gcc_commit(
     admission_threshold: float = 0.85,
     rejection_threshold: float = 0.0,
     compressed_summary: str | None = None,
+    author: str = "",
+    ci_context: dict | None = None,
 ) -> GccCommitResult:
     """Commit progress to project memory.
 
@@ -69,6 +72,9 @@ def gcc_commit(
         compressed_summary: Compressed rolling summary. Provide this when
             prompted — compress into a concise paragraph of project context,
             milestones, and direction. Max 1500 chars.
+        author: Optional author name/identifier stored in the commit block.
+        ci_context: Optional CI metadata dict (e.g., {"run_id": "123"}).
+            Stored as JSON in the commit block.
     """
     # Import ace_tools module (not function) to allow test patching via setattr
     import ccr.mcp.ace_tools as _ace_mod
@@ -109,16 +115,27 @@ def gcc_commit(
         with _srv._state_lock:
             mem = _srv._ensure_memory()
             # Phase 2: Auto-extract patterns via sub-model when not provided (CER §3.2)
+            # Retry up to 2 times on transient failure (A7 sub-model retry)
             if patterns_learned is None and mem.config.auto_extract_patterns and len(what) > 100:
                 sub = _srv._get_sub_client()
                 if sub is not None:
-                    patterns_learned = _srv._extract_patterns_from_commit(
-                        title, what, why, files_changed or [], sub
-                    ) or None
+                    _extracted = None
+                    for _attempt in range(2):
+                        try:
+                            _extracted = _srv._extract_patterns_from_commit(
+                                title, what, why, files_changed or [], sub
+                            )
+                            break
+                        except Exception:
+                            if _attempt == 0:
+                                time.sleep(1)
+                    patterns_learned = _extracted or None
             result = mem.commit(title, what, why, files_changed, next_step,
                                 patterns_learned,
                                 admission_threshold, rejection_threshold,
-                                compressed_summary)
+                                compressed_summary,
+                                author=author,
+                                ci_context=ci_context)
 
         # ACE §3.1-3.3: Generator → Reflector → Curator pipeline (fire-and-forget)
         sub = _srv._get_sub_client()
@@ -174,7 +191,14 @@ def gcc_commit(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def gcc_branch(name: str, purpose: str, hypothesis: str) -> GccBranchResult:
+def gcc_branch(
+    name: str,
+    purpose: str,
+    hypothesis: str,
+    linked_issue: str = "",
+    team_owner: str = "",
+    priority: str = "",
+) -> GccBranchResult:
     """Create an exploration branch for experimental work.
 
     Branches isolate experimental changes from the main line. Must be on
@@ -184,11 +208,19 @@ def gcc_branch(name: str, purpose: str, hypothesis: str) -> GccBranchResult:
         name: Branch name in kebab-case.
         purpose: What this branch explores.
         hypothesis: What you expect to learn or achieve.
+        linked_issue: Optional issue/ticket reference (e.g., "GH-123").
+        team_owner: Optional team or owner identifier.
+        priority: Optional priority level (e.g., "high", "p1").
     """
     try:
         with _srv._state_lock:
             mem = _srv._ensure_memory()
-            result = mem.create_branch(name, purpose, hypothesis)
+            result = mem.create_branch(
+                name, purpose, hypothesis,
+                linked_issue=linked_issue,
+                team_owner=team_owner,
+                priority=priority,
+            )
         return GccBranchResult(branch=name, message=result)
     except ValueError:
         raise  # User input validation — let MCP propagate
@@ -197,7 +229,12 @@ def gcc_branch(name: str, purpose: str, hypothesis: str) -> GccBranchResult:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
-def gcc_merge(branch: str, outcome: str, conclusion: str) -> GccMergeResult:
+def gcc_merge(
+    branch: str,
+    outcome: str,
+    conclusion: str,
+    custom_outcome: str = "",
+) -> GccMergeResult:
     """Merge an exploration branch back into main.
 
     Must be on the branch being merged. Integrates the branch's rolling
@@ -207,11 +244,17 @@ def gcc_merge(branch: str, outcome: str, conclusion: str) -> GccMergeResult:
         branch: Branch name to merge.
         outcome: One of 'success', 'failure', or 'partial'.
         conclusion: Summary of what was learned.
+        custom_outcome: If non-empty, overrides outcome validation and uses
+            this string as the outcome (e.g. "in-progress", "abandoned").
+            Bypasses the success/failure/partial constraint.
     """
     try:
         with _srv._state_lock:
             mem = _srv._ensure_memory()
-            result = mem.merge(branch, outcome, conclusion)
+            if custom_outcome:
+                result = mem.merge(branch, custom_outcome, conclusion, allow_custom_outcome=True)
+            else:
+                result = mem.merge(branch, outcome, conclusion)
         return GccMergeResult(source=branch, target="main", message=result)
     except ValueError:
         raise  # User input validation — let MCP propagate
@@ -230,6 +273,8 @@ def gcc_context(
     summaries_tier: str = "all",
     summaries_count: int = 5,
     max_tokens: int | None = None,
+    result_limit: int = 20,
+    time_range_hours: int | None = None,
 ) -> GccContextResult:
     """Retrieve project memory at the specified depth.
 
@@ -251,9 +296,14 @@ def gcc_context(
         summaries_count: Max summaries per tier (default 5).
         max_tokens: Optional upper bound on output size (rough 4 chars/token estimate).
             Use to prevent overly large context at higher levels.
+        result_limit: Maximum number of commit blocks to include (default 20).
+        time_range_hours: If set, only include commit blocks from the last N hours.
     """
+    from datetime import datetime, timezone, timedelta
+
     level = max(1, min(level, 5))
     log_window = max(0, min(log_window, 50))
+    result_limit = max(1, result_limit)
     _level_warnings: list[str] = []
     if search_term and level < 5:
         _level_warnings.append(f"search_term is only active at level=5 (current level={level}); use level=5 to search commits.")
@@ -268,6 +318,37 @@ def gcc_context(
         log_window=log_window,
         follow_links=follow_links,
     )
+
+    # Apply result_limit and time_range_hours filtering on commit blocks
+    # Commit blocks start with "\n## [C" or "## [C" at the beginning
+    if "\n## [C" in result or result.startswith("## [C"):
+        # Split on commit block boundaries, preserving delimiter
+        _parts = result.split("\n## [C")
+        _pre = _parts[0]  # Content before the first commit block
+        _blocks = ["\n## [C" + p for p in _parts[1:]]
+
+        # Apply time_range_hours filter
+        if time_range_hours is not None and time_range_hours > 0:
+            _cutoff = datetime.now(timezone.utc) - timedelta(hours=time_range_hours)
+            _filtered = []
+            for _blk in _blocks:
+                # Header: ## [C001] 2026-03-10 22:25 | ...
+                _ts_match = re.search(r"## \[C\d+\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", _blk)
+                if _ts_match:
+                    try:
+                        _ts = datetime.strptime(_ts_match.group(1), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                        if _ts >= _cutoff:
+                            _filtered.append(_blk)
+                    except ValueError:
+                        _filtered.append(_blk)  # Keep if unparseable
+                else:
+                    _filtered.append(_blk)
+            _blocks = _filtered
+
+        # Apply result_limit
+        _blocks = _blocks[:result_limit]
+
+        result = _pre + "".join(_blocks)
 
     # Append thematic clusters (level 3+)
     if level >= 3:
@@ -300,8 +381,11 @@ def gcc_context(
     if max_tokens is not None and max_tokens > 0:
         budget_chars = max_tokens * 4  # ~4 chars/token heuristic (matches estimate_tokens)
         if len(result) > budget_chars:
-            result = result[:budget_chars]
-            result += f"\n\n[Context truncated to ~{max_tokens} tokens. Use level=2 or sections filter for targeted retrieval.]"
+            # Markdown-aware cut: prefer cutting at a section boundary
+            cut = result.rfind("\n## ", 0, budget_chars)
+            if cut == -1:
+                cut = budget_chars
+            result = result[:cut] + f"\n\n[Context truncated to ~{max_tokens} tokens. Use level=2 or sections filter for targeted retrieval.]"
 
     if _level_warnings:
         result = "\n".join(f"[Warning: {w}]" for w in _level_warnings) + "\n\n" + result
@@ -470,30 +554,35 @@ def gcc_triples(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
-def gcc_evolve_memory(commit_id: str | None = None) -> GccEvolveMemoryResult:
+def gcc_evolve_memory(
+    commit_id: str | None = None,
+    rollback: bool = False,
+) -> GccEvolveMemoryResult:
     """Manually trigger A-MEM evolution for a commit or all recent commits.
 
     When a sub-model is available, rewrites commit summaries to incorporate
     context from related commits (A-MEM §3.3 Eq.7 memory evolution).
+    When no sub-model is available, applies a text fallback that deduplicates
+    sentences in the 'what' field of commit summaries.
 
     Args:
         commit_id: Specific commit to evolve (e.g. "C001"). If None, evolves
                    all recent commits that have semantic/supersession links.
+        rollback: If True, snapshot evolved_summaries before starting. On any
+                  exception, restore the snapshot automatically.
     """
     sub = _srv._get_sub_client()
-    if sub is None:
-        text = (
-            "Sub-model not available. Set CCR_OLLAMA_MODEL or ANTHROPIC_API_KEY "
-            "to enable A-MEM memory evolution."
-        )
-        return GccEvolveMemoryResult(evolutions=0, message=text)
 
     with _srv._state_lock:
         mem = _srv._ensure_memory()
     mem.sub_client = sub
 
+    # A6a: Snapshot for rollback support
+    snapshot = dict(mem._evolved_summaries) if rollback else None
+
     branch = mem.get_active_branch()
     evolutions_performed: list[str] = []
+    diff_lines: list[str] = []
 
     try:
         from ccr.core.types import CommitLink  # noqa: PLC0415
@@ -515,9 +604,21 @@ def gcc_evolve_memory(commit_id: str | None = None) -> GccEvolveMemoryResult:
             if not candidate_links:
                 return 0
             before = set(mem._evolved_summaries.keys())
+            # A6c: Record before state for diff
+            before_states: dict[str, str] = {}
+            for link in candidate_links:
+                tid = link.target if hasattr(link, "target") else link.get("target", "")
+                existing = mem.get_evolved_what(tid)
+                before_states[tid] = existing or ""
             mem._trigger_memory_evolution(cid, candidate_links)
             after = set(mem._evolved_summaries.keys())
-            return len(after - before)
+            new_keys = after - before
+            # Build diff entries
+            for tid in new_keys:
+                after_what = mem.get_evolved_what(tid) or ""
+                before_what = before_states.get(tid, "")
+                diff_lines.append(f"[{tid}]: '{before_what[:60]}' → '{after_what[:60]}'")
+            return len(new_keys)
 
         if commit_id:
             n = _evolve_commit_with_links(commit_id)
@@ -540,6 +641,12 @@ def gcc_evolve_memory(commit_id: str | None = None) -> GccEvolveMemoryResult:
                     evolutions_performed.append(f"{cid}: {n} new evolution(s)")
 
     except Exception as e:
+        if rollback and snapshot is not None:
+            mem._evolved_summaries = snapshot
+            try:
+                mem._save_evolved_summaries()
+            except Exception:
+                pass
         raise ToolError(f"Error during memory evolution: {type(e).__name__}: {e}") from e
 
     if not evolutions_performed or all("no new evolutions" in e for e in evolutions_performed):
@@ -547,6 +654,8 @@ def gcc_evolve_memory(commit_id: str | None = None) -> GccEvolveMemoryResult:
         return GccEvolveMemoryResult(evolutions=0, message=text)
     count = sum(1 for e in evolutions_performed if "no new evolutions" not in e)
     text = "A-MEM memory evolution complete:\n" + "\n".join(f"  - {e}" for e in evolutions_performed)
+    if diff_lines:
+        text += "\n\n## Diffs\n" + "\n".join(f"  {d}" for d in diff_lines)
     return GccEvolveMemoryResult(evolutions=count, message=text)
 
 
@@ -582,8 +691,10 @@ def gcc_status() -> GccStatusResult:
     """Show current project memory status.
 
     Returns the active branch, recent milestones, open branches,
-    and metadata summary.
+    and metadata summary. Warns if any active branch is more than 30 days old.
     """
+    from datetime import datetime, timezone
+
     with _srv._state_lock:
         mem = _srv._ensure_memory()
 
@@ -599,6 +710,31 @@ def gcc_status() -> GccStatusResult:
     total_commits = len(mem._build_commit_index(branch))
 
     text = "\n\n".join(parts)
+
+    # Stale branch detection — warn if any active branch is > 30 days old
+    try:
+        meta = mem._load_metadata()
+        now = datetime.now(timezone.utc)
+        _stale: list[str] = []
+        for b in meta.get("branches", []):
+            if b.get("status") != "active":
+                continue
+            created_str = b.get("created", "")
+            if not created_str:
+                continue
+            try:
+                created_dt = datetime.strptime(str(created_str), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                age_days = (now - created_dt).days
+                if age_days > 30:
+                    _stale.append(f"  - {b['name']} ({age_days} days old, created {created_str})")
+            except ValueError:
+                pass
+        if _stale:
+            text += "\n\n## ⚠ Stale Branches (> 30 days)\n" + "\n".join(_stale)
+            text += "\n\nConsider merging or closing these branches."
+    except Exception:
+        pass  # Stale branch detection is supplementary — never fail status
+
     return GccStatusResult(branch=branch, total_commits=total_commits, message=text)
 
 
@@ -659,6 +795,7 @@ def gcc_patterns(
     include_promoted: bool = True,
     search_term: str | None = None,
     max_age_hours: int | None = None,
+    auto_promote: bool = False,
 ) -> GccPatternsResult:
     """Query the CER-inspired pattern buffer.
 
@@ -673,6 +810,8 @@ def gcc_patterns(
         search_term: Optional keyword filter on pattern text.
         max_age_hours: If set, only return patterns last seen within this many hours.
             Useful for surfacing recent patterns: max_age_hours=24 = last 24h only.
+        auto_promote: If True, automatically promote all promotion candidates to the
+            ACE playbook via ace_apply_delta ADD ops. Errors are silently ignored.
     """
     with _srv._state_lock:
         mem = _srv._ensure_memory()
@@ -695,8 +834,9 @@ def gcc_patterns(
         promoted_tag = " [PROMOTED]" if p.get("promoted") else ""
         q_score = p.get("quality_score", 0.5)
         q_tag = f", q={q_score:.2f}" if (p.get("success_count", 0) + p.get("failure_count", 0)) > 0 else ""
+        last_seen_tag = f", last: {p['last_seen']}" if p.get("last_seen") else ""
         lines.append(
-            f"- **[{p['id']}]** ({p['occurrence_count']}x{q_tag}, first: {p['first_seen']}){promoted_tag}\n"
+            f"- **[{p['id']}]** ({p['occurrence_count']}x{q_tag}, first: {p['first_seen']}{last_seen_tag}){promoted_tag}\n"
             f"  {p['text']}\n"
             f"  Commits: {', '.join(p['commit_ids'])}"
         )
@@ -708,6 +848,19 @@ def gcc_patterns(
         lines.append(f"\n## Promotion Candidates (>= {threshold} occurrences)")
         for c in candidates:
             lines.append(f"- [{c['id']}] \"{c['text'][:100]}\" ({c['occurrence_count']}x)")
+
+    # A1: auto_promote — lazily promote candidates to ACE playbook
+    if auto_promote and candidates:
+        try:
+            import ccr.mcp.ace_tools as _ace_tools_mod
+            ops = [
+                {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": c["text"]}
+                for c in candidates
+            ]
+            _ace_tools_mod.ace_apply_delta(ops)
+            lines.append(f"\n[Auto-promoted {len(candidates)} candidate(s) to ACE playbook.]")
+        except Exception:
+            pass  # Auto-promotion is supplementary — never fail the query
 
     text = "\n".join(lines)
     return GccPatternsResult(total=total, matching=matching, message=text)

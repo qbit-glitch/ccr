@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -60,6 +61,8 @@ class CommitMixin:
         admission_threshold: float = 0.85,
         rejection_threshold: float = 0.0,
         compressed_summary: str | None = None,
+        author: str = "",
+        ci_context: dict | None = None,
     ) -> str:
         """Create a structured commit on the active branch.
 
@@ -158,6 +161,9 @@ class CommitMixin:
         if patterns_learned:
             patterns_str = f"**Patterns**: {' | '.join(patterns_learned)}\n"
 
+        author_str = f"**Author**: {author}\n" if author else ""
+        ci_str = f"**CI**: {json.dumps(ci_context)}\n" if ci_context else ""
+
         entry = (
             f"## [{commit_id}] {now} | branch:{branch} | {title}\n"
             f"**What**: {what}\n"
@@ -165,6 +171,8 @@ class CommitMixin:
             f"**Files**: {files_str}\n"
             f"**Next**: {next_step}\n"
             f"{patterns_str}"
+            f"{author_str}"
+            f"{ci_str}"
             f"**Score**: {admission_score_value:.2f}\n\n---\n\n"
         )
 

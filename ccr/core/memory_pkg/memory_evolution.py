@@ -85,8 +85,28 @@ class EvolutionMixin:
 
         Implements A-MEM S3.3 Eq.7: m_tilde_i = f_LLM(m_i, m')
         Returns None when sub_client is unavailable or an error occurs.
+        When sub_client is None, applies a text fallback: deduplicates sentences
+        in the 'what' field, returning an EvolvedSummary only if dedup removed
+        at least one sentence.
         """
         if self.sub_client is None:
+            # Text fallback: dedup sentences in existing_commit's 'what' field
+            what = existing_commit.get("what", "")
+            sentences = what.split(". ")
+            deduped = list(dict.fromkeys(s for s in sentences if s))
+            if len(deduped) < len(sentences):
+                evolved_what = ". ".join(deduped)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                existing_id = existing_commit.get("id", "")
+                new_id = new_commit.get("id", "")
+                return EvolvedSummary(
+                    commit_id=existing_id,
+                    evolved_what=evolved_what,
+                    evolution_reason="dedup-fallback: removed duplicate sentences",
+                    evolved_at=now_iso,
+                    source_commit_id=new_id,
+                    original_what=what,
+                )
             return None
         try:
             prompt = (
