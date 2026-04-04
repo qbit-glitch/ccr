@@ -1499,14 +1499,13 @@ class MemoryManager:
                 continue
             component: list[str] = []
             queue: deque[str] = deque([node])
+            visited.add(node)  # Mark at enqueue — prevents duplicate queue entries
             while queue:
                 n = queue.popleft()
-                if n in visited:
-                    continue
-                visited.add(n)
                 component.append(n)
                 for neighbor in adjacency.get(n, set()):
                     if neighbor not in visited:
+                        visited.add(neighbor)  # Mark at enqueue, not at pop
                         queue.append(neighbor)
             if len(component) >= min_cluster_size:
                 components.append(sorted(component))
@@ -1904,6 +1903,7 @@ class MemoryManager:
         min_occurrences: int = 1,
         include_promoted: bool = True,
         search_term: str | None = None,
+        max_age_hours: int | None = None,
     ) -> dict:
         """Query the pattern buffer. Returns dict for MCP tool formatting.
 
@@ -1915,6 +1915,9 @@ class MemoryManager:
         results = []
         # Snapshot current time once to avoid floating point drift between entries
         now = datetime.now(timezone.utc)
+        age_cutoff = (
+            now - timedelta(hours=max_age_hours) if max_age_hours is not None else None
+        )
 
         for pid, entry in data.get("patterns", {}).items():
             if entry.get("occurrence_count", 1) < min_occurrences:
@@ -1924,6 +1927,17 @@ class MemoryManager:
             if search_term:
                 if search_term.lower() not in entry["text"].lower():
                     continue
+            if age_cutoff is not None:
+                last_seen = entry.get("last_seen", entry.get("created_at", ""))
+                if last_seen:
+                    try:
+                        ts = datetime.fromisoformat(last_seen.strip().replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        if ts < age_cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass  # Skip age check for unparseable timestamps
             # CER recency-weighted retrieval: compute effective score
             quality = entry.get("quality_score", 0.5)
             last_seen = entry.get("last_seen", entry.get("created_at", ""))
@@ -1955,8 +1969,9 @@ class MemoryManager:
         if not timestamp_str:
             return 0.5  # Default moderate weight for undated patterns
         # Try ISO-8601 first (modern format used by datetime.now().isoformat())
+        # Replace 'Z' suffix for Python < 3.11 compat (fromisoformat rejects 'Z' before 3.11)
         try:
-            ts = datetime.fromisoformat(timestamp_str.strip())
+            ts = datetime.fromisoformat(timestamp_str.strip().replace("Z", "+00:00"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             hours = (now - ts).total_seconds() / 3600.0

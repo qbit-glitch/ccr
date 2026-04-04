@@ -77,6 +77,11 @@ def gcc_commit(
         # --- Input validation ---
         if not title.strip():
             raise ValueError("gcc_commit: 'title' must not be empty or whitespace-only.")
+        if '\n' in title or '\r' in title:
+            raise ValueError("gcc_commit: 'title' cannot contain newlines (breaks commit header parsing).")
+        _TITLE_MAX = 200
+        if len(title) > _TITLE_MAX:
+            title = title[:_TITLE_MAX]
 
         _FIELD_MAX = 2000
         _warnings: list[str] = []
@@ -249,6 +254,11 @@ def gcc_context(
     """
     level = max(1, min(level, 5))
     log_window = max(0, min(log_window, 50))
+    _level_warnings: list[str] = []
+    if search_term and level < 5:
+        _level_warnings.append(f"search_term is only active at level=5 (current level={level}); use level=5 to search commits.")
+    if commit_id and level < 5:
+        _level_warnings.append(f"commit_id is only active at level=5 (current level={level}); use level=5 for specific commit lookup.")
     with _srv._state_lock:
         mem = _srv._ensure_memory()
     result = mem.get_context(
@@ -292,6 +302,9 @@ def gcc_context(
         if len(result) > budget_chars:
             result = result[:budget_chars]
             result += f"\n\n[Context truncated to ~{max_tokens} tokens. Use level=2 or a lower level for targeted retrieval.]"
+
+    if _level_warnings:
+        result = "\n".join(f"[Warning: {w}]" for w in _level_warnings) + "\n\n" + result
 
     branch = mem.get_active_branch()
     return GccContextResult(level=level, branch=branch, message=result)
@@ -618,10 +631,17 @@ def gcc_consolidate(tier: str = "session", content: str | None = None) -> GccCon
         tier: "session", "phase", or "project".
         content: For tier="project" only — the generated overview text to save.
     """
+    _VALID_TIERS = {"session", "phase", "project"}
+    if tier not in _VALID_TIERS:
+        raise ToolError(f"tier must be one of {sorted(_VALID_TIERS)}, got: {tier!r}")
+
     try:
         with _srv._state_lock:
             mem = _srv._ensure_memory()
             if tier == "project" and content is not None:
+                _OVERVIEW_MAX = 5000
+                if len(content) > _OVERVIEW_MAX:
+                    content = content[:_OVERVIEW_MAX] + "\n\n[Truncated to 5000 chars by system]"
                 mem.save_overview(content)
                 return GccConsolidateResult(tier=tier, message="Project overview saved.")
             text = mem.get_consolidation_prompt(tier=tier)
@@ -638,6 +658,7 @@ def gcc_patterns(
     min_occurrences: int = 1,
     include_promoted: bool = True,
     search_term: str | None = None,
+    max_age_hours: int | None = None,
 ) -> GccPatternsResult:
     """Query the CER-inspired pattern buffer.
 
@@ -650,6 +671,8 @@ def gcc_patterns(
         min_occurrences: Minimum occurrence count to include (default 1).
         include_promoted: Whether to include already-promoted patterns (default True).
         search_term: Optional keyword filter on pattern text.
+        max_age_hours: If set, only return patterns last seen within this many hours.
+            Useful for surfacing recent patterns: max_age_hours=24 = last 24h only.
     """
     with _srv._state_lock:
         mem = _srv._ensure_memory()
@@ -657,6 +680,7 @@ def gcc_patterns(
         min_occurrences=min_occurrences,
         include_promoted=include_promoted,
         search_term=search_term,
+        max_age_hours=max_age_hours,
     )
 
     total = result["total"]

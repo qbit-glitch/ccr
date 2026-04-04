@@ -107,6 +107,7 @@ class AceApplyDeltaResult(TypedDict):
     applied: int
     scope: str
     message: str
+    failed_ids: NotRequired[list[str]]
 
 
 class AceUpdateCountersResult(TypedDict):

@@ -140,19 +140,25 @@ class Scratchpad:
     def list_entries(self) -> list[ScratchpadEntry]:
         """List all working memory entries, sorted by updated_at descending.
 
-        Expired entries are excluded (but not deleted — deletion happens on get()).
+        Expired entries are deleted in batch from disk to prevent bloat.
         """
         now = datetime.now(timezone.utc)
         with self._lock:
+            expired_keys = []
             active = []
             for e in self._entries.values():
                 if e.expires_at:
                     try:
                         if datetime.fromisoformat(e.expires_at) <= now:
+                            expired_keys.append(e.key)
                             continue
                     except (ValueError, TypeError):
                         pass
                 active.append(e)
+            if expired_keys:
+                for k in expired_keys:
+                    del self._entries[k]
+                self._save()
             return sorted(active, key=lambda e: e.updated_at, reverse=True)
 
     def delete(self, key: str) -> bool:

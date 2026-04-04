@@ -1076,6 +1076,12 @@ class Playbook:
                 mean_r = sum(rewards) / n
                 variance = sum((r - mean_r) ** 2 for r in rewards) / n
                 std_r = math.sqrt(variance)
+                if std_r <= 1e-10:
+                    # Degenerate group: all rewards identical — advantage is 0 for all
+                    for bullet in group:
+                        bullet.grpo_advantage = 0.0
+                        updated += 1
+                    continue
                 for bullet, r_i in zip(group, rewards):
                     bullet.grpo_advantage = (r_i - mean_r) / (std_r + 1e-8)
                     updated += 1

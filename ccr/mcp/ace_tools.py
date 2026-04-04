@@ -132,6 +132,15 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> AceApplyD
         with _srv._state_lock:
             pb, save_fn = _srv._resolve_playbook(scope)
             ops = parse_delta_operations({"operations": operations})
+            # Track bullet IDs that should exist for UPDATE/MERGE/REMOVE ops
+            bullet_ids_before = {b.id for b in pb.bullets}
+            failed_ids = [
+                op.bullet_id
+                for op in ops
+                if op.op_type in ("UPDATE", "MERGE", "REMOVE")
+                and op.bullet_id
+                and op.bullet_id not in bullet_ids_before
+            ]
             applied = pb.apply_delta(ops)
             save_fn()
 
@@ -149,7 +158,12 @@ def ace_apply_delta(operations: list[dict], scope: str = "project") -> AceApplyD
         text = f"Applied {applied} operation(s) to {scope} playbook. Now has {len(pb.bullets)} bullets."
         if promoted_count:
             text += f" Marked {promoted_count} pattern(s) as promoted in CER buffer."
-        return AceApplyDeltaResult(applied=applied, scope=scope, message=text)
+        if failed_ids:
+            text += f"\nWarning: {len(failed_ids)} operation(s) referenced missing bullet ID(s): {failed_ids}"
+        result: AceApplyDeltaResult = {"applied": applied, "scope": scope, "message": text}
+        if failed_ids:
+            result["failed_ids"] = failed_ids
+        return result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -727,14 +741,24 @@ def ace_generate_bullets(context: str, auto_apply: bool = False) -> AceGenerateB
                                     best_sim = sim
                                     best_id = b.id
                             if best_id and best_sim > 0.0:
-                                op = DeltaOperation(
-                                    op_type="MERGE",
-                                    section="",
+                                # Two-step: ADD candidate, then MERGE it into keeper
+                                # (bullet_id=keeper, merge_target=newly added)
+                                add_op = DeltaOperation(
+                                    op_type="ADD",
+                                    section="STRATEGIES & INSIGHTS",
                                     content=bullet_text,
-                                    bullet_id=best_id,
-                                    merge_target=best_id,
                                 )
-                                pb.apply_delta([op])
+                                pb.apply_delta([add_op])
+                                new_id = pb.bullets[-1].id if pb.bullets else None
+                                if new_id and new_id != best_id:
+                                    merge_op = DeltaOperation(
+                                        op_type="MERGE",
+                                        section="",
+                                        content=bullet_text,
+                                        bullet_id=best_id,
+                                        merge_target=new_id,
+                                    )
+                                    pb.apply_delta([merge_op])
                                 applied_count += 1
                 _srv._save_playbook()
             lines.append(f"Applied {applied_count} decision(s) to project playbook.")
