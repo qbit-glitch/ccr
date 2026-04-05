@@ -161,6 +161,67 @@ def _create_db_session(ccr_root: str, project_root: str) -> None:
         pass  # never block session start
 
 
+_DIRECTIVES: dict[str, str] = {
+    "default": """\
+<MANDATORY_CCR_ACTIONS>
+Memory already loaded. Respond directly to the user.
+
+REQUIRED after each task:
+  gcc_commit(title, what, why, files_changed, next_step)
+  session_log_turn(assistant_message="<your full response>")
+
+WHEN NEEDED:
+  gcc_context(level=3) — deeper context
+  gcc_search(query)    — find past decisions
+  ace_get_playbook()   — see evolved strategies
+</MANDATORY_CCR_ACTIONS>""",
+
+    "ml": """\
+<MANDATORY_CCR_ACTIONS>
+Memory already loaded. ML Research mode active.
+
+REQUIRED after each experiment/task:
+  gcc_commit(title, what, why, files_changed, next_step,
+             experiment={"id": "...", "hypothesis": "...",
+                         "metrics": {...}, "conclusion": "..."})
+  session_log_turn(assistant_message="<your full response>")
+
+WHEN NEEDED:
+  gcc_experiments()           — browse experiment history + metrics
+  gcc_branch(name, purpose)   — isolate a hypothesis
+  index_search(query)         — find code/config files
+</MANDATORY_CCR_ACTIONS>""",
+
+    "academic": """\
+<MANDATORY_CCR_ACTIONS>
+Memory already loaded. Academic Research mode active.
+
+REQUIRED after each writing/analysis task:
+  gcc_commit(title, what, why, files_changed, next_step)
+  session_log_turn(assistant_message="<your full response>")
+
+WHEN NEEDED:
+  gcc_discuss(topic, position) — record argument or decision
+  gcc_discussions()            — retrieve past positions/notes
+  gcc_search(query)            — search all past analysis
+  session_search(query)        — search conversation history
+</MANDATORY_CCR_ACTIONS>""",
+}
+
+
+def _get_preset(ccr_root: str) -> str:
+    """Read preset from .ccr/metadata.yaml. Returns 'default' if unset or on error."""
+    try:
+        import yaml  # noqa: PLC0415 — lazy import keeps hook startup fast
+        meta_path = os.path.join(ccr_root, "metadata.yaml")
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return (yaml.safe_load(f) or {}).get("preset", "default")
+    except Exception:
+        pass
+    return "default"
+
+
 def _handle_session_start(mem, project_root: str = "", user_prompt: str = "", was_stale: bool = False):
     """First prompt of session: inject full context + strong directive."""
     # Create DB session and buffer user prompt (non-fatal)
@@ -224,17 +285,10 @@ See: docs/quickstart-students.md for a 5-minute guide.
             pb_parts.append(f"# PROJECT STRATEGIES (this project)\n{playbook_text}")
         parts.append(f"<ace_playbook>\n{chr(10).join(pb_parts)}\n</ace_playbook>")
 
-    # Session-start directive (concise — detailed guidance is in CLAUDE.md)
+    # Session-start directive: preset-aware, surfaces only the relevant tool subset.
     # Level-2 context already injected above — no need to call gcc_context again.
-    parts.append("""<MANDATORY_CCR_ACTIONS>
-You have CCR MCP tools (gcc_*, ace_*, rlm_*, index_*, session_*) available.
-Memory context (level=2) already loaded above — respond directly to the user.
-
-After each task: call gcc_commit with what/why/files_changed/next_step.
-After significant work: call ace_get_playbook then ace_update_counters.
-New insight? Call ace_apply_delta with ADD. Commit proactively before context grows.
-After each response: call session_log_turn(assistant_message="<your full response>").
-</MANDATORY_CCR_ACTIONS>""")
+    preset = _get_preset(mem.ccr_root)
+    parts.append(_DIRECTIVES.get(preset, _DIRECTIVES["default"]))
 
     if parts:
         output = "\n\n".join(parts)

@@ -133,3 +133,45 @@ def initialize_state(ccr_root: str) -> None:
         session_id=str(uuid.uuid4())[:8],  # Short 8-char ID for sessions.jsonl
     )
     save_state(ccr_root, state)
+
+
+def extract_baseline_summary(
+    state: SessionState,
+    session_turns: list[dict],
+) -> dict[str, str | list[str]]:
+    """Build a baseline commit dict when no explicit commit was made.
+
+    Uses the first 1-3 user messages as the summary source. Returns a dict
+    compatible with mem.commit() kwargs.
+
+    Args:
+        state: Already-loaded SessionState (do not reload after clear_state).
+        session_turns: Turns from SessionStore.get_session_turns(), may be empty.
+
+    Returns:
+        Dict with title, what, why, files_changed, next_step.
+    """
+    user_msgs = [
+        t["user_message"] for t in session_turns[:10]
+        if t.get("user_message", "").strip()
+    ][:3]
+
+    if user_msgs:
+        topic = user_msgs[0][:80].replace("\n", " ").strip()
+        title = f"[auto] {topic}" if len(topic) > 5 else "[auto] Session baseline"
+        what_parts = [f"Turn {i + 1}: {m[:100]}" for i, m in enumerate(user_msgs)]
+    else:
+        title = "[auto] Session baseline"
+        what_parts = ["Session with no logged turns"]
+
+    files = list(dict.fromkeys(state.files_touched))[:20]
+    if files:
+        what_parts.append(f"Files touched: {', '.join(files[:5])}")
+
+    return {
+        "title": title,
+        "what": "; ".join(what_parts)[:500],
+        "why": "Session baseline: auto-captured when no explicit commit was made",
+        "files_changed": files,
+        "next_step": "",
+    }

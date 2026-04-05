@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -150,6 +151,16 @@ def gcc_commit(
                                 author=author,
                                 ci_context=ci_context,
                                 experiment=experiment)
+
+        # Write explicit-commit marker so on_stop.py skips auto-baseline for this session
+        if result and not result.startswith("Error") and not result.startswith("[REJECTED]"):
+            try:
+                if _srv._project_root:
+                    _marker = os.path.join(_srv._project_root, ".ccr", ".session_explicit_commit")
+                    with open(_marker, "w", encoding="utf-8") as _mf:
+                        _mf.write("1")
+            except Exception:
+                pass  # Non-fatal — worst case: on_stop creates a harmless duplicate baseline
 
         # ACE §3.1-3.3: Generator → Reflector → Curator pipeline (fire-and-forget)
         sub = _srv._get_sub_client()

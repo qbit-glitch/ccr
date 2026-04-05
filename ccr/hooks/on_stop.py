@@ -220,6 +220,61 @@ def _write_session_metrics(ccr_root: str, state) -> None:
 # Main hook logic
 # ---------------------------------------------------------------------------
 
+def _auto_baseline_commit(mem: object, state: object, store: object, session_id: str) -> None:
+    """Create a structural commit if no explicit gcc_commit was made this session.
+
+    Fires when: no explicit-commit marker AND session has >= 1 turn OR >= 1 file touched.
+    Skips: truly empty sessions (no turns, no files).
+    Non-fatal: all errors are logged but never propagated.
+
+    Args:
+        mem: MemoryManager instance (already initialized).
+        state: SessionState (already loaded — do not reload after clear_state).
+        store: SessionStore instance (already open).
+        session_id: Active session ID string, may be empty.
+    """
+    marker_path = os.path.join(mem.ccr_root, ".session_explicit_commit")
+
+    # Clean up marker unconditionally; record whether it was present
+    had_explicit = False
+    try:
+        if os.path.isfile(marker_path):
+            had_explicit = True
+            os.unlink(marker_path)
+    except OSError:
+        pass
+
+    if had_explicit:
+        return  # Explicit gcc_commit was made — no baseline needed
+
+    # Gate: require at least some session activity
+    has_files = bool(state.files_touched)
+    turns: list = []
+    if session_id:
+        try:
+            turns = store.get_session_turns(session_id, limit=10)
+        except Exception:
+            pass
+
+    if not has_files and not turns:
+        return  # Truly empty session — skip
+
+    try:
+        from ccr.hooks.state_accumulator import extract_baseline_summary  # noqa: PLC0415
+        fields = extract_baseline_summary(state, turns)
+        mem.commit(
+            title=fields["title"],
+            what=fields["what"],
+            why=fields["why"],
+            files_changed=fields["files_changed"],
+            next_step=fields["next_step"],
+            author="[auto-baseline]",
+        )
+        print(f"[CCR] Auto-baseline: {fields['title']}")
+    except Exception as exc:
+        _log_hook_error(f"Auto-baseline commit failed: {exc}")
+
+
 def main() -> None:
     # Read stdin payload FIRST — stdin is only available at hook entry
     payload = _read_stdin_payload()
@@ -299,6 +354,10 @@ def main() -> None:
                 inserted = _reconcile_transcript(store, session_id, transcript_path)
                 if inserted:
                     print(f"[CCR] Transcript reconciliation: inserted {inserted} missing turn(s).")
+
+            # Auto-baseline: create structural commit if no explicit gcc_commit was made
+            # Called AFTER reconciliation so reconciled turns are available in the DB
+            _auto_baseline_commit(mem, state, store, session_id)
 
         if os.path.isfile(id_file):
             os.unlink(id_file)

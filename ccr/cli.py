@@ -217,12 +217,21 @@ def index(project: str) -> None:
 
 @cli.command()
 @click.argument("project", default=".")
-def install(project: str) -> None:
+@click.option("--preset", default="default",
+              type=click.Choice(["default", "ml", "academic"]),
+              help="Workflow preset: ml (experiments+code), academic (writing+analysis), default")
+def install(project: str, preset: str) -> None:
     """Install CCR hooks into a project for automatic memory management.
 
     Generates .claude/settings.local.json hook configuration so Claude Code
     auto-commits session progress without manual gcc_commit calls.
     Also initializes .ccr/ if not present.
+
+    \b
+    Presets:
+        default   Generic mode — suitable for any project
+        ml        ML researcher mode — experiment tracking, hypothesis branching
+        academic  Academic researcher mode — decision logging, writing workflows
     """
     import json
 
@@ -233,6 +242,14 @@ def install(project: str) -> None:
     # Ensure .ccr/ exists
     mem = MemoryManager(project)
     mem.ensure_structure()
+
+    # Write preset to metadata.yaml if non-default
+    if preset != "default":
+        try:
+            from ccr.cli_presets import _write_preset_to_metadata  # noqa: PLC0415
+            _write_preset_to_metadata(project, preset)
+        except Exception as exc:
+            click.echo(f"  [warn] Could not write preset: {exc}", err=True)
 
     # Find the CCR package root for hook paths
     ccr_pkg = os.path.dirname(os.path.abspath(__file__))
@@ -308,7 +325,7 @@ def install(project: str) -> None:
         json.dump(existing_mcp, f, indent=2)
         f.write("\n")
 
-    click.echo(f"\n\u2705 CCR installed in {project}")
+    click.echo(f"\n\u2705 CCR installed in {project}  [preset: {preset}]")
     click.echo(f"\n  Hooks ({claude_dir}/settings.local.json):")
     click.echo(f"    UserPromptSubmit \u2192 injects memory context at session start")
     click.echo(f"    PostToolUse      \u2192 tracks tool calls for auto-commit")
@@ -638,6 +655,15 @@ def _register_project(project_root: str) -> None:
     with open(registry_path, "w", encoding="utf-8") as f:
         json.dump(projects_list, f, indent=2)
         f.write("\n")
+
+
+# Register preset commands from cli_presets.py
+try:
+    from ccr.cli_presets import export_context, set_preset  # noqa: PLC0415
+    cli.add_command(set_preset)
+    cli.add_command(export_context)
+except Exception:
+    pass  # Non-fatal — commands simply won't appear if import fails
 
 
 if __name__ == "__main__":
