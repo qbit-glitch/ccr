@@ -8,13 +8,16 @@ import signal
 import sys
 
 import click
-import yaml
 
-from ccr.core.types import CCREngineConfig, CCRConfig, RouterConfig
+from ccr.core.types import CCRConfig
 
 
-def _load_config(config_path: str | None, overrides: dict) -> CCREngineConfig:
-    """Load config from YAML file with CLI overrides."""
+def _load_config(config_path: str | None, overrides: dict):
+    """Load config from YAML file with CLI overrides (legacy ccr start only)."""
+    # Lazy imports — only needed for deprecated ccr start command
+    import yaml  # noqa: PLC0415
+    from ccr.core.types import CCREngineConfig  # noqa: PLC0415
+
     base = {}
     if config_path and os.path.isfile(config_path):
         with open(config_path) as f:
@@ -272,7 +275,14 @@ def install(project: str) -> None:
             pass
 
     existing.setdefault("hooks", {})
-    existing["hooks"].update(hook_config)
+    for event, commands in hook_config.items():
+        existing_cmds = existing["hooks"].get(event, [])
+        ccr_cmd = commands[0]["command"]
+        # Idempotent: append only if CCR hook not already registered for this event
+        if not any(c.get("command") == ccr_cmd for c in existing_cmds):
+            existing["hooks"][event] = existing_cmds + commands
+        else:
+            existing["hooks"].setdefault(event, existing_cmds)
 
     with open(settings_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
@@ -307,6 +317,24 @@ def install(project: str) -> None:
     click.echo(f"\n  MCP server ({mcp_json_path}):")
     click.echo(f"    ccr \u2192 {python_exe} -m ccr.mcp_server")
     abs_project = os.path.abspath(project)
+    # Run doctor inline to confirm install succeeded
+    click.echo(f"\n=== Install verification ===")
+    try:
+        from ccr.cli_doctor import _run_doctor_checks  # noqa: PLC0415
+        ok_items, issues, notices = _run_doctor_checks(project)
+        for item in ok_items:
+            click.echo(f"  [OK] {item}")
+        for item in notices:
+            click.echo(f"  [--] {item}")
+        for item in issues:
+            click.echo(f"  [!!] {item}")
+        if issues:
+            click.echo(f"\n  {len(issues)} issue(s) found — fix before opening Claude Code.")
+        else:
+            click.echo(f"\n  All checks passed.")
+    except Exception:
+        click.echo(f"  (Run 'ccr doctor' to verify installation)")
+
     click.echo(f"\n=== Next step ===")
     click.echo(f"  Open Claude Code from this exact directory:")
     click.echo(f"    cd {abs_project} && claude")
@@ -533,263 +561,12 @@ def status(project: str) -> None:
         click.echo("\nNo commits yet.")
 
 
-@cli.command()
-@click.argument("project", default=".")
-def doctor(project: str) -> None:
-    """Diagnose CCR health and configuration issues."""
-    import importlib
-
-    project = os.path.abspath(project)
-    ccr_dir = os.path.join(project, ".ccr")
-    issues = []
-    ok_items = []
-
-    # 1. Python version
-    py_ver = sys.version.split()[0]
-    if sys.version_info >= (3, 11):
-        ok_items.append(f"Python {py_ver}")
-    else:
-        issues.append(f"Python {py_ver} — requires 3.11+")
-
-    # 2. .ccr/ directory
-    if os.path.isdir(ccr_dir):
-        ok_items.append(f".ccr/ exists at {ccr_dir}")
-    else:
-        issues.append(".ccr/ not found — run 'ccr init'")
-
-    # 3. .mcp.json configuration
-    mcp_json = os.path.join(project, ".mcp.json")
-    if os.path.isfile(mcp_json):
-        ok_items.append(".mcp.json configured")
-    else:
-        issues.append(".mcp.json not found — CCR MCP server not registered")
-
-    # 4. ONNX semantic search
-    try:
-        import onnxruntime  # noqa: F401
-        import tokenizers  # noqa: F401
-        import numpy  # noqa: F401
-        ok_items.append("Semantic search available (onnxruntime + tokenizers)")
-    except ImportError:
-        issues.append("Semantic search unavailable — install ccr[semantic]")
-
-    # 5. ONNX model cached
-    model_dir = os.path.expanduser("~/.cache/ccr/models/all-MiniLM-L6-v2")
-    if os.path.isfile(os.path.join(model_dir, "model.onnx")):
-        ok_items.append("ONNX model cached (~90 MB)")
-    else:
-        issues.append("ONNX model not cached — will download on first use")
-
-    # 6. sqlite-vec
-    try:
-        import sqlite_vec  # noqa: F401
-        ok_items.append("Vector store available (sqlite-vec)")
-    except ImportError:
-        issues.append("Vector store unavailable — install ccr[vector] (optional)")
-
-    # 7. Hooks configured
-    settings_path = os.path.join(project, ".claude", "settings.local.json")
-    if os.path.isfile(settings_path):
-        try:
-            import json
-            with open(settings_path) as f:
-                settings = json.loads(f.read())
-            hooks = settings.get("hooks", {})
-            if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                ok_items.append("Auto-commit hooks configured")
-            else:
-                issues.append("Hooks not configured — run 'ccr install'")
-        except (json.JSONDecodeError, OSError):
-            issues.append("settings.local.json exists but unreadable")
-    else:
-        issues.append("No hooks configured — run 'ccr install' for auto-commit")
-
-    # 8. Hook error log
-    hook_errors_log = os.path.join(ccr_dir, ".hook_errors.log")
-    if os.path.isfile(hook_errors_log):
-        import datetime
-        try:
-            mtime = os.path.getmtime(hook_errors_log)
-            age_h = (datetime.datetime.now().timestamp() - mtime) / 3600
-            with open(hook_errors_log, encoding="utf-8") as f:
-                content = f.read()
-            n_errors = content.count("\n---")
-            if age_h < 24:
-                issues.append(
-                    f"Recent hook errors logged ({n_errors} total) — "
-                    f"run: tail -60 {hook_errors_log}"
-                )
-            else:
-                ok_items.append(f"Hook errors: {n_errors} old (last {age_h:.0f}h ago)")
-        except (OSError, UnicodeDecodeError):
-            ok_items.append("Hook error log exists but unreadable")
-    else:
-        ok_items.append("No hook errors logged")
-
-    # 9. Disk usage
-    if os.path.isdir(ccr_dir):
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(ccr_dir):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                try:
-                    total_size += os.path.getsize(fp)
-                except OSError:
-                    pass
-        size_kb = total_size / 1024
-        ok_items.append(f".ccr/ disk usage: {size_kb:.0f} KB")
-
-    # Print results
-    click.echo("CCR Doctor\n")
-    for item in ok_items:
-        click.echo(f"  [OK] {item}")
-    for item in issues:
-        click.echo(f"  [!!] {item}")
-    click.echo(f"\n  {len(ok_items)} OK, {len(issues)} issue(s)")
-    if not issues:
-        click.echo("  All checks passed.")
-
-
-@cli.command()
-@click.argument("project", default=".")
-@click.option("--multiplier", "-m", default=4.0, type=float,
-              help="Token re-typing multiplier (default 4). Use 2 for conservative, 6 for optimistic.")
-@click.option("--last", default=30, type=int,
-              help="Number of recent sessions to include in stats (default 30).")
-def stats(project: str, multiplier: float, last: int) -> None:
-    """Show CCR ROI dashboard: token savings, memory health, session history."""
-    import json as _json
-    import sys as _sys
-    from datetime import datetime
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    project = os.path.abspath(project)
-    ccr_dir = os.path.join(project, ".ccr")
-
-    if not os.path.isdir(ccr_dir):
-        click.echo(f"No .ccr/ directory found in {project}. Run 'ccr init' first.", err=True)
-        return
-
-    # --- Load session records ---
-    jsonl_path = os.path.join(ccr_dir, "metrics", "sessions.jsonl")
-    sessions = []
-    if os.path.isfile(jsonl_path):
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                    if rec.get("context_tokens", 0) > 0:
-                        sessions.append(rec)
-                except _json.JSONDecodeError:
-                    continue  # Skip corrupt lines
-    sessions = sessions[-last:]  # Most recent N sessions
-
-    # --- Load commit count from GCC ---
-    try:
-        from ccr.core.memory import MemoryManager
-        from ccr.core.types import CCRConfig
-        mem = MemoryManager(project, CCRConfig())
-        branch = mem.get_active_branch()
-        commit_index = mem._build_commit_index(branch)
-        commit_count = len(commit_index)
-        summary_path = os.path.join(mem.ccr_root, "branches", branch, "commits.md")
-        summary_len = 0
-        if os.path.isfile(summary_path):
-            with open(summary_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            import re
-            m = re.search(r"## Rolling Summary\s*\n(.*?)\n---", content, re.DOTALL)
-            if m:
-                summary_len = len(m.group(1).strip())
-    except Exception:
-        commit_count = 0
-        branch = "main"
-        summary_len = 0
-
-    # --- Load playbook ---
-    try:
-        playbook_path = os.path.join(ccr_dir, "playbook.txt")
-        playbook_text = ""
-        if os.path.isfile(playbook_path):
-            with open(playbook_path, "r", encoding="utf-8") as f:
-                playbook_text = f.read()
-        playbook_tokens = max(1, len(playbook_text) // 4)
-        bullet_count = playbook_text.count("] helpful=")
-    except Exception:
-        playbook_tokens = 0
-        bullet_count = 0
-
-    click.echo("\n=== CCR Stats Dashboard ===\n")
-
-    click.echo(f"Project memory ({branch})")
-    click.echo(f"  Commits:          {commit_count}")
-    if summary_len:
-        click.echo(f"  Rolling summary:  {summary_len}/1500 chars ({summary_len * 100 // 1500}%)")
-        if summary_len > 1200:
-            click.echo(f"  ⚠️  Summary is getting long — run gcc_consolidate() or gcc_context(level=5)")
-    if bullet_count:
-        click.echo(f"  Playbook:         {playbook_tokens:,} tokens ({bullet_count} bullets)")
-
-    click.echo()
-
-    if not sessions:
-        click.echo("Session history")
-        click.echo("  No session history yet.")
-        click.echo("  (CCR stats are recorded after each session ends with 'ccr install' hooks active.)")
-        return
-
-    # --- Compute aggregates ---
-    token_list = [s["context_tokens"] for s in sessions]
-    dur_list = [s.get("duration_min", 0) for s in sessions]
-    total_sessions = len(sessions)
-    avg_tokens = sum(token_list) / total_sessions
-    total_tokens = sum(token_list)
-    avoided = total_tokens * multiplier
-    avg_dur = sum(dur_list) / total_sessions if dur_list else 0
-    breakeven = int(1 / multiplier * 10) + 1 if multiplier else 6
-
-    click.echo(f"Session history (last {total_sessions} sessions)")
-    click.echo(f"  Avg context injected:  {avg_tokens:,.0f} tokens/session")
-    click.echo(f"  Total injected:        {total_tokens:,.0f} tokens")
-    click.echo(f"  Est. tokens avoided:   {avoided:,.0f} tokens (×{multiplier:.0f} re-typing heuristic*)")
-    if avg_dur:
-        click.echo(f"  Avg session duration:  {avg_dur:.0f} min")
-
-    click.echo()
-    click.echo(f"30-session projection")
-    projected_avoided = avg_tokens * 30 * multiplier
-    click.echo(f"  Est. savings:  ~{projected_avoided:,.0f} tokens")
-    if total_sessions >= breakeven:
-        click.echo(f"  Break-even:    {breakeven} sessions ✓ (already past)")
-    else:
-        remaining = breakeven - total_sessions
-        click.echo(f"  Break-even:    {breakeven} sessions ({remaining} more to go)")
-
-    click.echo()
-    click.echo(f"Recent sessions")
-    click.echo(f"  {'Date':<12} {'Context':>8}  {'Avoided':>9}  {'Duration':>10}")
-    click.echo(f"  {'-'*12} {'-'*8}  {'-'*9}  {'-'*10}")
-    for s in reversed(sessions[-10:]):
-        try:
-            dt = datetime.fromisoformat(s["start"]).strftime("%Y-%m-%d")
-        except Exception:
-            dt = "unknown"
-        ctx = s["context_tokens"]
-        avd = int(ctx * multiplier)
-        dur = s.get("duration_min", 0)
-        dur_str = f"{dur:.0f} min" if dur else "  —  "
-        click.echo(f"  {dt:<12} {ctx:>8,}  {avd:>9,}  {dur_str:>10}")
-
-    click.echo()
-    click.echo(
-        f"* Rough estimate: assumes you'd re-type ~{multiplier:.0f}× the context without CCR."
-    )
-    click.echo(
-        f"  Pass --multiplier N to adjust (e.g., --multiplier 2 for conservative estimate)."
-    )
+# doctor and stats live in submodules (split for 800-line compliance)
+# Re-exported here so `from ccr.cli import doctor/stats` continues to work
+from ccr.cli_doctor import doctor  # noqa: E402
+from ccr.cli_stats import stats  # noqa: E402
+cli.add_command(doctor)
+cli.add_command(stats)
 
 
 @cli.command()

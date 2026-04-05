@@ -27,11 +27,6 @@ def _log_hook_error(error_text: str) -> None:
         pass
 
 
-# Track whether this is the first invocation in this process lifetime.
-# Hooks are invoked as separate processes each time, so we use a marker file.
-_SESSION_MARKER = "/tmp/.ccr_session_{pid}.marker"
-
-
 _MARKER_MAX_AGE_SECONDS = 7200  # 2 hours — auto-invalidate force-killed sessions
 
 
@@ -185,8 +180,9 @@ See: docs/quickstart-students.md for a 5-minute guide.
 </ccr_ready>""")
         return
 
-    # Get level-1 context
-    context = mem.get_context(level=1)
+    # Get level-2 context (rolling summary + last 3 commits) — pre-injected so
+    # Claude doesn't need to call gcc_context(level=2) before responding.
+    context = mem.get_context(level=2)
 
     # Get global playbook (~/.ccr/)
     global_playbook_path = os.path.expanduser("~/.ccr/global_playbook.txt")
@@ -228,14 +224,15 @@ See: docs/quickstart-students.md for a 5-minute guide.
         parts.append(f"<ace_playbook>\n{chr(10).join(pb_parts)}\n</ace_playbook>")
 
     # Session-start directive (concise — detailed guidance is in CLAUDE.md)
+    # Level-2 context already injected above — no need to call gcc_context again.
     parts.append("""<MANDATORY_CCR_ACTIONS>
 You have CCR MCP tools (gcc_*, ace_*, rlm_*, index_*, session_*) available.
+Memory context (level=2) already loaded above — respond directly to the user.
 
-Before responding: call gcc_context(level=2) and gcc_status to load project memory.
 After each task: call gcc_commit with what/why/files_changed/next_step.
 After significant work: call ace_get_playbook then ace_update_counters.
 New insight? Call ace_apply_delta with ADD. Commit proactively before context grows.
-After each response: call session_log_turn(assistant_message="<your full response>") to persist this Q&A turn.
+After each response: call session_log_turn(assistant_message="<your full response>").
 </MANDATORY_CCR_ACTIONS>""")
 
     if parts:
