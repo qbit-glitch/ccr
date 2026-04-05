@@ -161,9 +161,12 @@ def _reconcile_transcript(
                 source="transcript",
             )
             inserted += 1
-        except Exception:
-            # UNIQUE constraint or other error — skip this turn
-            pass
+        except Exception as _exc:
+            if "UNIQUE" in str(_exc):
+                pass  # Already logged by session_log_turn — expected on duplicate
+            else:
+                import traceback as _tb
+                _log_hook_error(f"Transcript reconciliation turn {idx + 1}: {_tb.format_exc()}")
 
     return inserted
 
@@ -300,7 +303,8 @@ def main() -> None:
         if os.path.isfile(id_file):
             os.unlink(id_file)
     except Exception:
-        pass
+        import traceback
+        _log_hook_error(traceback.format_exc())
 
     # Clean up any pending user message buffer
     try:

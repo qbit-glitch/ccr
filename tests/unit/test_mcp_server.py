@@ -1031,10 +1031,11 @@ def _get_tool_annotations(tool_name: str):
 
 
 class TestToolAnnotations:
-    """Verify readOnlyHint, destructiveHint, idempotentHint on all 22 tools.
+    """Verify readOnlyHint, destructiveHint, idempotentHint on registered tools.
 
-    4 tools (gcc_log_ota, gcc_triples, gcc_clusters, ace_evolve_from_failures)
-    were removed from the MCP surface in Phase 2B tool consolidation.
+    ace_evolve_from_failures was restored in 0.2.6 after its @mcp.tool decorator
+    was accidentally removed. All ACE tools including ace_evolve_from_failures,
+    ace_generate_bullets, and ace_evolve_schema are active.
     """
 
     # -- Read-only tools --
@@ -1072,6 +1073,7 @@ class TestToolAnnotations:
 
     @pytest.mark.parametrize("tool_name", [
         "gcc_commit", "gcc_scratchpad", "ace_apply_delta", "ace_update_counters",
+        "ace_generate_bullets", "ace_evolve_from_failures",
         "rlm_init", "rlm_execute",
     ])
     def test_mutating_non_destructive_tools(self, tool_name):
@@ -1118,9 +1120,17 @@ class TestToolAnnotations:
 
     def test_all_tools_have_annotations(self):
         all_tools = mcp_instance._tool_manager._tools
-        assert len(all_tools) >= 22, f"Expected at least 22 tools, got {len(all_tools)}"
+        assert len(all_tools) >= 31, f"Expected at least 31 tools, got {len(all_tools)}"
         for name, tool in all_tools.items():
             assert tool.annotations is not None, f"{name} missing annotations"
+
+    def test_ace_evolve_from_failures_registered(self):
+        """ace_evolve_from_failures must be registered — it was unregistered in 0.2.5 and restored in 0.2.6."""
+        all_tools = mcp_instance._tool_manager._tools
+        assert "ace_evolve_from_failures" in all_tools, (
+            "ace_evolve_from_failures is missing from the MCP tool registry. "
+            "Ensure @mcp.tool decorator is present in ace_tools.py."
+        )
 
 
 # ===========================================================================

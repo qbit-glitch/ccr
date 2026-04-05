@@ -146,7 +146,15 @@ def session_get_history(
             message="No active session. Provide a session_id or start a new session.",
         )
 
-    turns = store.get_session_turns(sid, limit=limit, offset=offset)
+    try:
+        turns = store.get_session_turns(sid, limit=limit, offset=offset)
+    except Exception as exc:
+        return SessionGetHistoryResult(
+            session_id=sid,
+            turn_count=0,
+            turns=[],
+            message=f"Error retrieving session history: {exc}",
+        )
     lines = []
     for t in turns:
         source = t.get("source", "direct")
@@ -187,7 +195,14 @@ def session_search(
         limit: Maximum number of results (default 10).
     """
     store = _get_store()
-    results = store.search_turns(query, limit=limit)
+    try:
+        results = store.search_turns(query, limit=limit)
+    except Exception as exc:
+        return SessionSearchResult(
+            result_count=0,
+            results=[],
+            message=f"Error searching sessions: {exc}",
+        )
 
     lines = []
     for r in results:
@@ -238,12 +253,12 @@ def session_export(
 
     try:
         data = store.export_session(sid, fmt=format)
-    except ValueError as exc:
+    except Exception as exc:
         return SessionExportResult(
             session_id=sid,
             format=format,
             data="",
-            message=str(exc),
+            message=f"Export failed: {exc}",
         )
 
     line_count = data.count("\n") + 1 if data.strip() else 0

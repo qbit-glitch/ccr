@@ -78,8 +78,29 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
 );
 """
 
-_CREATE_FTS_TRIGGER = """
+_CREATE_FTS_TRIGGER_INSERT = """
 CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
+    INSERT INTO turns_fts(rowid, user_message, assistant_message)
+    VALUES (new.id, new.user_message, new.assistant_message);
+END;
+"""
+
+_CREATE_FTS_TRIGGER_DELETE = """
+CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, user_message, assistant_message)
+    VALUES ('delete', old.id, old.user_message, old.assistant_message);
+END;
+"""
+
+_CREATE_FTS_TRIGGER_BU = """
+CREATE TRIGGER IF NOT EXISTS turns_bu BEFORE UPDATE ON turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, user_message, assistant_message)
+    VALUES ('delete', old.id, old.user_message, old.assistant_message);
+END;
+"""
+
+_CREATE_FTS_TRIGGER_AU = """
+CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
     INSERT INTO turns_fts(rowid, user_message, assistant_message)
     VALUES (new.id, new.user_message, new.assistant_message);
 END;
@@ -133,7 +154,10 @@ class SessionStore:
             # FTS5 may not be compiled in — catch and disable gracefully
             try:
                 conn.execute(_CREATE_FTS)
-                conn.execute(_CREATE_FTS_TRIGGER)
+                conn.execute(_CREATE_FTS_TRIGGER_INSERT)
+                conn.execute(_CREATE_FTS_TRIGGER_DELETE)
+                conn.execute(_CREATE_FTS_TRIGGER_BU)
+                conn.execute(_CREATE_FTS_TRIGGER_AU)
             except sqlite3.OperationalError:
                 self._fts_available = False
             conn.commit()

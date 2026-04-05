@@ -347,21 +347,25 @@ class TestAceUpdateLessonValidation:
 def _mock_sub_client(monkeypatch, decisions: list[dict]):
     """Patch the ACE pipeline to return predetermined decisions without LLM calls."""
     import ccr.mcp.ace_tools as ace_mod
+    import ccr.mcp.ace_llm_tools as llm_mod
     # Patch _get_sub_client via the shim (_srv = ccr.mcp_server which proxies to server.py)
     monkeypatch.setattr(ace_mod._srv, "_get_sub_client", lambda: object())
-    # Patch the pipeline helpers directly on ace_tools module (where ace_generate_bullets calls them)
-    monkeypatch.setattr(
-        ace_mod, "_ace_generator",
-        lambda ctx, sub: ["candidate 1", "candidate 2"],
-    )
-    monkeypatch.setattr(
-        ace_mod, "_ace_reflector",
-        lambda cands, ctx, sub: cands,
-    )
-    monkeypatch.setattr(
-        ace_mod, "_ace_curator",
-        lambda existing, cands, sub: decisions,
-    )
+    # Patch the pipeline helpers on the module where ace_generate_bullets actually calls them
+    # (ace_llm_tools.py since the split; also patch ace_tools for backward compat)
+    _captured_decisions = decisions
+    for mod in (ace_mod, llm_mod):
+        monkeypatch.setattr(
+            mod, "_ace_generator",
+            lambda ctx, sub: ["candidate 1", "candidate 2"],
+        )
+        monkeypatch.setattr(
+            mod, "_ace_reflector",
+            lambda cands, ctx, sub: cands,
+        )
+        monkeypatch.setattr(
+            mod, "_ace_curator",
+            lambda existing, cands, sub, _d=_captured_decisions: _d,
+        )
 
 
 class TestAceGenerateConfirmIndices:

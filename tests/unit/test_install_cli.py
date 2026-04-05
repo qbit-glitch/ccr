@@ -124,3 +124,42 @@ class TestInstallSuccessMessage:
         runner = CliRunner()
         result = runner.invoke(cli, ["install", str(project)])
         assert "Quick test" in result.output or "gcc_status" in result.output
+
+
+class TestInstallPreservesNonCcrHooks:
+    """ccr install must not clobber pre-existing hooks from other tools."""
+
+    def test_pre_existing_hook_survives_install(self, project):
+        """A hook from another tool on UserPromptSubmit must survive ccr install."""
+        settings_dir = project / ".claude"
+        settings_dir.mkdir(parents=True)
+        settings_path = settings_dir / "settings.local.json"
+        settings_path.write_text(json.dumps({
+            "hooks": {
+                "UserPromptSubmit": [{"type": "command", "command": "other-tool.py"}]
+            }
+        }))
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["install", str(project)])
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(settings_path.read_text())
+        cmds = [c["command"] for c in data["hooks"]["UserPromptSubmit"]]
+        assert "other-tool.py" in cmds, "Pre-existing hook was clobbered by ccr install"
+        assert any("on_session_start.py" in c for c in cmds), "CCR hook not added"
+
+    def test_pre_existing_hook_no_duplicate_on_reinstall(self, project):
+        """Re-running ccr install must not add the pre-existing hook twice."""
+        runner = CliRunner()
+        runner.invoke(cli, ["install", str(project)])
+        runner.invoke(cli, ["install", str(project)])
+
+        settings = json.loads(
+            (project / ".claude" / "settings.local.json").read_text()
+        )
+        hooks = settings.get("hooks", {})
+        for hook_name in ("UserPromptSubmit", "PostToolUse", "Stop", "PreCompact"):
+            assert len(hooks[hook_name]) == 1, (
+                f"{hook_name} has {len(hooks[hook_name])} entries after 2 installs"
+            )

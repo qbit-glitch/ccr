@@ -32,13 +32,19 @@ MCP server giving Claude Code persistent memory (GCC), self-evolving playbooks (
 - **Search past sessions**: `session_search(query="...")` — full-text search all Q&A logs
 - **Export for training**: `session_export(format="jsonl")` — OpenAI fine-tuning format
 
+### Research & Experiment Tools (v6)
+- **Log experiment**: `gcc_experiments(experiment_id=..., hypothesis_contains=..., metric_filter={...})` — query/filter experiment records stored in commits
+- **Log decision**: `gcc_discuss(topic=..., hypothesis=..., decision=..., rationale=...)` — persist reasoning behind design choices across sessions
+- **List discussions**: `gcc_discussions(limit=20)` — retrieve stored decision log
+- **Semantic search**: `gcc_search(query=..., mode="hybrid")` — keyword/semantic/hybrid search across all memory
+
 ## Project Structure
 
 ```
 ccr/
   mcp_server.py     # Backward-compat shim → ccr/mcp/
-  mcp/              # FastMCP tools: server.py, gcc_tools.py, ace_tools.py, rlm_tools.py, index_tools.py
-  hooks/            # on_session_start.py, on_stop.py, on_compact.py
+  mcp/              # FastMCP tools: server.py, gcc_tools.py, ace_tools.py, rlm_tools.py, index_tools.py, session_tools.py
+  hooks/            # on_session_start.py, on_stop.py, on_compact.py, on_tool_use.py
   core/
     memory.py       # GCC .ccr/ directory: commit/branch/merge/context
     scratchpad.py   # Ephemeral KV working memory
@@ -52,12 +58,12 @@ ccr/
   ace/playbook.py   # Bullet library: sections, delta ops, decay, GRPO
   models/           # Legacy (not used in MCP mode)
   utils/            # tokens.py, parsing.py
-tests/unit/         # ~1566 tests
+tests/unit/         # ~1993 tests
 ```
 
 ## Key Patterns
 
-- **12 core MCP tools** via stdio; 10 more with `CCR_EXTENDED=1`
+- **31 MCP tools** always active (gcc×14, ace×7, rlm×3, index×3, session×4)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
 - **Two-tier playbook**: Global (~/.ccr/) + project (.ccr/); `scope="global"|"project"` on ACE tools
@@ -70,7 +76,7 @@ tests/unit/         # ~1566 tests
 ## Development
 
 ```bash
-pytest tests/unit/ tests/integration/ -x -q  # ~1566 tests
+pytest tests/unit/ tests/integration/ -x -q  # ~1993 tests
 python -m ccr.mcp_server                     # MCP server (stdio)
 ```
 
@@ -81,7 +87,7 @@ python -m ccr.mcp_server                     # MCP server (stdio)
 {"mcpServers": {"ccr": {"command": ".venv/bin/python", "args": ["-m", "ccr.mcp_server", "--project", "."]}}}
 ```
 
-## Research Papers (11)
+## Research Papers (16)
 
 1. **GCC** (2508.00031) — version-controlled memory + A-MAC admission
 2. **RLM** (2512.24601) — REPL execution, FINAL_VAR termination
@@ -94,6 +100,11 @@ python -m ccr.mcp_server                     # MCP server (stdio)
 9. **ExpRAG** (2603.18272) — embedding-based commit search
 10. **ERL** (2603.24639) — trigger/action bullets
 11. **EvolveR** (2510.16079) — quality-scored patterns (Bayesian)
+12. **Memori** (2603.19935) — semantic triples for token-efficient memory
+13. **EverMemOS** (2601.02163) — thematic clustering via connected components
+14. **AgeMem** (2601.01885) — working memory scratchpad (ephemeral KV)
+15. **AgentEvolver** (2511.10395) — contribution-weighted proportional credit
+16. **ALMA** (2602.07755) — meta-learned memory retrieval parameter evolution
 
 Full details and limitation tables: `docs/papers.md`
 

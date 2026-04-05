@@ -25,6 +25,9 @@ from ccr.core.types import CCRConfig, PlaybookSchema
 from ccr.mcp.audit import configure_audit_log
 from ccr.utils.parsing import extract_json_string
 
+# Default sub-model for optional Anthropic-backed features (non-critical path)
+_DEFAULT_SUB_MODEL = "claude-haiku-4-5-20251001"
+
 # ---------------------------------------------------------------------------
 # Globals — initialized once at startup
 # ---------------------------------------------------------------------------
@@ -95,7 +98,7 @@ def _get_sub_client() -> object | None:
     if api_key:
         try:
             from ccr.models.anthropic_client import ClaudeClient  # noqa: PLC0415
-            return ClaudeClient(api_key=api_key, model_name="claude-haiku-4-5-20251001", max_tokens=1024)
+            return ClaudeClient(api_key=api_key, model_name=_DEFAULT_SUB_MODEL, max_tokens=1024)
         except Exception:
             pass
 
@@ -439,10 +442,21 @@ def main():
     _init(args.project)
 
     # Import tool modules to trigger @mcp.tool registration
-    import ccr.mcp.gcc_tools  # noqa: F401
-    import ccr.mcp.ace_tools  # noqa: F401
-    import ccr.mcp.rlm_tools  # noqa: F401
-    import ccr.mcp.index_tools  # noqa: F401
-    import ccr.mcp.session_tools  # noqa: F401
+    import sys as _sys
+    _TOOL_MODULES = [
+        ("ccr.mcp.gcc_tools", "GCC memory tools"),
+        ("ccr.mcp.ace_tools", "ACE core playbook tools"),
+        ("ccr.mcp.ace_llm_tools", "ACE LLM pipeline tools"),
+        ("ccr.mcp.ace_schema_tools", "ACE schema evolution tools"),
+        ("ccr.mcp.rlm_tools", "RLM sandboxed REPL"),
+        ("ccr.mcp.index_tools", "Index search tools"),
+        ("ccr.mcp.session_tools", "Session logger tools"),
+    ]
+    for _mod, _label in _TOOL_MODULES:
+        try:
+            __import__(_mod)
+        except ImportError as _exc:
+            print(f"[CCR] Failed to load {_label} ({_mod}): {_exc}", file=_sys.stderr)
+            raise
 
     mcp.run(transport="stdio")

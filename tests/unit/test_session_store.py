@@ -306,3 +306,75 @@ def test_persistence(db_path):
     assert len(turns) == 1
     assert turns[0]["user_message"] == "hello"
     assert turns[0]["assistant_message"] == "world"
+
+
+# ---------------------------------------------------------------------------
+# FTS5 content-table trigger correctness
+# ---------------------------------------------------------------------------
+
+
+def test_fts_all_four_triggers_registered(store):
+    """All 4 FTS5 triggers (ai, ad, bu, au) must be registered in sqlite_master."""
+    if not store._fts_available:
+        pytest.skip("FTS5 not available")
+    conn = store._get_conn()
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='turns'"
+    ).fetchall()
+    trigger_names = {r[0] for r in rows}
+    assert "turns_ai" in trigger_names, "INSERT trigger missing"
+    assert "turns_ad" in trigger_names, "DELETE trigger missing"
+    assert "turns_bu" in trigger_names, "BEFORE UPDATE trigger missing"
+    assert "turns_au" in trigger_names, "AFTER UPDATE trigger missing"
+
+
+def test_fts_delete_trigger(store):
+    """Deleted turns must not appear in FTS search results."""
+    if not store._fts_available:
+        pytest.skip("FTS5 not available")
+    sid = store.create_session()
+    store.log_turn(sid, "phantom query", "phantom answer")
+
+    # Verify it appears before deletion
+    results_before = store.search_turns("phantom")
+    assert len(results_before) == 1
+
+    # Delete the turn directly
+    conn = store._get_conn()
+    conn.execute("DELETE FROM turns WHERE session_id = ?", (sid,))
+    conn.commit()
+
+    # FTS index must be consistent — no phantom row
+    results_after = store.search_turns("phantom")
+    assert len(results_after) == 0, "FTS index stale after DELETE — missing turns_ad trigger?"
+
+
+def test_fts_update_trigger(store):
+    """Updated turns must reflect new content in FTS search.
+
+    Uses unique tokens that appear only in assistant_message to avoid
+    cross-field FTS5 AND-matches confusing the assertion.
+    """
+    if not store._fts_available:
+        pytest.skip("FTS5 not available")
+    sid = store.create_session()
+    # Use tokens unique enough that they can't appear elsewhere
+    store.log_turn(sid, "neutral user prompt", "OLDTOKEN_XZ9Q")
+
+    # Verify original token is found
+    assert len(store.search_turns("OLDTOKEN_XZ9Q")) == 1
+
+    # Update only assistant_message to a different unique token
+    conn = store._get_conn()
+    row = conn.execute("SELECT id FROM turns WHERE session_id = ?", (sid,)).fetchone()
+    conn.execute(
+        "UPDATE turns SET assistant_message = 'NEWTOKEN_QZ9X' WHERE id = ?",
+        (row["id"],),
+    )
+    conn.commit()
+
+    # Old unique token must be gone; new token must be present
+    old_results = store.search_turns("OLDTOKEN_XZ9Q")
+    new_results = store.search_turns("NEWTOKEN_QZ9X")
+    assert len(old_results) == 0, "FTS stale: old token still matched after UPDATE — missing turns_bu/turns_au trigger?"
+    assert len(new_results) == 1, "FTS stale: new token not found after UPDATE"

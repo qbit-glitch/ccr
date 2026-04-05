@@ -245,3 +245,64 @@ class TestSessionExport:
         result = session_export()
         assert result["data"] == ""
         assert "session_id" in result["message"].lower() or result["session_id"] == ""
+
+    def test_invalid_format_returns_error_message(self, tmp_path):
+        """Invalid format arg returns error message, never raises."""
+        session_log_turn(assistant_message="some response")
+        sid = _srv._current_session_id
+        result = session_export(session_id=sid, format="xml")
+        assert result["data"] == ""
+        assert result["message"] != ""
+
+    def test_db_error_returns_gracefully(self, tmp_path, monkeypatch):
+        """SQLite operational errors are caught and returned as message, not raised."""
+        session_log_turn(assistant_message="first")
+        sid = _srv._current_session_id
+
+        def bad_export(*args, **kwargs):
+            import sqlite3
+            raise sqlite3.OperationalError("disk I/O error")
+
+        store = _srv._ensure_session_store()
+        monkeypatch.setattr(store, "export_session", bad_export)
+        result = session_export(session_id=sid, format="jsonl")
+        assert result["data"] == ""
+        assert "error" in result["message"].lower() or "disk" in result["message"].lower()
+
+
+# ===========================================================================
+# Error-path coverage for session_get_history and session_search
+# ===========================================================================
+
+
+class TestSessionToolsErrorPaths:
+    def test_get_history_db_error_returns_gracefully(self, tmp_path, monkeypatch):
+        """get_session_turns DB error returns error message instead of raising."""
+        session_log_turn(assistant_message="test")
+        sid = _srv._current_session_id
+
+        def bad_get_turns(*args, **kwargs):
+            import sqlite3
+            raise sqlite3.OperationalError("disk I/O error")
+
+        store = _srv._ensure_session_store()
+        monkeypatch.setattr(store, "get_session_turns", bad_get_turns)
+        result = session_get_history(session_id=sid)
+        assert result["turn_count"] == 0
+        assert result["turns"] == []
+        assert "error" in result["message"].lower()
+
+    def test_search_db_error_returns_gracefully(self, tmp_path, monkeypatch):
+        """search_turns DB error returns error message instead of raising."""
+        session_log_turn(assistant_message="hello")
+
+        def bad_search(*args, **kwargs):
+            import sqlite3
+            raise sqlite3.OperationalError("disk I/O error")
+
+        store = _srv._ensure_session_store()
+        monkeypatch.setattr(store, "search_turns", bad_search)
+        result = session_search(query="hello")
+        assert result["result_count"] == 0
+        assert result["results"] == []
+        assert "error" in result["message"].lower()
