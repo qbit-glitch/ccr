@@ -53,6 +53,11 @@ _chunk_embeddings_path: str = ""
 _scratchpad: Scratchpad | None = None
 _triple_store: TripleStore | None = None
 
+# Session logger (chat turn persistence)
+_session_store: object | None = None   # SessionStore when initialized
+_session_db_path: str = ""
+_current_session_id: str = ""          # cached for current session
+
 mcp = FastMCP(
     "ccr",
     instructions=(
@@ -105,6 +110,7 @@ def _init(project_root: str | None = None) -> None:
     global _embedding_model, _embeddings_path, _chunk_embeddings_path
     global _scratchpad
     global _triple_store
+    global _session_store, _session_db_path, _current_session_id
 
     _project_root = os.path.abspath(project_root or os.getcwd())
     _memory = MemoryManager(_project_root, CCRConfig())
@@ -147,6 +153,11 @@ def _init(project_root: str | None = None) -> None:
 
     # Triple store (Memori-inspired semantic triple extraction)
     _triple_store = TripleStore(os.path.join(_project_root, ".ccr", "triples.json"))
+
+    # Session logger — path set here; store initialized lazily on first use
+    _session_db_path = os.path.join(_project_root, ".ccr", "sessions.db")
+    _session_store = None
+    _current_session_id = ""
 
     # Build repo index — try incremental load first (skip rebuild if mtimes unchanged)
     _repo_index = None
@@ -392,6 +403,27 @@ def _serialize_playbook(pb: Playbook) -> str:
     return pb.serialize_with_failures() if has_lessons else pb.serialize()
 
 
+def _ensure_session_store():
+    """Return the SessionStore, initializing lazily on first call.
+
+    Also refreshes _current_session_id from .ccr/.current_session_id if not cached.
+    """
+    global _session_store, _current_session_id
+    if _session_store is None:
+        from ccr.core.session_store import SessionStore  # noqa: PLC0415
+        db = _session_db_path or os.path.join(_project_root, ".ccr", "sessions.db")
+        _session_store = SessionStore(db)
+    if not _current_session_id:
+        id_file = os.path.join(_project_root, ".ccr", ".current_session_id")
+        try:
+            if os.path.isfile(id_file):
+                with open(id_file, "r", encoding="utf-8") as f:
+                    _current_session_id = f.read().strip()
+        except OSError:
+            pass
+    return _session_store
+
+
 def main():
     """Run the MCP server with stdio transport."""
     import argparse
@@ -411,5 +443,6 @@ def main():
     import ccr.mcp.ace_tools  # noqa: F401
     import ccr.mcp.rlm_tools  # noqa: F401
     import ccr.mcp.index_tools  # noqa: F401
+    import ccr.mcp.session_tools  # noqa: F401
 
     mcp.run(transport="stdio")

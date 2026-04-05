@@ -84,7 +84,14 @@ def start(
     sub_model_url: str | None,
     config_path: str | None,
 ) -> None:
-    """Start the CCR gateway proxy."""
+    """[DEPRECATED — use 'ccr install' for Claude Code] Start the CCR gateway proxy."""
+    click.echo(
+        "WARNING: 'ccr start' runs the legacy HTTP proxy architecture (requires ANTHROPIC_API_KEY).\n"
+        "   For Claude Code users, use 'ccr install' instead — it sets up MCP + hooks with no API key.\n"
+        "   See: https://github.com/qbit-glitch/ccr#quick-start\n",
+        err=True,
+    )
+
     from ccr.core.engine import CCREngine
     from ccr.gateway import CCRGateway
 
@@ -231,15 +238,23 @@ def install(project: str) -> None:
     # Determine python executable (prefer venv)
     python_exe = sys.executable
 
-    # Build hook commands
+    # Build hook commands (all 4 hooks required for full auto-commit chain)
     hook_config = {
         "UserPromptSubmit": [{
             "type": "command",
             "command": f"{python_exe} {os.path.join(hooks_dir, 'on_session_start.py')}",
         }],
+        "PostToolUse": [{
+            "type": "command",
+            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_tool_use.py')}",
+        }],
         "Stop": [{
             "type": "command",
             "command": f"{python_exe} {os.path.join(hooks_dir, 'on_stop.py')}",
+        }],
+        "PreCompact": [{
+            "type": "command",
+            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_compact.py')}",
         }],
     }
 
@@ -263,11 +278,231 @@ def install(project: str) -> None:
         json.dump(existing, f, indent=2)
         f.write("\n")
 
-    click.echo(f"Installed CCR hooks in {claude_dir}/settings.local.json")
-    click.echo(f"  - UserPromptSubmit: session start + context injection")
-    click.echo(f"  - Stop: auto-commit session progress")
-    click.echo(f"\n.ccr/ initialized in {project}")
-    click.echo("CCR will now auto-commit your session progress. No manual gcc_commit needed.")
+    # Write .mcp.json — registers the CCR MCP server with Claude Code
+    mcp_json_path = os.path.join(project, ".mcp.json")
+    existing_mcp: dict = {}
+    if os.path.isfile(mcp_json_path):
+        try:
+            with open(mcp_json_path, "r", encoding="utf-8") as f:
+                existing_mcp = json.loads(f.read())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    existing_mcp.setdefault("mcpServers", {})
+    existing_mcp["mcpServers"]["ccr"] = {
+        "command": python_exe,
+        "args": ["-m", "ccr.mcp_server", "--project", project],
+    }
+
+    with open(mcp_json_path, "w", encoding="utf-8") as f:
+        json.dump(existing_mcp, f, indent=2)
+        f.write("\n")
+
+    click.echo(f"\n\u2705 CCR installed in {project}")
+    click.echo(f"\n  Hooks ({claude_dir}/settings.local.json):")
+    click.echo(f"    UserPromptSubmit \u2192 injects memory context at session start")
+    click.echo(f"    PostToolUse      \u2192 tracks tool calls for auto-commit")
+    click.echo(f"    Stop             \u2192 auto-commits session progress on exit")
+    click.echo(f"    PreCompact       \u2192 saves state before context resets")
+    click.echo(f"\n  MCP server ({mcp_json_path}):")
+    click.echo(f"    ccr \u2192 {python_exe} -m ccr.mcp_server")
+    abs_project = os.path.abspath(project)
+    click.echo(f"\n=== Next step ===")
+    click.echo(f"  Open Claude Code from this exact directory:")
+    click.echo(f"    cd {abs_project} && claude")
+    click.echo(f"")
+    click.echo(f"  \u26a0\ufe0f  Claude Code must be launched from {abs_project}")
+    click.echo(f"     Hooks only fire when CWD matches the project root.")
+    click.echo(f"")
+    click.echo(f"  Quick test — ask Claude:")
+    click.echo(f'    "What do you remember about this project?"')
+    click.echo(f"    Then call: gcc_status()")
+
+
+@cli.command()
+@click.argument("project", default=".")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def uninstall(project: str, yes: bool) -> None:
+    """Remove CCR hooks and MCP registration. Memory (.ccr/) is preserved."""
+    import json as _json
+
+    project = os.path.abspath(project)
+    claude_dir = os.path.join(project, ".claude")   # matches install's write path
+    settings_path = os.path.join(claude_dir, "settings.local.json")
+    mcp_json_path = os.path.join(project, ".mcp.json")
+
+    changes = []
+
+    # Check what will be removed
+    hooks_to_remove = []
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                existing = _json.loads(f.read())
+            for event, cmds in existing.get("hooks", {}).items():
+                kept = [c for c in cmds if "ccr" not in c.get("command", "")]
+                removed = [c for c in cmds if "ccr" in c.get("command", "")]
+                if removed:
+                    hooks_to_remove.extend([(event, c) for c in removed])
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    mcp_entry_exists = False
+    if os.path.isfile(mcp_json_path):
+        try:
+            with open(mcp_json_path, "r", encoding="utf-8") as f:
+                existing_mcp = _json.loads(f.read())
+            mcp_entry_exists = "ccr" in existing_mcp.get("mcpServers", {})
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    if not hooks_to_remove and not mcp_entry_exists:
+        click.echo("CCR is not installed in this project — nothing to remove.")
+        return
+
+    # Show what will be removed
+    click.echo(f"Will remove from {project}:")
+    for event, cmd in hooks_to_remove:
+        click.echo(f"  Hook [{event}]: {cmd.get('command', '')}")
+    if mcp_entry_exists:
+        click.echo(f"  MCP server: ccr entry from {mcp_json_path}")
+    click.echo(f"  Memory (.ccr/) will NOT be touched.")
+
+    if not yes:
+        click.confirm("Proceed?", abort=True)
+
+    # Remove CCR hooks from settings.local.json
+    if hooks_to_remove and os.path.isfile(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                existing = _json.loads(f.read())
+            for event in list(existing.get("hooks", {}).keys()):
+                existing["hooks"][event] = [
+                    c for c in existing["hooks"][event]
+                    if "ccr" not in c.get("command", "")
+                ]
+                if not existing["hooks"][event]:
+                    del existing["hooks"][event]
+            if not existing.get("hooks"):
+                existing.pop("hooks", None)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                _json.dump(existing, f, indent=2)
+                f.write("\n")
+            click.echo(f"✓ Removed {len(hooks_to_remove)} hook(s) from {settings_path}")
+        except (OSError, _json.JSONDecodeError) as exc:
+            click.echo(f"⚠️  Failed to update hooks: {exc}", err=True)
+
+    # Remove ccr entry from .mcp.json
+    if mcp_entry_exists and os.path.isfile(mcp_json_path):
+        try:
+            with open(mcp_json_path, "r", encoding="utf-8") as f:
+                existing_mcp = _json.loads(f.read())
+            existing_mcp.get("mcpServers", {}).pop("ccr", None)
+            with open(mcp_json_path, "w", encoding="utf-8") as f:
+                _json.dump(existing_mcp, f, indent=2)
+                f.write("\n")
+            click.echo(f"✓ Removed ccr MCP server from {mcp_json_path}")
+        except (OSError, _json.JSONDecodeError) as exc:
+            click.echo(f"⚠️  Failed to update .mcp.json: {exc}", err=True)
+
+    click.echo("\nCCR uninstalled. Your .ccr/ memory is intact.")
+    click.echo("To reinstall: ccr install")
+
+
+@cli.command()
+@click.argument("project", default=".")
+@click.option("--days", "-d", default=90, type=int,
+              help="Archive commits older than N days (default 90).")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be archived without making changes.")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def clean(project: str, days: int, dry_run: bool, yes: bool) -> None:
+    """Prune old commits to .ccr/archive/ (rolling summary preserved)."""
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    project = os.path.abspath(project)
+    ccr_dir = os.path.join(project, ".ccr")
+
+    if not os.path.isdir(ccr_dir):
+        click.echo(f"No .ccr/ directory found in {project}. Run 'ccr init' first.", err=True)
+        return
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from ccr.core.memory import MemoryManager
+    from ccr.core.types import CCRConfig
+
+    mem = MemoryManager(project, CCRConfig())
+    branch = mem.get_active_branch()
+
+    commits_path = os.path.join(mem.ccr_root, "branches", branch, "commits.md")
+    if not os.path.isfile(commits_path):
+        click.echo("No commits to clean.")
+        return
+
+    with open(commits_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    commit_pattern = re.compile(
+        r"(## \[C\d{3,}\] (\d{4}-\d{2}-\d{2} \d{2}:\d{2}).*?)(?=## \[C\d{3,}\]|\Z)",
+        re.DOTALL,
+    )
+
+    to_archive = []
+    to_keep = []
+    for m in commit_pattern.finditer(content):
+        block = m.group(1).strip()
+        date_str = m.group(2)
+        try:
+            commit_dt = datetime.fromisoformat(date_str.replace(" ", "T") + ":00+00:00")
+            if commit_dt < cutoff:
+                to_archive.append(block)
+            else:
+                to_keep.append(block)
+        except ValueError:
+            to_keep.append(block)  # Keep if date unparseable
+
+    if not to_archive:
+        click.echo(f"No commits older than {days} days found — nothing to archive.")
+        return
+
+    click.echo(f"{'[dry-run] ' if dry_run else ''}Found {len(to_archive)} commit(s) older than {days} days to archive, {len(to_keep)} to keep.")
+
+    if dry_run:
+        click.echo("\nCommits that would be archived:")
+        for block in to_archive:
+            first_line = block.splitlines()[0]
+            click.echo(f"  {first_line}")
+        return
+
+    if not yes:
+        click.confirm(f"Archive {len(to_archive)} commit(s)? (Rolling summary is preserved)", abort=True)
+
+    # Write archive file
+    archive_dir = os.path.join(ccr_dir, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    archive_path = os.path.join(archive_dir, f"{today}_{branch}.md")
+    with open(archive_path, "a", encoding="utf-8") as f:
+        f.write(f"# Archived {today} — branch: {branch} (commits older than {days} days)\n\n")
+        for block in to_archive:
+            f.write(block + "\n\n---\n\n")
+
+    # Rewrite commits.md keeping rolling summary + non-archived commits
+    summary_match = re.search(r"^## Rolling Summary.*?(?=## \[C\d{3,}\]|\Z)", content, re.DOTALL | re.MULTILINE)
+    summary_section = summary_match.group(0) if summary_match else ""
+
+    new_content = summary_section
+    if to_keep:
+        new_content += "\n\n".join(to_keep) + "\n\n---\n\n"
+
+    with open(commits_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    click.echo(f"✓ Archived {len(to_archive)} commit(s) → {archive_path}")
+    click.echo(f"✓ {len(to_keep)} commit(s) retained in {commits_path}")
+    click.echo("  Rolling summary preserved.")
 
 
 @cli.command()
@@ -369,7 +604,29 @@ def doctor(project: str) -> None:
     else:
         issues.append("No hooks configured — run 'ccr install' for auto-commit")
 
-    # 8. Disk usage
+    # 8. Hook error log
+    hook_errors_log = os.path.join(ccr_dir, ".hook_errors.log")
+    if os.path.isfile(hook_errors_log):
+        import datetime
+        try:
+            mtime = os.path.getmtime(hook_errors_log)
+            age_h = (datetime.datetime.now().timestamp() - mtime) / 3600
+            with open(hook_errors_log, encoding="utf-8") as f:
+                content = f.read()
+            n_errors = content.count("\n---")
+            if age_h < 24:
+                issues.append(
+                    f"Recent hook errors logged ({n_errors} total) — "
+                    f"run: tail -60 {hook_errors_log}"
+                )
+            else:
+                ok_items.append(f"Hook errors: {n_errors} old (last {age_h:.0f}h ago)")
+        except (OSError, UnicodeDecodeError):
+            ok_items.append("Hook error log exists but unreadable")
+    else:
+        ok_items.append("No hook errors logged")
+
+    # 9. Disk usage
     if os.path.isdir(ccr_dir):
         total_size = 0
         for dirpath, dirnames, filenames in os.walk(ccr_dir):
@@ -391,6 +648,148 @@ def doctor(project: str) -> None:
     click.echo(f"\n  {len(ok_items)} OK, {len(issues)} issue(s)")
     if not issues:
         click.echo("  All checks passed.")
+
+
+@cli.command()
+@click.argument("project", default=".")
+@click.option("--multiplier", "-m", default=4.0, type=float,
+              help="Token re-typing multiplier (default 4). Use 2 for conservative, 6 for optimistic.")
+@click.option("--last", default=30, type=int,
+              help="Number of recent sessions to include in stats (default 30).")
+def stats(project: str, multiplier: float, last: int) -> None:
+    """Show CCR ROI dashboard: token savings, memory health, session history."""
+    import json as _json
+    import sys as _sys
+    from datetime import datetime
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    project = os.path.abspath(project)
+    ccr_dir = os.path.join(project, ".ccr")
+
+    if not os.path.isdir(ccr_dir):
+        click.echo(f"No .ccr/ directory found in {project}. Run 'ccr init' first.", err=True)
+        return
+
+    # --- Load session records ---
+    jsonl_path = os.path.join(ccr_dir, "metrics", "sessions.jsonl")
+    sessions = []
+    if os.path.isfile(jsonl_path):
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                    if rec.get("context_tokens", 0) > 0:
+                        sessions.append(rec)
+                except _json.JSONDecodeError:
+                    continue  # Skip corrupt lines
+    sessions = sessions[-last:]  # Most recent N sessions
+
+    # --- Load commit count from GCC ---
+    try:
+        from ccr.core.memory import MemoryManager
+        from ccr.core.types import CCRConfig
+        mem = MemoryManager(project, CCRConfig())
+        branch = mem.get_active_branch()
+        commit_index = mem._build_commit_index(branch)
+        commit_count = len(commit_index)
+        summary_path = os.path.join(mem.ccr_root, "branches", branch, "commits.md")
+        summary_len = 0
+        if os.path.isfile(summary_path):
+            with open(summary_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            import re
+            m = re.search(r"## Rolling Summary\s*\n(.*?)\n---", content, re.DOTALL)
+            if m:
+                summary_len = len(m.group(1).strip())
+    except Exception:
+        commit_count = 0
+        branch = "main"
+        summary_len = 0
+
+    # --- Load playbook ---
+    try:
+        playbook_path = os.path.join(ccr_dir, "playbook.txt")
+        playbook_text = ""
+        if os.path.isfile(playbook_path):
+            with open(playbook_path, "r", encoding="utf-8") as f:
+                playbook_text = f.read()
+        playbook_tokens = max(1, len(playbook_text) // 4)
+        bullet_count = playbook_text.count("] helpful=")
+    except Exception:
+        playbook_tokens = 0
+        bullet_count = 0
+
+    click.echo("\n=== CCR Stats Dashboard ===\n")
+
+    click.echo(f"Project memory ({branch})")
+    click.echo(f"  Commits:          {commit_count}")
+    if summary_len:
+        click.echo(f"  Rolling summary:  {summary_len}/1500 chars ({summary_len * 100 // 1500}%)")
+        if summary_len > 1200:
+            click.echo(f"  ⚠️  Summary is getting long — run gcc_consolidate() or gcc_context(level=5)")
+    if bullet_count:
+        click.echo(f"  Playbook:         {playbook_tokens:,} tokens ({bullet_count} bullets)")
+
+    click.echo()
+
+    if not sessions:
+        click.echo("Session history")
+        click.echo("  No session history yet.")
+        click.echo("  (CCR stats are recorded after each session ends with 'ccr install' hooks active.)")
+        return
+
+    # --- Compute aggregates ---
+    token_list = [s["context_tokens"] for s in sessions]
+    dur_list = [s.get("duration_min", 0) for s in sessions]
+    total_sessions = len(sessions)
+    avg_tokens = sum(token_list) / total_sessions
+    total_tokens = sum(token_list)
+    avoided = total_tokens * multiplier
+    avg_dur = sum(dur_list) / total_sessions if dur_list else 0
+    breakeven = int(1 / multiplier * 10) + 1 if multiplier else 6
+
+    click.echo(f"Session history (last {total_sessions} sessions)")
+    click.echo(f"  Avg context injected:  {avg_tokens:,.0f} tokens/session")
+    click.echo(f"  Total injected:        {total_tokens:,.0f} tokens")
+    click.echo(f"  Est. tokens avoided:   {avoided:,.0f} tokens (×{multiplier:.0f} re-typing heuristic*)")
+    if avg_dur:
+        click.echo(f"  Avg session duration:  {avg_dur:.0f} min")
+
+    click.echo()
+    click.echo(f"30-session projection")
+    projected_avoided = avg_tokens * 30 * multiplier
+    click.echo(f"  Est. savings:  ~{projected_avoided:,.0f} tokens")
+    if total_sessions >= breakeven:
+        click.echo(f"  Break-even:    {breakeven} sessions ✓ (already past)")
+    else:
+        remaining = breakeven - total_sessions
+        click.echo(f"  Break-even:    {breakeven} sessions ({remaining} more to go)")
+
+    click.echo()
+    click.echo(f"Recent sessions")
+    click.echo(f"  {'Date':<12} {'Context':>8}  {'Avoided':>9}  {'Duration':>10}")
+    click.echo(f"  {'-'*12} {'-'*8}  {'-'*9}  {'-'*10}")
+    for s in reversed(sessions[-10:]):
+        try:
+            dt = datetime.fromisoformat(s["start"]).strftime("%Y-%m-%d")
+        except Exception:
+            dt = "unknown"
+        ctx = s["context_tokens"]
+        avd = int(ctx * multiplier)
+        dur = s.get("duration_min", 0)
+        dur_str = f"{dur:.0f} min" if dur else "  —  "
+        click.echo(f"  {dt:<12} {ctx:>8,}  {avd:>9,}  {dur_str:>10}")
+
+    click.echo()
+    click.echo(
+        f"* Rough estimate: assumes you'd re-type ~{multiplier:.0f}× the context without CCR."
+    )
+    click.echo(
+        f"  Pass --multiplier N to adjust (e.g., --multiplier 2 for conservative estimate)."
+    )
 
 
 @cli.command()

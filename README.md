@@ -1,16 +1,11 @@
 # CCR — Claude Context Reducer
 
-Persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL for Claude Code. No API keys required — works with a Claude Max subscription alone.
+> **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
+> **With CCR:** Claude already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-## What CCR Does
+CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL — no API keys needed. Works with **Claude Max ($20/mo)**.
 
-CCR is an MCP server that gives Claude Code three capabilities it doesn't have natively:
-
-1. **Persistent Memory (GCC)** — Git-style version-controlled memory that survives across sessions. Branch, merge, and search your project's decision history.
-2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
-3. **Sandboxed REPL (RLM)** — An isolated Python environment for iterative analysis, with repo search and structured output.
-
-All tools run as pure logic with zero LLM calls. Claude Code itself provides the reasoning.
+> **New to CCR?** See the [Student & Researcher Quickstart](docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
 ## Quick Start
 
@@ -21,8 +16,35 @@ pip install ccr-memory  # or: pip install -e . (from source)
 # 2. Configure hooks for automatic memory management
 ccr install
 
-# 3. Use Claude Code normally — CCR auto-commits your session progress
+# 3. Open Claude Code from your project directory — CCR handles the rest
+cd /your/project && claude
 ```
+
+That's it. Claude will automatically load your project memory on every session start and auto-commit progress when you finish.
+
+### What CCR Does
+
+CCR is an MCP server that gives Claude Code three capabilities it doesn't have natively:
+
+1. **Persistent Memory (GCC)** — Git-style version-controlled memory that survives across sessions. Branch, merge, and search your project's decision history.
+2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
+3. **Sandboxed REPL (RLM)** — An isolated Python environment for iterative analysis, with repo search and structured output.
+
+All tools run as pure logic with zero LLM calls. Claude Code itself provides the reasoning.
+
+### For Researchers and Students
+
+On Claude Max ($20/mo), you're not paying per token — you're paying for continuity. CCR makes that continuity real: Claude carries your experiment history, design decisions, and open questions forward across every session.
+
+A 3-month project means ~90 sessions. Without CCR, each starts from scratch. With CCR, each starts where the last left off.
+
+**Researcher-specific features:**
+- `gcc_commit(experiment={"metrics": {"val_loss": 0.23}})` — log ML runs with metrics and hypothesis
+- `gcc_experiments(metric_filter={"val_loss": {"lt": 0.3}})` — find all runs meeting a metric threshold
+- `gcc_discuss(topic=..., decision=..., rationale=...)` — persistent decision log for architecture choices
+- `gcc_search("preprocessing decision")` — find any past decision across commits, discussions, and sessions
+
+See the [Student & Researcher Quickstart](docs/quickstart-students.md) for a full PhD workflow guide.
 
 ### Manual Setup (without `ccr install`)
 
@@ -74,6 +96,10 @@ Then in your Claude Code session, call `gcc_context(level=2)` to load memory and
 - **ONNX embeddings**: Optional dense embeddings (all-MiniLM-L6-v2, 384-dim)
 - **Zero-config**: Works immediately; semantic search available with `pip install ccr-memory[semantic]`
 
+### Session Logger
+
+Every Q&A turn (user message + Claude's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected Claude behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — Claude calls `session_log_turn` after each response. See [docs/session-logger.md](docs/session-logger.md) for the full reference.
+
 ## Architecture
 
 ```
@@ -112,6 +138,15 @@ CCR stores all data in a `.ccr/` directory within your project (like `.git/`). G
 | `ace_prune` | Remove harmful strategies |
 | `rlm_init` / `rlm_execute` / `rlm_finalize` | Sandboxed REPL |
 | `index_build` / `index_search` | Repo search |
+
+### Session Logger
+
+| Tool | Purpose |
+|------|---------|
+| `session_log_turn` | Log the current Q&A turn (called automatically after each response) |
+| `session_get_history` | Retrieve recent turns for a session (defaults to current session) |
+| `session_search` | Full-text search across all session turns (FTS5) |
+| `session_export` | Export a session as `json`, `jsonl` (OpenAI fine-tune), or `markdown` |
 
 ## Research Foundation
 

@@ -1524,7 +1524,7 @@ class TestRollingSummaryCompressionPrompt:
     def test_short_summary_no_warning(self, memory):
         """Short summaries don't trigger compression warning."""
         result = memory.commit("T1", "did A", "reason A", ["a.py"], "next A")
-        assert "Rolling summary is getting long" not in result
+        assert "Rolling summary at" not in result
         assert "compressed_summary" not in result
 
     def test_long_summary_triggers_warning(self, memory):
@@ -1543,20 +1543,20 @@ class TestRollingSummaryCompressionPrompt:
         # After enough commits, the summary should exceed 1200 chars
         # (each entry is ~100 chars: "what (because: why). Next: next_step")
         if len(summary) > 1200:
-            assert "Rolling summary is getting long" in result
+            assert "Rolling summary at" in result
             assert "compressed_summary" in result
 
     def test_warning_includes_char_count(self, memory):
-        """Warning message includes the current summary length."""
+        """Warning message includes the current summary length and 1500-char cap."""
         # Write a summary just over the 1200 char threshold directly
         # then commit to trigger the warning
         summary_1300 = "; ".join([f"Entry {i} with some content here" for i in range(40)])
         assert len(summary_1300) > 1200
         memory._write_rolling_summary("main", summary_1300[:1400])
         result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
-        assert "Rolling summary is getting long" in result
-        # Should include the actual char count
-        assert "chars" in result
+        assert "Rolling summary at" in result
+        # Should include the actual char count and the 1500-char cap
+        assert "/1500 chars" in result
 
     def test_no_warning_when_compressed_summary_provided(self, memory):
         """When compressed_summary is provided, no warning even if summary is long."""
@@ -1565,7 +1565,7 @@ class TestRollingSummaryCompressionPrompt:
         # Commit with compressed_summary — should NOT trigger warning
         result = memory.commit("Next", "added more", "reason", ["f.py"], "done",
                                compressed_summary="Compressed version of the summary")
-        assert "Rolling summary is getting long" not in result
+        assert "Rolling summary at" not in result
 
     def test_warning_suggests_two_call_pattern(self, memory):
         """Warning message mentions the two-call pattern for compression."""
@@ -1581,7 +1581,7 @@ class TestRollingSummaryCompressionPrompt:
         summary = "x" * 1200 + " important context here"
         memory._write_rolling_summary("main", summary)
         result = memory.commit("Next", "added more", "reason", ["f.py"], "done")
-        assert "Rolling summary is getting long" in result
+        assert "Rolling summary at" in result
         assert "important context here" in result
         # Should show the summary between delimiters
         assert "---" in result

@@ -19,12 +19,16 @@ from ccr.mcp_types import (
     GccCommitResult,
     GccConsolidateResult,
     GccContextResult,
+    GccDiscussResult,
+    GccDiscussionsResult,
     GccEvolveMemoryResult,
+    GccExperimentsResult,
     GccLinksResult,
     GccLogOtaResult,
     GccMergeResult,
     GccPatternsResult,
     GccScratchpadResult,
+    GccSearchResult,
     GccStatusResult,
     GccTriplesResult,
 )
@@ -48,6 +52,7 @@ def gcc_commit(
     compressed_summary: str | None = None,
     author: str = "",
     ci_context: dict | None = None,
+    experiment: dict | None = None,
 ) -> GccCommitResult:
     """Commit progress to project memory.
 
@@ -75,6 +80,14 @@ def gcc_commit(
         author: Optional author name/identifier stored in the commit block.
         ci_context: Optional CI metadata dict (e.g., {"run_id": "123"}).
             Stored as JSON in the commit block.
+        experiment: Optional research experiment data. Expected keys: id (str),
+            hypothesis (str), metrics (dict[str, float|int|str]), conclusion (str).
+            Stored as **Experiment** section in the commit. Use for ML runs,
+            ablations, and any quantitative results. Searchable later via
+            gcc_context(level=5, search_term="<metric_name>"). Example:
+            {"id": "exp-042", "hypothesis": "LoRA r=16 matches full FT",
+             "metrics": {"val_loss": 0.23, "accuracy": 0.87},
+             "conclusion": "Confirmed — 98% perf at 12% params"}
     """
     # Import ace_tools module (not function) to allow test patching via setattr
     import ccr.mcp.ace_tools as _ace_mod
@@ -135,7 +148,8 @@ def gcc_commit(
                                 admission_threshold, rejection_threshold,
                                 compressed_summary,
                                 author=author,
-                                ci_context=ci_context)
+                                ci_context=ci_context,
+                                experiment=experiment)
 
         # ACE §3.1-3.3: Generator → Reflector → Curator pipeline (fire-and-forget)
         sub = _srv._get_sub_client()
@@ -391,6 +405,20 @@ def gcc_context(
         result = "\n".join(f"[Warning: {w}]" for w in _level_warnings) + "\n\n" + result
 
     branch = mem.get_active_branch()
+
+    # B2: Context level heuristic — suggest richer retrieval for large projects
+    if level == 2:
+        try:
+            total = len(mem._build_commit_index(branch))
+            if total >= 30:
+                result += (
+                    f"\n\n[Hint: This project has {total} commits. "
+                    f"Try gcc_context(level=3) for richer history or "
+                    f"gcc_context(level=5, search_term='<topic>') for targeted search.]"
+                )
+        except Exception:
+            pass
+
     return GccContextResult(level=level, branch=branch, message=result)
 
 
@@ -937,3 +965,301 @@ def gcc_scratchpad(
 
     else:
         raise ToolError(f"Invalid mode '{mode}'. Use 'get', 'set', or 'clear'.")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_experiments(
+    experiment_id: str | None = None,
+    hypothesis_contains: str | None = None,
+    metric_filter: dict | None = None,
+    date_range: list[str] | None = None,
+    top_n: str | None = None,
+    compare: list[str] | None = None,
+) -> GccExperimentsResult:
+    """Query and filter experiment records stored in commits via gcc_commit(experiment={...}).
+
+    Parses **Experiment**: blocks from commit history and returns matching records.
+    Supports metric filtering, date ranges, comparison, and metric-based sorting.
+
+    Args:
+        experiment_id: Filter to this exact experiment ID (e.g. "exp-042").
+        hypothesis_contains: Substring match on hypothesis text (case-insensitive).
+        metric_filter: Dict of {metric_name: {op: value}} conditions.
+            Supported ops: lt, lte, gt, gte, eq.
+            Example: {"val_loss": {"lt": 0.3}, "accuracy": {"gte": 0.8}}
+        date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
+            Example: ["2026-01-01", "2026-04-01"]
+        top_n: "metric_name:asc|desc" — sort all results by metric.
+            Example: "val_loss:asc" (best validation loss first)
+        compare: Two commit IDs for side-by-side comparison table.
+            Example: ["C041", "C053"]
+
+    Returns:
+        count: Number of matching experiments.
+        records: Raw list of experiment record dicts.
+        message: Markdown table of results (or comparison table if compare= given).
+
+    Usage examples:
+        # Find all runs with val_loss < 0.3
+        gcc_experiments(metric_filter={"val_loss": {"lt": 0.3}})
+
+        # Compare two specific runs
+        gcc_experiments(compare=["C041", "C053"])
+
+        # Best runs sorted by accuracy (highest first)
+        gcc_experiments(top_n="accuracy:desc")
+
+        # LoRA experiments from last month
+        gcc_experiments(hypothesis_contains="LoRA", date_range=["2026-03-01", "2026-04-05"])
+    """
+    _srv._ensure_memory()
+    mem = _srv._mem
+
+    result = mem.get_experiments(
+        experiment_id=experiment_id,
+        hypothesis_contains=hypothesis_contains,
+        metric_filter=metric_filter,
+        date_range=date_range,
+        top_n=top_n,
+        compare=compare,
+    )
+
+    return GccExperimentsResult(
+        count=result["count"],
+        records=result["records"],
+        message=result["message"],
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def gcc_discuss(
+    topic: str,
+    hypothesis: str,
+    alternatives_considered: str,
+    decision: str,
+    rationale: str,
+    uncertainty: str = "",
+    linked_commit: str | None = None,
+) -> GccDiscussResult:
+    """Log a decision or hypothesis to the persistent discussion log.
+
+    Stores a structured record in .ccr/branches/{branch}/discussions.md.
+    Use to preserve the reasoning behind design choices, experiment directions,
+    and trade-off decisions that would otherwise be lost between sessions.
+
+    Args:
+        topic: Short title for the decision (e.g., "dataset preprocessing approach").
+        hypothesis: The hypothesis or assumption being tested/decided.
+        alternatives_considered: Comma-separated alternatives that were rejected.
+        decision: The choice made.
+        rationale: Why this decision was made (evidence, benchmarks, constraints).
+        uncertainty: Open questions or risks that remain (optional).
+        linked_commit: Commit ID (e.g., "C045") this decision relates to (optional).
+
+    Returns:
+        id: Discussion ID (D001, D002, ...).
+        date: Timestamp of the record.
+        topic: The topic as stored.
+        message: The formatted discussion block.
+
+    Example:
+        gcc_discuss(
+            topic="optimizer choice for LoRA fine-tuning",
+            hypothesis="AdamW with warmup outperforms SGD",
+            alternatives_considered="SGD, Adam (no weight decay), LAMB",
+            decision="AdamW with linear warmup",
+            rationale="15% lower val_loss vs SGD in 3-epoch ablation (C041)",
+            uncertainty="Not tested beyond 10K steps",
+            linked_commit="C041",
+        )
+    """
+    _srv._ensure_memory()
+    mem = _srv._mem
+
+    result = mem.add_discussion(
+        topic=topic,
+        hypothesis=hypothesis,
+        alternatives_considered=alternatives_considered,
+        decision=decision,
+        rationale=rationale,
+        uncertainty=uncertainty,
+        linked_commit=linked_commit,
+    )
+
+    return GccDiscussResult(
+        id=result["id"],
+        date=result["date"],
+        topic=result["topic"],
+        message=result["message"],
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_discussions(
+    search: str | None = None,
+    topic: str | None = None,
+    date_range: list[str] | None = None,
+) -> GccDiscussionsResult:
+    """Query the persistent discussion log.
+
+    Retrieves decision records logged via gcc_discuss. Useful for reviewing
+    past reasoning, finding decisions related to a topic, or recalling why
+    a certain approach was chosen.
+
+    Args:
+        search: Full-text substring match across all fields (case-insensitive).
+        topic: Exact topic match (case-insensitive).
+        date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
+
+    Returns:
+        count: Number of matching discussions.
+        records: Raw discussion record dicts.
+        message: Markdown table of results.
+
+    Example:
+        gcc_discussions(search="optimizer")
+        gcc_discussions(date_range=["2026-03-01", "2026-04-05"])
+    """
+    _srv._ensure_memory()
+    mem = _srv._mem
+
+    result = mem.get_discussions(
+        search=search,
+        topic=topic,
+        date_range=date_range,
+    )
+
+    return GccDiscussionsResult(
+        count=result["count"],
+        records=result["records"],
+        message=result["message"],
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_search(
+    query: str,
+    sources: list[str] | None = None,
+    limit: int = 10,
+    date_range: list[str] | None = None,
+) -> GccSearchResult:
+    """Unified search across all CCR memory sources.
+
+    Searches commits, discussions, experiments, and session history in one call.
+    Returns aggregated results grouped by source. Use this instead of calling
+    gcc_context(level=5), gcc_discussions, gcc_experiments, and session_search
+    separately.
+
+    Args:
+        query: Text to search for. Case-insensitive substring match.
+        sources: Which sources to search. Default: all available.
+            Options: "commits", "discussions", "experiments", "sessions".
+        limit: Max results per source (default 10).
+        date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
+            Applied to all sources that support date filtering.
+
+    Returns:
+        total: Total number of matches across all sources.
+        sources_searched: List of sources that were queried.
+        message: Aggregated markdown results grouped by source.
+
+    Example:
+        gcc_search("LoRA")
+        gcc_search("val_loss", sources=["commits", "experiments"])
+        gcc_search("dataset", date_range=["2026-03-01", "2026-04-05"])
+    """
+    _srv._ensure_memory()
+    mem = _srv._mem
+
+    all_sources = ["commits", "discussions", "experiments", "sessions"]
+    if sources:
+        active_sources = [s.lower() for s in sources if s.lower() in all_sources]
+    else:
+        active_sources = all_sources
+
+    sections = []
+    total = 0
+    searched = []
+
+    # --- Commits ---
+    if "commits" in active_sources:
+        searched.append("commits")
+        try:
+            branch = mem.get_active_branch()
+            commits_text = mem._search_commits(branch, query)
+            if commits_text and commits_text.strip():
+                # Count results (## [C###] headers)
+                count = len(re.findall(r"## \[C\d{3,}\]", commits_text))
+                if count:
+                    total += count
+                    sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{commits_text.strip()}")
+        except Exception:
+            pass
+
+    # --- Discussions ---
+    if "discussions" in active_sources:
+        searched.append("discussions")
+        try:
+            result = mem.get_discussions(search=query, date_range=date_range)
+            if result["count"]:
+                total += result["count"]
+                sections.append(f"## Discussions ({result['count']} match{'es' if result['count'] != 1 else ''})\n\n{result['message']}")
+        except Exception:
+            pass
+
+    # --- Experiments ---
+    if "experiments" in active_sources:
+        searched.append("experiments")
+        try:
+            result = mem.get_experiments(
+                hypothesis_contains=query,
+                date_range=date_range,
+            )
+            # Also try metric key match
+            result2 = mem.get_experiments()
+            exp_matches = [
+                r for r in result2["records"]
+                if query.lower() in str(r).lower()
+                and r not in result["records"]
+            ]
+            all_exp_records = result["records"] + exp_matches
+            if all_exp_records:
+                from ccr.core.memory_pkg.memory_experiments import _format_experiment_table
+                count = len(all_exp_records)
+                total += count
+                sections.append(f"## Experiments ({count} match{'es' if count != 1 else ''})\n\n{_format_experiment_table(all_exp_records[:limit])}")
+        except Exception:
+            pass
+
+    # --- Sessions ---
+    if "sessions" in active_sources:
+        searched.append("sessions")
+        try:
+            from ccr.core.session_store import SessionStore
+            import os as _os
+            db_path = _os.path.join(mem.ccr_root, "sessions.db")
+            if _os.path.isfile(db_path):
+                store = SessionStore(db_path)
+                turns = store.search_turns(query, limit=limit)
+                if turns:
+                    total += len(turns)
+                    session_lines = ["| Date | Session | Snippet |", "|------|---------|---------|"]
+                    for t in turns[:limit]:
+                        date = (t.get("timestamp") or "")[:10]
+                        sid = t.get("session_id", "?")[:8]
+                        snippet = (t.get("assistant_message") or t.get("user_message") or "")[:80].replace("\n", " ")
+                        session_lines.append(f"| {date} | {sid} | {snippet}... |")
+                    sections.append(f"## Sessions ({len(turns)} match{'es' if len(turns) != 1 else ''})\n\n" + "\n".join(session_lines))
+        except Exception:
+            pass
+
+    if not sections:
+        message = f"No results for '{query}' in {', '.join(searched)}."
+    else:
+        message = "\n\n".join(sections)
+
+    return GccSearchResult(
+        total=total,
+        sources_searched=searched,
+        message=message,
+    )

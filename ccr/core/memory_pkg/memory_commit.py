@@ -63,6 +63,7 @@ class CommitMixin:
         compressed_summary: str | None = None,
         author: str = "",
         ci_context: dict | None = None,
+        experiment: dict | None = None,
     ) -> str:
         """Create a structured commit on the active branch.
 
@@ -164,6 +165,22 @@ class CommitMixin:
         author_str = f"**Author**: {author}\n" if author else ""
         ci_str = f"**CI**: {json.dumps(ci_context)}\n" if ci_context else ""
 
+        exp_str = ""
+        if experiment and isinstance(experiment, dict):
+            exp_lines = ["**Experiment**:"]
+            if experiment.get("id"):
+                exp_lines.append(f"  - ID: {experiment['id']}")
+            if experiment.get("hypothesis"):
+                exp_lines.append(f"  - Hypothesis: {experiment['hypothesis']}")
+            if experiment.get("metrics") and isinstance(experiment["metrics"], dict):
+                metrics_parts = ", ".join(
+                    f"{k}={v}" for k, v in experiment["metrics"].items()
+                )
+                exp_lines.append(f"  - Metrics: {metrics_parts}")
+            if experiment.get("conclusion"):
+                exp_lines.append(f"  - Conclusion: {experiment['conclusion']}")
+            exp_str = "\n".join(exp_lines) + "\n"
+
         entry = (
             f"## [{commit_id}] {now} | branch:{branch} | {title}\n"
             f"**What**: {what}\n"
@@ -173,6 +190,7 @@ class CommitMixin:
             f"{patterns_str}"
             f"{author_str}"
             f"{ci_str}"
+            f"{exp_str}"
             f"**Score**: {admission_score_value:.2f}\n\n---\n\n"
         )
 
@@ -279,7 +297,7 @@ class CommitMixin:
         if _pre_update_summary_len > summary_compression_threshold and compressed_summary is None:
             current_summary = self._get_rolling_summary(branch)
             result += (
-                f"\n\n\u26a0\ufe0f Rolling summary is getting long ({_pre_update_summary_len} chars). "
+                f"\n\n\u26a0\ufe0f Rolling summary at {_pre_update_summary_len}/1500 chars. "
                 f"Call gcc_commit again with compressed_summary='<your 2-3 sentence synthesis>'. "
                 f"Current summary to compress:\n\n---\n{current_summary}\n---\n\n"
                 f"Write a concise synthesis capturing key decisions and current direction, "

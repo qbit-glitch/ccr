@@ -26,6 +26,12 @@ MCP server giving Claude Code persistent memory (GCC), self-evolving playbooks (
 - `index_search(query)` — keyword/semantic/hybrid search
 - `index_build` — rebuild after code changes
 
+### Session Logger (SL)
+- **After each response**: `session_log_turn(assistant_message="<your full response>")` — logs this Q&A turn to `.ccr/sessions.db`
+- **Review session**: `session_get_history()` — last 20 turns of current session
+- **Search past sessions**: `session_search(query="...")` — full-text search all Q&A logs
+- **Export for training**: `session_export(format="jsonl")` — OpenAI fine-tuning format
+
 ## Project Structure
 
 ```

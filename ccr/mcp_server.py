@@ -27,6 +27,7 @@ from ccr.mcp.server import (  # noqa: F401
     _ensure_memory,
     _ensure_playbook,
     _ensure_index,
+    _ensure_session_store,
     _extract_patterns_from_commit,
     _resolve_playbook,
     _serialize_playbook,
@@ -86,6 +87,14 @@ from ccr.mcp.index_tools import (  # noqa: F401
     index_status,
 )
 
+# Re-export all Session Logger tool functions
+from ccr.mcp.session_tools import (  # noqa: F401
+    session_log_turn,
+    session_get_history,
+    session_search,
+    session_export,
+)
+
 # ---------------------------------------------------------------------------
 # Mutable global proxies — tests do `mcp_mod._memory = None` etc.
 # We need attribute access on THIS module to read/write the REAL globals
@@ -112,12 +121,13 @@ for _name in (
     "_schema_path", "_global_schema_path", "_embedding_model",
     "_embeddings_path", "_chunk_embeddings_path", "_scratchpad",
     "_triple_store", "_state_lock",
+    "_session_store", "_session_db_path", "_current_session_id",
     "_get_sub_client", "_extract_patterns_from_commit",
     "_init", "_atomic_write", "_load_playbook", "_save_playbook",
     "_load_global_playbook", "_save_global_playbook",
     "_load_schema", "_load_schema_history", "_save_schema",
     "_ensure_global_playbook", "_ensure_memory", "_ensure_playbook",
-    "_ensure_index", "_resolve_playbook", "_serialize_playbook",
+    "_ensure_index", "_ensure_session_store", "_resolve_playbook", "_serialize_playbook",
 ):
     _PROXIED_ATTRS[_name] = _server_mod
 

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ class SessionState:
     patterns_observed: list[str] = field(default_factory=list)
     tool_calls: int = 0
     start_time: float = 0.0
+    context_tokens: int = 0   # C1: tokens injected at session start
+    session_id: str = ""      # C1: short UUID for sessions.jsonl correlation
 
     def is_meaningful(self, min_chars: int = 50) -> bool:
         """Check if accumulated state has enough content to warrant a commit."""
@@ -65,6 +68,8 @@ def load_state(ccr_root: str) -> SessionState:
             patterns_observed=data.get("patterns_observed", []),
             tool_calls=data.get("tool_calls", 0),
             start_time=data.get("start_time", 0.0),
+            context_tokens=data.get("context_tokens", 0),
+            session_id=data.get("session_id", ""),
         )
     except (OSError, json.JSONDecodeError, TypeError):
         return SessionState()
@@ -122,6 +127,9 @@ def append_tool_use(ccr_root: str, tool_name: str, summary: str,
 
 
 def initialize_state(ccr_root: str) -> None:
-    """Initialize a fresh session state with start timestamp."""
-    state = SessionState(start_time=time.time())
+    """Initialize a fresh session state with start timestamp and session ID."""
+    state = SessionState(
+        start_time=time.time(),
+        session_id=str(uuid.uuid4())[:8],  # Short 8-char ID for sessions.jsonl
+    )
     save_state(ccr_root, state)

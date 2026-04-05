@@ -9,6 +9,20 @@ import os
 import sys
 
 
+def _log_hook_error(error_text: str) -> None:
+    """Write error to .ccr/.hook_errors.log — non-fatal, never raises."""
+    import datetime
+    try:
+        proj = os.environ.get("CCR_PROJECT_ROOT", os.getcwd())
+        log_path = os.path.join(proj, ".ccr", ".hook_errors.log")
+        if os.path.isdir(os.path.dirname(log_path)):
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {ts} [on_compact] ---\n{error_text}\n")
+    except Exception:
+        pass
+
+
 def main():
     project_root = os.environ.get("CCR_PROJECT_ROOT", os.getcwd())
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -34,4 +48,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        _log_hook_error(traceback.format_exc())

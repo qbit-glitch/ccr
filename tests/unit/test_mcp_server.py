@@ -1431,7 +1431,7 @@ class TestGCCCommitRollingSummaryCompression:
     def test_gcc_commit_short_summary_no_warning(self):
         """Short summaries don't produce compression warning."""
         result = gcc_commit("T1", "did A", "reason A", ["a.py"], "next A")
-        assert "Rolling summary is getting long" not in result["message"]
+        assert "Rolling summary at" not in result["message"]
 
     def test_gcc_commit_long_summary_triggers_warning(self):
         """Long summaries produce compression warning in return value."""
@@ -1440,7 +1440,8 @@ class TestGCCCommitRollingSummaryCompression:
         mem = mod._memory
         mem._write_rolling_summary("main", "x" * 1300)
         result = gcc_commit("Next", "added more stuff", "reason", ["f.py"], "done")
-        assert "Rolling summary is getting long" in result["message"]
+        assert "Rolling summary at" in result["message"]
+        assert "/1500 chars" in result["message"]
         assert "compressed_summary" in result["message"]
 
     def test_gcc_commit_compressed_summary_suppresses_warning(self):
@@ -1450,7 +1451,7 @@ class TestGCCCommitRollingSummaryCompression:
         mem._write_rolling_summary("main", "x" * 1300)
         result = gcc_commit("Next", "added more", "reason", ["f.py"], "done",
                             compressed_summary="Clean compressed summary here")
-        assert "Rolling summary is getting long" not in result["message"]
+        assert "Rolling summary at" not in result["message"]
 
 
 # ===========================================================================

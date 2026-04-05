@@ -21,11 +21,15 @@ File: `ccr/hooks/on_session_start.py`
 On the **first prompt** of a session:
 - Creates a `.ccr/.session_active` marker file (atomic `O_CREAT|O_EXCL` to prevent race conditions).
 - Initializes fresh session state via `state_accumulator.initialize_state()`.
+- Creates a new session row in `.ccr/sessions.db` and writes the session ID to `.ccr/.current_session_id` (Session Logger).
 - Reads level-1 memory context from `.ccr/`.
 - Reads global playbook from `~/.ccr/global_playbook.txt`.
 - Reads project playbook from `.ccr/playbook.txt`.
 - Logs a "session start" OTA triple.
 - Outputs context, playbook, and a `<MANDATORY_CCR_ACTIONS>` directive to stdout (Claude Code captures hook stdout as injected context).
+
+On **every prompt** (first and subsequent):
+- Writes the user's message to `.ccr/.pending_user_msg` using an atomic write (`tmp` + `os.replace`). The `session_log_turn` MCP tool reads and deletes this file when Claude logs the turn after responding.
 
 On **subsequent prompts** in the same session:
 - Outputs a lightweight `<ccr_reminder>` to commit after tasks.
@@ -58,6 +62,7 @@ Fires when Claude Code session ends. Reads accumulated session state and auto-co
 - If meaningful: converts state to commit fields and calls `mem.commit()`.
 - If not meaningful: logs a clean session-end OTA triple.
 - Always clears session state file on exit.
+- **Session Logger finalization**: reads `.ccr/.current_session_id`, sets `ended_at` on the session row in `sessions.db`, then deletes `.current_session_id`. Also deletes `.ccr/.pending_user_msg` if it exists (cleanup for any unread buffered prompt). Both operations are non-fatal — a failure here never blocks session termination.
 
 ### Pre-Compact Reminder
 
@@ -132,24 +137,23 @@ This generates hook configuration in `.claude/settings.local.json`:
       "type": "command",
       "command": "/path/to/.venv/bin/python /path/to/ccr/hooks/on_session_start.py"
     }],
+    "PostToolUse": [{
+      "type": "command",
+      "command": "/path/to/.venv/bin/python /path/to/ccr/hooks/on_tool_use.py"
+    }],
     "Stop": [{
       "type": "command",
       "command": "/path/to/.venv/bin/python /path/to/ccr/hooks/on_stop.py"
+    }],
+    "PreCompact": [{
+      "type": "command",
+      "command": "/path/to/.venv/bin/python /path/to/ccr/hooks/on_compact.py"
     }]
   }
 }
 ```
 
-It also initializes `.ccr/` if not already present.
-
-**Note:** The PostToolUse hook for `on_tool_use.py` is not installed by `ccr install` by default. To enable silent accumulation, add it manually to `.claude/settings.local.json`:
-
-```json
-"PostToolUse": [{
-  "type": "command",
-  "command": "/path/to/.venv/bin/python /path/to/ccr/hooks/on_tool_use.py"
-}]
-```
+It also writes `.mcp.json` and initializes `.ccr/` if not already present.
 
 ## Customization
 
@@ -189,9 +193,12 @@ All hooks respect `CCR_PROJECT_ROOT` to override the project directory. If not s
 |------|---------|
 | `.ccr/.session_state.json` | Accumulated session state (auto-deleted on session end). |
 | `.ccr/.session_active` | Marker file for first-prompt detection (atomic create). |
-| `ccr/hooks/on_session_start.py` | Session initialization + context injection. |
+| `.ccr/.current_session_id` | Active Session Logger session ID (written on first prompt, deleted on Stop). |
+| `.ccr/.pending_user_msg` | Buffered user prompt for `session_log_turn` to consume (written each prompt, deleted after logging). |
+| `.ccr/sessions.db` | Session Logger SQLite database (`sessions` + `turns` + FTS5 index). |
+| `ccr/hooks/on_session_start.py` | Session initialization + context injection + Session Logger setup. |
 | `ccr/hooks/on_tool_use.py` | Silent tool use accumulator. |
-| `ccr/hooks/on_stop.py` | Auto-committer on session end. |
+| `ccr/hooks/on_stop.py` | Auto-committer on session end + Session Logger finalization. |
 | `ccr/hooks/on_compact.py` | Pre-compaction reminder. |
 | `ccr/hooks/on_session_end.py` | Legacy session-end logger (superseded by on_stop.py). |
 | `ccr/hooks/state_accumulator.py` | Shared SessionState dataclass + atomic file I/O. |

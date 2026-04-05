@@ -204,3 +204,64 @@ class IndexStatusResult(TypedDict):
     chunk_count: int
     is_stale: bool
     message: str
+
+
+# ===========================================================================
+# Session Logger Tools
+# ===========================================================================
+
+
+class GccSearchResult(TypedDict):
+    total: int
+    sources_searched: list[str]
+    message: str
+
+
+class GccDiscussResult(TypedDict):
+    id: str
+    date: str
+    topic: str
+    message: str
+
+
+class GccDiscussionsResult(TypedDict):
+    count: int
+    records: list[dict]
+    message: str
+
+
+class GccExperimentsResult(TypedDict):
+    count: int
+    records: list[dict]
+    message: str
+
+
+# ===========================================================================
+# Session Logger Tools
+# ===========================================================================
+
+
+class SessionLogTurnResult(TypedDict):
+    session_id: str
+    turn_number: int
+    message: str
+
+
+class SessionGetHistoryResult(TypedDict):
+    session_id: str
+    turn_count: int
+    turns: list[dict]
+    message: str
+
+
+class SessionSearchResult(TypedDict):
+    result_count: int
+    results: list[dict]
+    message: str
+
+
+class SessionExportResult(TypedDict):
+    session_id: str
+    format: str
+    data: str
+    message: str

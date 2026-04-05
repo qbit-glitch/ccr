@@ -21,9 +21,11 @@ from ccr.core.memory_pkg import (
     CommitMixin,
     ConsolidationMixin,
     ContextMixin,
+    DiscussionsMixin,
     EmbeddingsMixin,
     EvolvedSummary,
     EvolutionMixin,
+    ExperimentsMixin,
     FileIOMixin,
     InitMixin,
     LinksMixin,
@@ -52,6 +54,8 @@ class MemoryManager(
     BranchOpsMixin,
     ConsolidationMixin,
     ContextMixin,
+    ExperimentsMixin,
+    DiscussionsMixin,
 ):
     """Manages the .ccr/ directory for a project.
 
