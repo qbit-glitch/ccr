@@ -210,8 +210,9 @@ See: docs/quickstart-students.md for a 5-minute guide.
     parts = []
     if was_stale:
         parts.append(
-            "⚡ CCR reloaded after unclean shutdown — previous session marker was stale. "
-            "Memory context injected fresh."
+            "⚡ CCR recovered from an unclean shutdown — memory context freshly injected. "
+            "Everything is OK; no action needed. "
+            "If this message appears every session, run `ccr doctor` to check for hook errors."
         )
     if context.strip():
         parts.append(f"<gcc_context>\n{context}\n</gcc_context>")
