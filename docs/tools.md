@@ -1,6 +1,6 @@
 # CCR Tool Reference
 
-30 MCP tools exposed via stdio transport. All tools are pure logic (zero LLM calls unless a sub-model is explicitly configured). Claude Code drives all reasoning.
+32 MCP tools exposed via stdio transport. All tools are pure logic (zero LLM calls unless a sub-model is explicitly configured). Claude Code drives all reasoning.
 
 Tools are organized into four groups: GCC (memory), ACE (playbook), RLM (sandbox), and Index (search).
 

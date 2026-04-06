@@ -34,9 +34,7 @@ All tools run as pure logic with zero LLM calls. Claude Code itself provides the
 
 ### For Researchers and Students
 
-On Claude Max ($20/mo), you're not paying per token — you're paying for continuity. CCR makes that continuity real: Claude carries your experiment history, design decisions, and open questions forward across every session.
-
-A 3-month project means ~90 sessions. Without CCR, each starts from scratch. With CCR, each starts where the last left off.
+CCR is designed for long-running research projects where context loss is the main productivity bottleneck. A 3-month project means ~90 Claude Code sessions. Without CCR, each starts from scratch. With CCR, each starts where the last left off.
 
 **Researcher-specific features:**
 - `gcc_commit(experiment={"metrics": {"val_loss": 0.23}})` — log ML runs with metrics and hypothesis
@@ -44,7 +42,17 @@ A 3-month project means ~90 sessions. Without CCR, each starts from scratch. Wit
 - `gcc_discuss(topic=..., decision=..., rationale=...)` — persistent decision log for architecture choices
 - `gcc_search("preprocessing decision")` — find any past decision across commits, discussions, and sessions
 
-See the [Student & Researcher Quickstart](docs/quickstart-students.md) for a full PhD workflow guide.
+**Cost options:**
+
+| Path | Cost | Notes |
+|------|------|-------|
+| Claude Max | $20/mo | Unlimited Claude Code usage (recommended for daily users) |
+| Anthropic API key | ~$2–8/mo | Pay-per-token; cost scales with usage |
+| Claude Pro | ❌ | For claude.ai chat only — does *not* include Claude Code |
+
+> **Global pricing note:** $20/mo is US-priced. In purchasing-power-parity terms, this is $40–80/mo equivalent in many countries. The API-key path is the most accessible for budget-constrained researchers — set `ANTHROPIC_API_KEY` and use `claude` normally.
+
+See the [Student & Researcher Quickstart](docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
 
 ### Manual Setup (without `ccr install`)
 

@@ -175,12 +175,23 @@ def _reconcile_transcript(
 # C1: Session metrics writer
 # ---------------------------------------------------------------------------
 
-def _write_session_metrics(ccr_root: str, state) -> None:
+def _write_session_metrics(ccr_root: str, state, turn_count: int = 0) -> None:
     """Append a one-line JSON record to .ccr/metrics/sessions.jsonl (non-fatal).
 
     Records context_tokens injected and duration for 'ccr stats' ROI dashboard.
     Skips sessions where context_tokens == 0 (no memory was injected — likely
     a session that started before ccr install ran).
+
+    Args:
+        ccr_root: Path to the .ccr/ directory.
+        state: SessionState object with context_tokens, start_time, session_id,
+            and tool_calls (count of tool-use turns this session).
+        turn_count: Number of Q&A turns in this session (from SessionStore).
+            Used to estimate per-turn reminder overhead injected by CCR.
+            Reminders fire only on turns where tool use has occurred, so overhead
+            is capped at min(turn_count - 1, state.tool_calls) * 32 tokens.
+            Pure Q&A sessions (tool_calls == 0) have zero reminder overhead.
+            32 = measured length of _handle_subsequent_prompt output (129 chars ÷ 4).
     """
     if not getattr(state, "context_tokens", 0):
         return  # Nothing injected — skip to avoid skewing averages
@@ -200,6 +211,13 @@ def _write_session_metrics(ccr_root: str, state) -> None:
         )
         duration_min = max(0, round((now - start_dt).total_seconds() / 60, 1))
 
+        # Per-turn reminder overhead: _handle_subsequent_prompt emits ~32 tokens only
+        # on turns where tool use has occurred. Cap overhead at actual tool-using turns
+        # to avoid overcounting for pure-Q&A sessions (tool_calls == 0 → no reminders).
+        # 32 = measured reminder text length (129 chars ÷ 4 chars/token).
+        tool_call_turns = min(max(0, turn_count - 1), getattr(state, "tool_calls", 0))
+        reminder_overhead_tokens = tool_call_turns * 32
+
         record = {
             "session_id": getattr(state, "session_id", "") or "",
             "start": start_dt.isoformat(),
@@ -207,6 +225,7 @@ def _write_session_metrics(ccr_root: str, state) -> None:
             "context_tokens": getattr(state, "context_tokens", 0),
             "duration_min": duration_min,
             "branch": ccr_root,  # coarse identifier; ccr stats reads branch from commits
+            "reminder_overhead_tokens": reminder_overhead_tokens,
         }
 
         jsonl_path = os.path.join(metrics_dir, "sessions.jsonl")
@@ -223,9 +242,11 @@ def _write_session_metrics(ccr_root: str, state) -> None:
 def _auto_baseline_commit(mem: object, state: object, store: object, session_id: str) -> None:
     """Create a structural commit if no explicit gcc_commit was made this session.
 
-    Fires when: no explicit-commit marker AND session has >= 1 turn OR >= 1 file touched.
-    Skips: truly empty sessions (no turns, no files).
-    Non-fatal: all errors are logged but never propagated.
+    Priority 1: State-accumulator auto-commit when state.is_meaningful() is True
+                (files modified, ops accumulated via on_tool_use hooks).
+    Priority 2: Baseline summary from session turns (for pure-conversation sessions).
+
+    Non-fatal: all errors logged, never propagated.
 
     Args:
         mem: MemoryManager instance (already initialized).
@@ -247,7 +268,24 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
     if had_explicit:
         return  # Explicit gcc_commit was made — no baseline needed
 
-    # Gate: require at least some session activity
+    # Priority 1: State accumulator (files touched / ops accumulated)
+    if state.is_meaningful():
+        try:
+            fields = state.to_commit_fields()
+            mem.commit(
+                title=fields["title"],
+                what=fields["what"],
+                why=fields["why"],
+                files_changed=fields["files_changed"],
+                next_step=fields["next_step"],
+                patterns_learned=fields["patterns_learned"],
+            )
+            print(f"[CCR] Auto-committed: {fields['title']}")
+        except Exception as exc:
+            _log_hook_error(f"Auto-commit failed: {exc}")
+        return
+
+    # Priority 2: Baseline summary from session turns
     has_files = bool(state.files_touched)
     turns: list = []
     if session_id:
@@ -258,6 +296,16 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
 
     if not has_files and not turns:
         return  # Truly empty session — skip
+
+    # Quality gate: skip trivial sessions that would pollute the commit log
+    # (e.g. "hi", "thanks", single-word greetings with no file activity)
+    if not has_files:
+        substantive = [
+            t for t in turns
+            if len(t.get("user_message", "").strip().split()) >= 3
+        ]
+        if not substantive:
+            return  # Only trivial messages — skip
 
     try:
         from ccr.hooks.state_accumulator import extract_baseline_summary  # noqa: PLC0415
@@ -286,40 +334,13 @@ def main() -> None:
 
     from ccr.core.memory import MemoryManager
     from ccr.core.types import CCRConfig
-    from ccr.hooks.state_accumulator import clear_state, load_state, save_state
+    from ccr.hooks.state_accumulator import clear_state, load_state
 
     mem = MemoryManager(project_root, CCRConfig())
     if not os.path.isdir(mem.ccr_root):
         return
 
     state = load_state(mem.ccr_root)
-
-    if state.is_meaningful():
-        fields = state.to_commit_fields()
-        try:
-            mem.commit(
-                title=fields["title"],
-                what=fields["what"],
-                why=fields["why"],
-                files_changed=fields["files_changed"],
-                next_step=fields["next_step"],
-                patterns_learned=fields["patterns_learned"],
-            )
-            print(f"[CCR] Auto-committed: {fields['title']}")
-        except Exception as exc:
-            # Don't crash the hook on commit failure
-            print(f"[CCR] Auto-commit failed: {exc}")
-    else:
-        # Log session end even without auto-commit
-        mem.log_ota(
-            tool_name="session-end",
-            observation="Claude Code session ending",
-            thought="No meaningful progress to auto-commit",
-            action="Session ended cleanly",
-        )
-
-    # C1: Write session metrics record before clearing state
-    _write_session_metrics(mem.ccr_root, state)
 
     # Clean up session state
     clear_state(mem.ccr_root)
@@ -344,6 +365,7 @@ def main() -> None:
         if not session_id and stdin_session_id:
             session_id = stdin_session_id
 
+        turn_count = 0
         if session_id:
             from ccr.core.session_store import SessionStore  # noqa: PLC0415
             store = SessionStore(os.path.join(mem.ccr_root, "sessions.db"))
@@ -358,6 +380,19 @@ def main() -> None:
             # Auto-baseline: create structural commit if no explicit gcc_commit was made
             # Called AFTER reconciliation so reconciled turns are available in the DB
             _auto_baseline_commit(mem, state, store, session_id)
+
+            # Read final turn count for reminder-overhead estimate in session metrics
+            try:
+                sessions = store.list_sessions(limit=1)
+                # list_sessions returns newest-first; find our session_id specifically
+                conn_rows = store.get_session_turns(session_id, limit=10000)
+                turn_count = len(conn_rows)
+            except Exception:
+                turn_count = 0
+
+        # C1: Write session metrics record — done after store is open so we
+        # can pass the real turn count for per-turn reminder overhead estimation.
+        _write_session_metrics(mem.ccr_root, state, turn_count=turn_count)
 
         if os.path.isfile(id_file):
             os.unlink(id_file)

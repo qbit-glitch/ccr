@@ -151,6 +151,16 @@ class SessionStore:
             conn.execute(_CREATE_TURNS)
             conn.execute(_CREATE_TURNS_IDX_SESSION)
             conn.execute(_CREATE_SESSIONS_IDX_STARTED)
+            # Schema migration: add 'source' column if missing (added in v0.3.0).
+            # SQLite raises OperationalError("duplicate column name") when the column
+            # already exists — we catch and ignore it, making this safe to run every startup.
+            try:
+                conn.execute(
+                    "ALTER TABLE turns ADD COLUMN source TEXT NOT NULL DEFAULT 'direct'"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already present — expected for fresh installs
             # FTS5 may not be compiled in — catch and disable gracefully
             try:
                 conn.execute(_CREATE_FTS)

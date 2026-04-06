@@ -2,9 +2,63 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 
 import click
+
+
+def _check_stale_hook_paths(hooks: dict) -> list[str]:
+    """Inspect CCR hook commands for stale python/script paths after pip upgrade.
+
+    For each CCR hook command of the form:
+        CCR_PROJECT_ROOT=/path  python_exe  script_path  [extra args...]
+    checks that python_exe (index 1) and script_path (index 2) both exist on disk.
+
+    Returns a list of [WARN] message strings for any missing paths, or [] if all valid.
+    """
+    _CCR_HOOK_SCRIPTS = {
+        "on_session_start.py",
+        "on_tool_use.py",
+        "on_stop.py",
+        "on_compact.py",
+    }
+    warnings: list[str] = []
+
+    for _event, cmds in hooks.items():
+        for entry in cmds:
+            if not isinstance(entry, dict):
+                continue
+            cmd = entry.get("command", "")
+            # Only inspect CCR hook commands (contain a known hook script name)
+            if not any(script in cmd for script in _CCR_HOOK_SCRIPTS):
+                continue
+
+            try:
+                parts = shlex.split(cmd)
+            except ValueError:
+                parts = cmd.split()
+            # Format: CCR_PROJECT_ROOT=... python_exe script_path [args...]
+            if len(parts) < 3:
+                continue
+
+            python_exe = parts[1]
+            hook_script = parts[2]
+
+            missing: list[str] = []
+            if not os.path.isfile(python_exe):
+                missing.append(f"python: {python_exe} → missing")
+            if not os.path.isfile(hook_script):
+                missing.append(f"script: {hook_script} → missing")
+
+            if missing:
+                detail = ", ".join(missing)
+                warnings.append(
+                    f"[WARN] Hook path stale — re-run `ccr install` to update paths "
+                    f"after pip upgrade\n         {detail}"
+                )
+
+    return warnings
 
 
 def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
@@ -79,6 +133,15 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
                     issues.append(
                         f"Duplicate hook command in {event} — run: ccr uninstall && ccr install"
                     )
+            # Check for stale hook paths (python exe or script missing after pip upgrade)
+            stale_items = _check_stale_hook_paths(hooks)
+            if stale_items:
+                for stale_msg in stale_items:
+                    notices.append(stale_msg)
+            else:
+                # Only emit OK when hooks are actually configured
+                if "Stop" in hooks or "UserPromptSubmit" in hooks:
+                    ok_items.append("Hook paths valid (python + 4 scripts found)")
         except (json.JSONDecodeError, OSError):
             issues.append("settings.local.json exists but unreadable")
     else:
@@ -133,6 +196,33 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     except Exception:
         notices.append("Could not verify version parity (ccr-memory not installed via pip)")
 
+    # 11. Stale .session_active marker (from force-killed session)
+    if os.path.isdir(ccr_dir):
+        session_active = os.path.join(ccr_dir, ".session_active")
+        if os.path.isfile(session_active):
+            # Check if the PID inside it is still alive
+            try:
+                with open(session_active, "r") as f:
+                    stored_pid = int(f.read().strip())
+                os.kill(stored_pid, 0)  # Raises if process is dead
+                ok_items.append("Session active (current session running)")
+            except (ValueError, OSError):
+                # Process is dead — stale marker
+                import time as _time
+                try:
+                    age_h = (_time.time() - os.path.getmtime(session_active)) / 3600
+                    notices.append(
+                        f"Stale .session_active marker found (process dead, "
+                        f"age {age_h:.1f}h) — it will be auto-cleaned on next "
+                        f"session start, or delete it manually: "
+                        f"rm {session_active}"
+                    )
+                except OSError:
+                    notices.append(
+                        "Stale .session_active marker found — delete it: "
+                        f"rm {session_active}"
+                    )
+
     return ok_items, issues, notices
 
 
@@ -149,7 +239,11 @@ def doctor(project: str) -> None:
     for item in issues:
         click.echo(f"  [!!] {item}")
     for item in notices:
-        click.echo(f"  [--] {item}")
+        # Notices that already carry a [WARN] prefix are printed as-is (indented only)
+        if item.startswith("[WARN]"):
+            click.echo(f"  {item}")
+        else:
+            click.echo(f"  [--] {item}")
     click.echo(f"\n  {len(ok_items)} OK, {len(issues)} issue(s), {len(notices)} notice(s)")
     if not issues:
         click.echo("  All checks passed.")

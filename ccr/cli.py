@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import sys
 
@@ -258,23 +259,29 @@ def install(project: str, preset: str) -> None:
     # Determine python executable (prefer venv)
     python_exe = sys.executable
 
-    # Build hook commands (all 4 hooks required for full auto-commit chain)
+    # Build hook commands (all 4 hooks required for full auto-commit chain).
+    # CCR_PROJECT_ROOT is baked in at install time so hooks work regardless of
+    # which directory Claude Code is launched from.
+    # Paths are shell-quoted so spaces in project/python paths work correctly.
+    _q = shlex.quote
+    _project_q = _q(project)
+    _python_q = _q(python_exe)
     hook_config = {
         "UserPromptSubmit": [{
             "type": "command",
-            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_session_start.py')}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
         }],
         "PostToolUse": [{
             "type": "command",
-            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_tool_use.py')}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
         }],
         "Stop": [{
             "type": "command",
-            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_stop.py')}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
         }],
         "PreCompact": [{
             "type": "command",
-            "command": f"{python_exe} {os.path.join(hooks_dir, 'on_compact.py')}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
         }],
     }
 
@@ -293,13 +300,19 @@ def install(project: str, preset: str) -> None:
 
     existing.setdefault("hooks", {})
     for event, commands in hook_config.items():
-        existing_cmds = existing["hooks"].get(event, [])
-        ccr_cmd = commands[0]["command"]
-        # Idempotent: append only if CCR hook not already registered for this event
-        if not any(c.get("command") == ccr_cmd for c in existing_cmds):
-            existing["hooks"][event] = existing_cmds + commands
-        else:
-            existing["hooks"].setdefault(event, existing_cmds)
+        # Identify CCR hook script for this event (last shell token of command string).
+        # Use shlex.split to correctly handle quoted paths with spaces.
+        try:
+            hook_script = shlex.split(commands[0]["command"])[-1]
+        except (ValueError, IndexError):
+            hook_script = commands[0]["command"].split()[-1]
+        # Remove any pre-existing CCR hook for this event (any version/prefix),
+        # keeping non-CCR hooks from other tools intact.
+        existing_cmds = [
+            c for c in existing["hooks"].get(event, [])
+            if hook_script not in c.get("command", "")
+        ]
+        existing["hooks"][event] = existing_cmds + commands
 
     with open(settings_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
@@ -333,9 +346,10 @@ def install(project: str, preset: str) -> None:
     click.echo(f"    PreCompact       \u2192 saves state before context resets")
     click.echo(f"\n  MCP server ({mcp_json_path}):")
     click.echo(f"    ccr \u2192 {python_exe} -m ccr.mcp_server")
-    abs_project = os.path.abspath(project)
     # Run doctor inline to confirm install succeeded
     click.echo(f"\n=== Install verification ===")
+    click.echo(f"  \u2705 CCR_PROJECT_ROOT={project} baked into hook commands.")
+    click.echo(f"     Hooks will work regardless of which directory Claude Code is launched from.")
     try:
         from ccr.cli_doctor import _run_doctor_checks  # noqa: PLC0415
         ok_items, issues, notices = _run_doctor_checks(project)
@@ -353,15 +367,17 @@ def install(project: str, preset: str) -> None:
         click.echo(f"  (Run 'ccr doctor' to verify installation)")
 
     click.echo(f"\n=== Next step ===")
-    click.echo(f"  Open Claude Code from this exact directory:")
-    click.echo(f"    cd {abs_project} && claude")
-    click.echo(f"")
-    click.echo(f"  \u26a0\ufe0f  Claude Code must be launched from {abs_project}")
-    click.echo(f"     Hooks only fire when CWD matches the project root.")
+    click.echo(f"  Open Claude Code in any terminal:")
+    click.echo(f"    claude")
+    click.echo(f"  or from the project directory:")
+    click.echo(f"    cd {project} && claude")
     click.echo(f"")
     click.echo(f"  Quick test — ask Claude:")
     click.echo(f'    "What do you remember about this project?"')
     click.echo(f"    Then call: gcc_status()")
+    click.echo(f"")
+    click.echo(f"  Other useful commands:")
+    click.echo(f"    ccr export-context   — export memory for claude.ai (web) sessions")
 
 
 @cli.command()

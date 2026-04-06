@@ -238,7 +238,8 @@ class TestOnToolUseHook:
         state = load_state(ccr_root)
         assert "Ran tests" in state.what_accumulated
 
-    def test_hook_skips_read(self, tmp_path, monkeypatch):
+    def test_hook_increments_tool_calls_for_read(self, tmp_path, monkeypatch):
+        """Read tool must increment tool_calls (for reminder-gate accuracy) but not accumulate summary/files."""
         ccr_root = str(tmp_path / ".ccr")
         os.makedirs(ccr_root)
         initialize_state(ccr_root)
@@ -251,7 +252,12 @@ class TestOnToolUseHook:
         main()
 
         state = load_state(ccr_root)
-        assert state.tool_calls == 0
+        assert state.tool_calls == 1, f"Expected tool_calls=1, got {state.tool_calls}"
+        assert state.what_accumulated == [], "Read should not append to what_accumulated"
+        # Read tracks files_touched (for commit title quality) but without a summary
+        assert any("foo.py" in f for f in state.files_touched), (
+            f"Read should track files_touched, got: {state.files_touched}"
+        )
 
     def test_hook_skips_without_ccr_dir(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CCR_PROJECT_ROOT", str(tmp_path))

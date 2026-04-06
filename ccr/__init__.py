@@ -4,7 +4,7 @@ Persistent memory (GCC), self-evolving playbooks (ACE), and sandboxed
 REPL (RLM) for Claude Code via MCP.  No API keys required.
 """
 
-__version__ = "0.2.7"
+__version__ = "0.3.1"
 
 # Core symbols used by hooks and MCP server (no heavy deps)
 from ccr.core.memory import MemoryManager

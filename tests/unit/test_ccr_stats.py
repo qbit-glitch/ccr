@@ -69,13 +69,15 @@ class TestCcrStats(unittest.TestCase):
         self.assertIn("×2", result.output)
 
     def test_heuristic_label_present(self):
-        """Output must include heuristic disclaimer (* Rough estimate)."""
+        """Output must include heuristic disclaimer and --multiplier hint."""
         sessions = [{"context_tokens": 1000, "start": "2026-04-01T10:00:00+00:00",
                      "end": "2026-04-01T10:30:00+00:00", "duration_min": 30.0}]
         _make_project(self.tmp, sessions=sessions)
         result = self.runner.invoke(stats, [self.tmp])
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("Rough estimate", result.output)
+        # Disclaimer now references "Gross savings" and "Net savings" instead of "Rough estimate"
+        self.assertIn("Gross savings", result.output)
+        self.assertIn("Net savings", result.output)
         self.assertIn("--multiplier", result.output)
 
     def test_broken_jsonl_line_skipped_gracefully(self):

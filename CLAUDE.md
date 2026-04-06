@@ -63,7 +63,7 @@ tests/unit/         # ~1993 tests
 
 ## Key Patterns
 
-- **31 MCP tools** always active (gcc×14, ace×7, rlm×3, index×3, session×4)
+- **32 MCP tools** always active (gcc×14, ace×8, rlm×3, index×3, session×4)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
 - **Two-tier playbook**: Global (~/.ccr/) + project (.ccr/); `scope="global"|"project"` on ACE tools

@@ -27,6 +27,26 @@ def _log_hook_error(error_text: str) -> None:
         pass
 
 
+def _read_tool_data_from_stdin() -> tuple[str, dict]:
+    """Read tool_name and tool_input from Claude Code's PostToolUse stdin JSON.
+
+    Claude Code sends hook data as JSON via stdin:
+    {"tool_name": "Write", "tool_input": {"file_path": "...", ...}}
+
+    Returns:
+        (tool_name, tool_input) — both empty/empty-dict on failure.
+    """
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+            if raw.strip():
+                data = json.loads(raw)
+                return data.get("tool_name", ""), data.get("tool_input", {}) or {}
+    except Exception:
+        pass
+    return "", {}
+
+
 def main() -> None:
     project_root = os.environ.get("CCR_PROJECT_ROOT", os.getcwd())
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -35,17 +55,19 @@ def main() -> None:
     if not os.path.isdir(ccr_root):
         return
 
-    # Claude Code passes hook context via CLAUDE_HOOK_* env vars
-    tool_name = os.environ.get("CLAUDE_TOOL_NAME", "")
-    tool_input = os.environ.get("CLAUDE_TOOL_INPUT", "{}")
+    # Primary: Claude Code sends PostToolUse hook data via stdin JSON.
+    tool_name, input_data = _read_tool_data_from_stdin()
+
+    # Fallback: env vars (backward compat / manual invocation / older Claude Code versions).
+    if not tool_name:
+        tool_name = os.environ.get("CLAUDE_TOOL_NAME", "")
+        try:
+            input_data = json.loads(os.environ.get("CLAUDE_TOOL_INPUT", "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            input_data = {}
 
     if not tool_name:
         return
-
-    try:
-        input_data = json.loads(tool_input) if tool_input else {}
-    except (json.JSONDecodeError, TypeError):
-        input_data = {}
 
     summary = ""
     files: list[str] = []
@@ -58,6 +80,13 @@ def main() -> None:
             files.append(rel)
             summary = f"Modified {rel}"
 
+    # Track Read-accessed files (files_touched only, no summary to avoid noise in commits)
+    elif tool_name == "Read":
+        file_path = input_data.get("file_path", "")
+        if file_path:
+            rel = _relative_path(file_path, project_root)
+            files.append(rel)
+
     # Detect bash commands that indicate progress
     elif tool_name == "Bash":
         cmd = input_data.get("command", "")
@@ -68,12 +97,15 @@ def main() -> None:
         elif cmd.startswith("git "):
             summary = f"Git: {cmd.split()[1] if len(cmd.split()) > 1 else 'operation'}"
 
-    # Skip if nothing meaningful detected
-    if not summary and not files:
-        return
-
-    from ccr.hooks.state_accumulator import append_tool_use
-    append_tool_use(ccr_root, tool_name, summary, files)
+    # Always increment tool_calls (for conditional reminder gate + is_meaningful accuracy).
+    # Only append summary/files when meaningful content was detected.
+    from ccr.hooks.state_accumulator import append_tool_use, load_state, save_state
+    if summary or files:
+        append_tool_use(ccr_root, tool_name, summary, files)
+    else:
+        state = load_state(ccr_root)
+        state.tool_calls += 1
+        save_state(ccr_root, state)
 
 
 def _relative_path(file_path: str, project_root: str) -> str:

@@ -24,11 +24,42 @@ class TestExtractBaselineSummary:
     def _make_turns(self, messages: list[str]) -> list[dict]:
         return [{"user_message": m, "assistant_message": "ok"} for m in messages]
 
-    def test_uses_first_user_message_as_title(self):
+    def test_uses_first_user_message_as_title_when_no_files_or_ops(self):
+        """User message is priority 3 — only used when no files and no what_accumulated."""
         state = SessionState()
         turns = self._make_turns(["How do I train this model?"])
         result = extract_baseline_summary(state, turns)
         assert result["title"] == "[auto] How do I train this model?"
+
+    def test_files_touched_takes_priority_over_user_message(self):
+        """files_touched is priority 1 — always preferred over user message."""
+        state = SessionState(files_touched=["train.py", "config.yaml"])
+        turns = self._make_turns(["How do I train this model?"])
+        result = extract_baseline_summary(state, turns)
+        assert result["title"].startswith("[auto] Edited ")
+        assert "train.py" in result["title"]
+
+    def test_what_accumulated_takes_priority_over_user_message(self):
+        """what_accumulated is priority 2 — used when no files but ops were recorded."""
+        state = SessionState(what_accumulated=["Modified model.py"])
+        turns = self._make_turns(["How do I train this model?"])
+        result = extract_baseline_summary(state, turns)
+        assert "Modified model.py" in result["title"]
+        assert "How do I" not in result["title"]
+
+    def test_title_shows_multiple_files_with_suffix(self):
+        """Title for 4+ files shows '+N more' suffix."""
+        state = SessionState(files_touched=["a.py", "b.py", "c.py", "d.py"])
+        result = extract_baseline_summary(state, [])
+        assert "+1 more" in result["title"]
+        assert "a.py" in result["title"]
+
+    def test_title_three_files_no_suffix(self):
+        """Exactly 3 files — no '+N more' suffix."""
+        state = SessionState(files_touched=["a.py", "b.py", "c.py"])
+        result = extract_baseline_summary(state, [])
+        assert "more" not in result["title"]
+        assert "a.py" in result["title"]
 
     def test_title_capped_at_80_chars(self):
         state = SessionState()
@@ -181,6 +212,78 @@ class TestExplicitCommitMarker:
 
 
 # ---------------------------------------------------------------------------
+# Double-commit prevention: state.is_meaningful() path writes marker
+# ---------------------------------------------------------------------------
+
+class TestDoubleCommitPrevention:
+    """Verify that when state.is_meaningful() commits, the marker is written
+    so _auto_baseline_commit skips — no two commits per session."""
+
+    def _make_mem(self, tmp_path):
+        mem = MagicMock()
+        mem.ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(mem.ccr_root, exist_ok=True)
+        return mem
+
+    def test_after_meaningful_commit_baseline_skips(self, tmp_path):
+        """Integration: when explicit marker is present, _auto_baseline_commit skips."""
+        from ccr.hooks.on_stop import _auto_baseline_commit
+
+        mem = self._make_mem(tmp_path)
+        # Simulate: gcc_commit was called explicitly and wrote the marker
+        marker = os.path.join(mem.ccr_root, ".session_explicit_commit")
+        with open(marker, "w") as f:
+            f.write("1")
+
+        state = SessionState(files_touched=["train.py"])
+        store = MagicMock()
+        store.get_session_turns.return_value = [
+            {"user_message": "Fix the training loop", "assistant_message": "done"}
+        ]
+
+        _auto_baseline_commit(mem, state, store, "ses_abc")
+
+        mem.commit.assert_not_called()
+        assert not os.path.exists(marker), "Marker cleaned up after use"
+
+    def test_marker_peek_does_not_delete_it(self, tmp_path):
+        """on_stop.py peeks at the marker (does not delete it) before is_meaningful().
+
+        The marker must still be present after the peek so _auto_baseline_commit
+        can find it and perform cleanup with its own read+delete logic.
+        This verifies single-writer semantics: only _auto_baseline_commit deletes the marker.
+        """
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root, exist_ok=True)
+        marker = os.path.join(ccr_root, ".session_explicit_commit")
+        with open(marker, "w") as f:
+            f.write("1")
+
+        # Simulate the peek as written in on_stop.main()
+        _explicit_marker = os.path.join(ccr_root, ".session_explicit_commit")
+        _had_explicit_commit = os.path.isfile(_explicit_marker)
+
+        # After peek: marker must still exist (peek does not delete)
+        assert _had_explicit_commit, "Peek should detect the marker"
+        assert os.path.isfile(marker), "Peek must not delete the marker"
+
+        # _auto_baseline_commit is the sole consumer: it reads + deletes the marker
+        from ccr.hooks.on_stop import _auto_baseline_commit
+        mem = self._make_mem(tmp_path)
+        mem.ccr_root = ccr_root  # reuse same ccr_root
+        state = SessionState(files_touched=["train.py"])
+        store = MagicMock()
+        store.get_session_turns.return_value = []
+
+        _auto_baseline_commit(mem, state, store, "ses_x")
+
+        # Marker must now be gone — cleaned up by _auto_baseline_commit
+        assert not os.path.isfile(marker), "Marker must be cleaned up by _auto_baseline_commit"
+        # commit not called because had_explicit=True
+        mem.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _auto_baseline_commit
 # ---------------------------------------------------------------------------
 
@@ -246,6 +349,30 @@ class TestAutoBaselineCommit:
 
         mem.commit.assert_not_called()
 
+    def test_skips_trivial_greeting_no_files(self, tmp_path):
+        """Quality gate: 'hi' / short messages with no files should not create a baseline."""
+        from ccr.hooks.on_stop import _auto_baseline_commit
+        mem = self._make_mem(tmp_path)
+        state = SessionState()  # no files
+        store = self._make_store([{"user_message": "hi", "assistant_message": "Hello!"}])
+
+        _auto_baseline_commit(mem, state, store, "ses_123")
+
+        mem.commit.assert_not_called()
+
+    def test_creates_baseline_for_substantive_turn_no_files(self, tmp_path):
+        """Quality gate: turn with >= 3 words qualifies even without files."""
+        from ccr.hooks.on_stop import _auto_baseline_commit
+        mem = self._make_mem(tmp_path)
+        state = SessionState()
+        store = self._make_store([
+            {"user_message": "Explain how attention works in transformers", "assistant_message": "ok"}
+        ])
+
+        _auto_baseline_commit(mem, state, store, "ses_123")
+
+        mem.commit.assert_called_once()
+
     def test_marker_cleaned_up_when_present(self, tmp_path):
         from ccr.hooks.on_stop import _auto_baseline_commit
         mem = self._make_mem(tmp_path)
@@ -303,10 +430,10 @@ class TestAutoBaselineCommit:
         mem = self._make_mem(tmp_path)
         state = SessionState()
         store = self._make_store([
-            {"user_message": "Explain transformers", "assistant_message": "ok"}
+            {"user_message": "Explain how transformers work", "assistant_message": "ok"}
         ])
 
         _auto_baseline_commit(mem, state, store, "ses_abc")
 
         call_kwargs = mem.commit.call_args[1]
-        assert "Explain transformers" in call_kwargs["title"]
+        assert "Explain how transformers work" in call_kwargs["title"]

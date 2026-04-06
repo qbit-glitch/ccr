@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.1] — 2026-04-06
+
+### Fixed
+- **P0**: DB schema migration for `source` column — existing `.ccr/sessions.db` files created
+  before v0.3.0 now receive the column automatically via `ALTER TABLE turns ADD COLUMN source`.
+  Prevents silent transcript-reconciliation failures on upgrade.
+- **P1**: `session_log_turn` demoted from `REQUIRED` to `WHEN NEEDED` in all hook directives.
+  Transcript reconciliation in `on_stop.py` already captures all turns at session end — the
+  REQUIRED framing was incorrect and injected unnecessary bookkeeping overhead.
+- **P1**: `ccr stats` label changed from "Measured context injected" to "Est. context injected"
+  (4 chars/token is a heuristic, not a verified measurement). Footnote updated accordingly.
+- **P1**: Reminder overhead constant corrected from 45 → 32 tokens/turn (measured: actual
+  reminder text is 129 chars ÷ 4 = 32 tokens).
+- **P2**: `on_tool_use.py` now increments `state.tool_calls` for ALL tool invocations (Read,
+  Glob, Grep, plain Bash) — not just Write/Edit/pytest/git. Fixes conditional reminder
+  suppression accuracy and `is_meaningful()` gate for read-heavy sessions.
+- **P2**: `Read` tool now appends `file_path` to `files_touched` (no summary entry, to avoid
+  "Read x.py" noise in commit messages). Auto-commit titles now meaningful for code-reading sessions.
+- **P2**: Hook commands now use `shlex.quote()` on all path interpolations. Fixes spurious
+  `[WARN] Hook path stale` notices for users with spaces in project paths (common on macOS).
+- **P2**: `ccr doctor` now uses `shlex.split()` when parsing hook commands for stale-path checks.
+- **P3**: Tool count corrected to 32 (gcc×14, ace×8, rlm×3, index×3, session×4) in
+  `CLAUDE.md` and `docs/tools.md`.
+
+---
+
+## [0.3.0] — 2026-04-06
+
+### Added
+- Auto-baseline commit: `on_stop.py` creates a structural GCC commit at every session end,
+  even when Claude skips `gcc_commit` — uses transcript reconciliation as the data source
+- Workflow presets: `ccr install --preset ml|academic|default` injects a focused 5-6 tool
+  directive instead of surfacing all 32 tools, reducing onboarding friction
+- `ccr export-context`: exports GCC memory as a pasteable `CONTEXT.md` for claude.ai sessions
+- `ccr stats`: ROI dashboard showing context tokens injected, session history, and savings estimate
+
+### Fixed
+- **P0**: `CCR_PROJECT_ROOT` is now baked into hook commands at install time
+  (`CCR_PROJECT_ROOT=/abs/path python on_session_start.py`). Hooks no longer silently fail
+  when Claude Code is launched from a directory other than the project root.
+- **P0**: `on_tool_use.py` now reads tool data from Claude Code's stdin JSON payload
+  (the actual PostToolUse hook API) with env-var fallback for backward compat.
+  `files_touched` is now reliably accumulated in session state.
+- **P1**: Auto-baseline commit title now uses the best available signal in priority order:
+  `files_touched` (e.g. `[auto] Edited model.py, train.py`) → `what_accumulated` →
+  first user message. Improves future retrieval quality vs. the previous "what was asked" title.
+
+---
+
 ## [0.2.7] — 2026-04-05
 
 ### Fixed

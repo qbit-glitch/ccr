@@ -168,12 +168,13 @@ Memory already loaded. Respond directly to the user.
 
 REQUIRED after each task:
   gcc_commit(title, what, why, files_changed, next_step)
-  session_log_turn(assistant_message="<your full response>")
 
 WHEN NEEDED:
   gcc_context(level=3) — deeper context
   gcc_search(query)    — find past decisions
   ace_get_playbook()   — see evolved strategies
+  session_log_turn(assistant_message="...") — only if you need real-time turn access;
+                                              turns are auto-captured at session end
 </MANDATORY_CCR_ACTIONS>""",
 
     "ml": """\
@@ -184,12 +185,12 @@ REQUIRED after each experiment/task:
   gcc_commit(title, what, why, files_changed, next_step,
              experiment={"id": "...", "hypothesis": "...",
                          "metrics": {...}, "conclusion": "..."})
-  session_log_turn(assistant_message="<your full response>")
 
 WHEN NEEDED:
   gcc_experiments()           — browse experiment history + metrics
   gcc_branch(name, purpose)   — isolate a hypothesis
   index_search(query)         — find code/config files
+  session_log_turn(assistant_message="...") — only if real-time turn access needed
 </MANDATORY_CCR_ACTIONS>""",
 
     "academic": """\
@@ -198,13 +199,13 @@ Memory already loaded. Academic Research mode active.
 
 REQUIRED after each writing/analysis task:
   gcc_commit(title, what, why, files_changed, next_step)
-  session_log_turn(assistant_message="<your full response>")
 
 WHEN NEEDED:
   gcc_discuss(topic, position) — record argument or decision
   gcc_discussions()            — retrieve past positions/notes
   gcc_search(query)            — search all past analysis
   session_search(query)        — search conversation history
+  session_log_turn(assistant_message="...") — only if real-time turn access needed
 </MANDATORY_CCR_ACTIONS>""",
 }
 
@@ -217,6 +218,11 @@ def _get_preset(ccr_root: str) -> str:
         if os.path.isfile(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 return (yaml.safe_load(f) or {}).get("preset", "default")
+    except ImportError:
+        _log_hook_error(
+            "pyyaml not installed — preset from metadata.yaml cannot be read. "
+            "Install it: pip install pyyaml"
+        )
     except Exception:
         pass
     return "default"
@@ -238,6 +244,7 @@ After finishing your first task, call:
 
 CCR will then remember your progress across all future sessions automatically.
 See: docs/quickstart-students.md for a 5-minute guide.
+Tip: use `ccr export-context` to export memory for claude.ai sessions.
 </ccr_ready>""")
         return
 
@@ -310,9 +317,18 @@ def _handle_subsequent_prompt(mem, user_prompt: str = ""):
     """Subsequent prompts: light reminder to commit if progress was made."""
     # Buffer user prompt for session_log_turn to consume
     _buffer_user_prompt(mem.ccr_root, user_prompt)
+
+    # Skip reminder if no tool use has occurred yet — nothing to commit
+    try:
+        from ccr.hooks.state_accumulator import load_state  # noqa: PLC0415
+        state = load_state(mem.ccr_root)
+        if state.tool_calls == 0:
+            return  # No work done yet — reminder would be noise
+    except Exception:
+        pass  # On any error, default to showing the reminder
+
     print("""<ccr_reminder>
 Remember: call gcc_commit after completing tasks. Call ace_update_counters after significant work.
-After each response: call session_log_turn(assistant_message="<your full response>").
 </ccr_reminder>""")
 
 

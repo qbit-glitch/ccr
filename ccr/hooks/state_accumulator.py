@@ -156,15 +156,31 @@ def extract_baseline_summary(
         if t.get("user_message", "").strip()
     ][:3]
 
-    if user_msgs:
+    files = list(dict.fromkeys(state.files_touched))[:20]
+
+    # Title priority:
+    # 1. files_touched — most useful for future retrieval (shows what changed)
+    # 2. what_accumulated — operation summaries from on_tool_use (e.g. "Modified train.py")
+    # 3. first user message — least useful (what was asked, not what changed)
+    if files:
+        filenames = [os.path.basename(f) for f in files[:3]]
+        n_extra = max(0, len(files) - 3)
+        suffix = f" +{n_extra} more" if n_extra else ""
+        title = f"[auto] Edited {', '.join(filenames)}{suffix}"
+    elif state.what_accumulated:
+        first_op = state.what_accumulated[0][:80].replace("\n", " ").strip()
+        title = f"[auto] {first_op}" if len(first_op) > 5 else "[auto] Session baseline"
+    elif user_msgs:
         topic = user_msgs[0][:80].replace("\n", " ").strip()
         title = f"[auto] {topic}" if len(topic) > 5 else "[auto] Session baseline"
-        what_parts = [f"Turn {i + 1}: {m[:100]}" for i, m in enumerate(user_msgs)]
     else:
         title = "[auto] Session baseline"
+
+    if user_msgs:
+        what_parts = [f"Turn {i + 1}: {m[:100]}" for i, m in enumerate(user_msgs)]
+    else:
         what_parts = ["Session with no logged turns"]
 
-    files = list(dict.fromkeys(state.files_touched))[:20]
     if files:
         what_parts.append(f"Files touched: {', '.join(files[:5])}")
 
