@@ -48,6 +48,10 @@ from ccr.mcp.gcc_tools import (  # noqa: F401
     gcc_consolidate,
     gcc_patterns,
     gcc_scratchpad,
+    gcc_experiments,
+    gcc_discuss,
+    gcc_discussions,
+    gcc_search,
 )
 
 # Re-export all ACE tool functions and helpers

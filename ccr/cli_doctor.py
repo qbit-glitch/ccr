@@ -115,15 +115,22 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     except ImportError:
         notices.append("Vector store not installed (optional) — pip install 'ccr-memory[vector]'")
 
-    # 7. Hooks configured
+    # 7. Hooks configured — check project-local first, then global (~/.claude/)
     settings_path = os.path.join(project, ".claude", "settings.local.json")
+    global_settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json")
+    if not os.path.isfile(settings_path) and os.path.isfile(global_settings_path):
+        settings_path = global_settings_path
+        _from_global = True
+    else:
+        _from_global = False
     if os.path.isfile(settings_path):
         try:
             with open(settings_path) as f:
                 settings = json.loads(f.read())
             hooks = settings.get("hooks", {})
+            scope = " (global)" if _from_global else ""
             if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                ok_items.append("Auto-commit hooks configured")
+                ok_items.append(f"Auto-commit hooks configured{scope}")
             else:
                 issues.append("Hooks not configured — run 'ccr install'")
             # Check for duplicate hook commands (from running ccr install twice before fix)
@@ -156,9 +163,14 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
             with open(hook_errors_log, encoding="utf-8") as f:
                 content = f.read()
             n_errors = content.count("\n---")
-            if age_h < 24:
+            if age_h < 2:
                 issues.append(
                     f"Recent hook errors logged ({n_errors} total) — "
+                    f"run: tail -60 {hook_errors_log}"
+                )
+            elif age_h < 48:
+                notices.append(
+                    f"Hook errors logged ({n_errors} total, last {age_h:.0f}h ago) — "
                     f"run: tail -60 {hook_errors_log}"
                 )
             else:

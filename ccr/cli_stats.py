@@ -83,9 +83,12 @@ def stats(project: str, multiplier: float, last: int) -> None:
     click.echo(f"Project memory ({branch})")
     click.echo(f"  Commits:          {commit_count}")
     if summary_len:
-        click.echo(f"  Rolling summary:  {summary_len}/1500 chars ({summary_len * 100 // 1500}%)")
-        if summary_len > 1200:
-            click.echo(f"  Summary is getting long — run gcc_consolidate() or gcc_context(level=5)")
+        pct = summary_len * 100 // 1500
+        click.echo(f"  Rolling summary:  {summary_len}/1500 chars ({pct}%)")
+        if summary_len >= 1350:  # ≥90%
+            click.echo("  [!!] Summary near capacity — call gcc_consolidate() in your next session")
+        elif summary_len >= 1200:  # ≥80%
+            click.echo("  [--] Summary at 80%+ — consider calling gcc_consolidate() soon")
     if bullet_count:
         click.echo(f"  Playbook:         {playbook_tokens:,} tokens ({bullet_count} bullets)")
 
@@ -93,8 +96,33 @@ def stats(project: str, multiplier: float, last: int) -> None:
 
     if not sessions:
         click.echo("Session history")
-        click.echo("  No session history yet.")
-        click.echo("  (CCR stats are recorded after each session ends with 'ccr install' hooks active.)")
+        # Distinguish: no sessions.jsonl at all vs file exists but empty/unqualified
+        def _has_ccr_hooks(path: str) -> bool:
+            if not os.path.isfile(path):
+                return False
+            try:
+                import json as _json2
+                with open(path, encoding="utf-8") as _f:
+                    _s = _json2.load(_f)
+                hooks = _s.get("hooks", {})
+                return "Stop" in hooks or "UserPromptSubmit" in hooks
+            except Exception:
+                return False
+
+        hooks_dir = os.path.join(project, ".claude", "settings.local.json")
+        global_hooks = os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json")
+        hooks_installed = _has_ccr_hooks(hooks_dir) or _has_ccr_hooks(global_hooks)
+        if not os.path.isfile(jsonl_path):
+            if hooks_installed:
+                click.echo("  Hooks are active — stats will appear after your first session ends.")
+                click.echo("  Open Claude Code in this project and run at least one prompt.")
+            else:
+                click.echo("  No session history yet.")
+                click.echo("  Run 'ccr install' to enable automatic session tracking.")
+        else:
+            click.echo("  Sessions logged but no context-injection records found.")
+            click.echo("  This usually means sessions started before 'ccr install' was run.")
+            click.echo("  Stats will populate from the next session onward.")
         return
 
     # --- Compute aggregates ---
@@ -108,7 +136,7 @@ def stats(project: str, multiplier: float, last: int) -> None:
     total_overhead = sum(overhead_list)
     net_saved = max(0, gross_avoided - total_overhead)
     avg_dur = sum(dur_list) / total_sessions if dur_list else 0
-    breakeven = int(1 / multiplier * 10) + 1 if multiplier else 6
+    # breakeven removed — replaced with honest token summary below
     has_overhead_data = any(s.get("reminder_overhead_tokens", 0) > 0 for s in sessions)
 
     click.echo(f"Session history (last {total_sessions} sessions)")
@@ -134,11 +162,9 @@ def stats(project: str, multiplier: float, last: int) -> None:
     if total_overhead > 0:
         click.echo(f"  Est. overhead:       ~{projected_overhead:,.0f} tokens")
         click.echo(f"  Est. net savings:    ~{projected_net:,.0f} tokens")
-    if total_sessions >= breakeven:
-        click.echo(f"  Break-even:    {breakeven} sessions (already past)")
-    else:
-        remaining = breakeven - total_sessions
-        click.echo(f"  Break-even:    {breakeven} sessions ({remaining} more to go)")
+    click.echo(f"  Note: 'gross savings' = tokens injected × {multiplier:.0f} re-typing heuristic "
+               f"(assumes you'd manually re-explain that much context). Use --multiplier 1 "
+               f"to see injected tokens only.")
 
     click.echo()
     # Show overhead column only when at least one session has reminder data

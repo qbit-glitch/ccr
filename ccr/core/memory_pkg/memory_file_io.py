@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
+import sys as _sys
 import os
 import re
 import subprocess
 import tempfile
 import threading
 from contextlib import contextmanager
+
+if _sys.platform != "win32":
+    import fcntl as _fcntl
+else:
+    _fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +92,24 @@ class FileIOMixin:
 
     @contextmanager
     def _file_lock(self, path: str):
-        """Cross-process file lock using fcntl.flock.
-
-        Creates a .lock file alongside the target file. Uses LOCK_EX
-        (exclusive) to prevent concurrent writes from multiple MCP server
-        instances sharing the same .ccr/ directory.
+        """Cross-process file lock. Uses fcntl.flock on POSIX; falls back to
+        threading.Lock on Windows (no cross-process isolation on Windows — safe
+        for single-instance Claude Code use).
         """
+        if _fcntl is None:
+            # Windows fallback: threading lock only (no cross-process isolation)
+            lock = self._locks.setdefault(path + ".lock", threading.Lock())
+            with lock:
+                yield
+            return
         lock_path = path + ".lock"
         os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
         lock_fd = open(lock_path, "w")
         try:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+            _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_EX)
             yield
         finally:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_UN)
             lock_fd.close()
             # M5: Clean up .lock files
             try:

@@ -2,8 +2,8 @@
 
 CCR gives Claude Code persistent memory across sessions. Without it, Claude forgets
 everything when you close the terminal. With it, Claude remembers your project's history,
-decisions, and experiment results — even months later. Works with Claude Max ($20/mo),
-no API keys needed.
+decisions, and experiment results — even months later. Works with Claude Pro ($20/mo) or
+Claude Max ($100/mo) — no API keys needed. Also works with an Anthropic API key.
 
 ---
 
@@ -22,6 +22,8 @@ no API keys needed.
 ---
 
 ## 3-Step Setup
+
+> **Platform:** macOS and Linux only. Windows is not yet supported.
 
 ```bash
 # Step 1: Install CCR
@@ -154,12 +156,14 @@ gcc_search("preprocessing decision")
 | Scenario | Tokens per session start |
 |----------|--------------------------|
 | Without CCR (re-explaining project) | 3,000–10,000 |
-| With CCR `gcc_context(level=2)` | ~200–500 |
-| Savings over 30 sessions | ~90,000–285,000 tokens |
+| With CCR `gcc_context(level=2)` — new project | ~200–500 |
+| With CCR `gcc_context(level=2)` — mature project | ~1,500–4,000 |
+| Savings over 30 sessions | 60,000–280,000 tokens |
 
-Claude Max ($20/mo) gives effectively unlimited usage in Claude Code. CCR's value isn't
-reducing your bill — it's making every session productive from minute zero by eliminating
-the "re-explain everything" tax.
+CCR's value isn't reducing your bill — it's making every session productive from minute
+zero by eliminating the "re-explain everything" tax. Note: context injection grows as your
+project history deepens. A 3-month project injects more than a week-old one — that's still
+far less than reconstructing context manually.
 
 ---
 
@@ -191,24 +195,26 @@ when you notice a pattern ("this approach kept causing bugs", "this template sav
 
 ## FAQ
 
-**Q: Does CCR work without Claude Max?**
-A: CCR requires Claude Code, which requires **Claude Max ($20/mo)**. This is distinct
-from Claude Pro ($20/mo) — Claude Pro is for claude.ai chat, while Claude Max is for
-Claude Code (the terminal CLI). If you can't afford $20/mo, CCR also works with an
-Anthropic API key:
+**Q: What subscription does CCR require?**
+A: CCR requires Claude Code (the terminal CLI). Claude Code is available with:
+
+| Plan | Price | Claude Code access |
+|------|-------|--------------------|
+| Claude Pro | $20/mo | Yes — with rate limits |
+| Claude Max | $100/mo | Yes — higher rate limits |
+| Anthropic API key | Pay-per-use | Yes — ~$2–8/mo at student usage |
+
+**Claude Pro ($20/mo) is the minimum.** Claude Max ($100/mo) is for heavier users
+who hit Pro's rate limits. If you can't afford either, use an API key:
 
 ```bash
-# API key path (pay-per-token, but you control costs):
 export ANTHROPIC_API_KEY=sk-ant-...
-claude  # Claude Code opens with API key billing
+claude  # Claude Code works with API key billing
 ```
 
-At typical student usage (1-2 hours/day), API costs are roughly $2-8/month. Claude Max
-is better value for heavy users (unlimited within fair-use caps).
-
-> **Note on global pricing:** $20/mo is US-priced. In purchasing-power-parity terms,
-> this can be $40-80/mo equivalent in many countries. The API-key path above is the
-> most accessible for budget-constrained researchers.
+> **Note on global pricing:** $20/mo (Claude Pro) is US-priced. In PPP terms, this is
+> $40–80/mo equivalent in many countries. The API-key path is the most accessible for
+> budget-constrained researchers — you only pay for what you use.
 
 **Q: Will Claude automatically commit my progress?**
 A: Yes, if you ran `ccr install`. The Stop hook auto-commits when you end the session.

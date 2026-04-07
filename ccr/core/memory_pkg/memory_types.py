@@ -7,7 +7,6 @@ EvolvedSummary dataclass live at module level (not in a class).
 
 from __future__ import annotations
 
-import fcntl
 import heapq
 import json
 import logging

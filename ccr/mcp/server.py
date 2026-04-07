@@ -444,7 +444,9 @@ def main():
     # Import tool modules to trigger @mcp.tool registration
     import sys as _sys
     _TOOL_MODULES = [
-        ("ccr.mcp.gcc_tools", "GCC memory tools"),
+        ("ccr.mcp.gcc_branch_tools", "GCC branch management tools"),
+        ("ccr.mcp.gcc_search_tools", "GCC search and query tools"),
+        ("ccr.mcp.gcc_tools", "GCC core memory tools"),
         ("ccr.mcp.ace_tools", "ACE core playbook tools"),
         ("ccr.mcp.ace_llm_tools", "ACE LLM pipeline tools"),
         ("ccr.mcp.ace_schema_tools", "ACE schema evolution tools"),

@@ -82,3 +82,6 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: marks end-to-end integration tests (subprocess, network, etc.)",
+]

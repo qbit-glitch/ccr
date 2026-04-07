@@ -3,9 +3,9 @@
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
 > **With CCR:** Claude already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL — no API keys needed. Works with **Claude Max ($20/mo)**.
+CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Pro ($20/mo)**, **Claude Max ($100/mo)**, or an Anthropic API key. **macOS/Linux only** (Windows support is not yet implemented).
 
-> **New to CCR?** See the [Student & Researcher Quickstart](docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
+> **New to CCR?** See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
 ## Quick Start
 
@@ -46,13 +46,13 @@ CCR is designed for long-running research projects where context loss is the mai
 
 | Path | Cost | Notes |
 |------|------|-------|
-| Claude Max | $20/mo | Unlimited Claude Code usage (recommended for daily users) |
-| Anthropic API key | ~$2–8/mo | Pay-per-token; cost scales with usage |
-| Claude Pro | ❌ | For claude.ai chat only — does *not* include Claude Code |
+| Claude Pro | $20/mo | Claude Code access with rate limits |
+| Claude Max | $100/mo | Higher rate limits for heavy daily use |
+| Anthropic API key | ~$2–8/mo | Pay-per-token; cheapest for light/moderate use |
 
-> **Global pricing note:** $20/mo is US-priced. In purchasing-power-parity terms, this is $40–80/mo equivalent in many countries. The API-key path is the most accessible for budget-constrained researchers — set `ANTHROPIC_API_KEY` and use `claude` normally.
+> **Global pricing note:** Claude Pro ($20/mo) is US-priced. At PPP, this is $40–80/mo equivalent in many countries. The API-key path (~$2–8/mo actual usage) is the most accessible entry point for budget-constrained students — set `ANTHROPIC_API_KEY` and `claude` works normally.
 
-See the [Student & Researcher Quickstart](docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
+See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
 
 ### Manual Setup (without `ccr install`)
 
@@ -106,7 +106,7 @@ Then in your Claude Code session, call `gcc_context(level=2)` to load memory and
 
 ### Session Logger
 
-Every Q&A turn (user message + Claude's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected Claude behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — Claude calls `session_log_turn` after each response. See [docs/session-logger.md](docs/session-logger.md) for the full reference.
+Every Q&A turn (user message + Claude's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected Claude behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — Claude calls `session_log_turn` after each response. See [docs/session-logger.md](https://github.com/qbit-glitch/ccr/blob/main/docs/session-logger.md) for the full reference.
 
 ## Architecture
 
@@ -194,7 +194,7 @@ All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` 
 | Sandboxed REPL | Yes | No | No | No |
 | Zero LLM calls | Yes | No | No | No |
 | Zero infrastructure | Yes | No | No (DB) | No (Neo4j) |
-| Works with Claude Max only | Yes | No | No | No |
+| Works without per-call LLM billing | Yes | No | No | No |
 | Open source | MIT | Yes | Apache 2.0 | Apache 2.0 |
 
 ## Configuration

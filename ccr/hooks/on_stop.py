@@ -251,7 +251,7 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
     Args:
         mem: MemoryManager instance (already initialized).
         state: SessionState (already loaded — do not reload after clear_state).
-        store: SessionStore instance (already open).
+        store: SessionStore instance (already open), or None if session creation failed.
         session_id: Active session ID string, may be empty.
     """
     marker_path = os.path.join(mem.ccr_root, ".session_explicit_commit")
@@ -288,7 +288,7 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
     # Priority 2: Baseline summary from session turns
     has_files = bool(state.files_touched)
     turns: list = []
-    if session_id:
+    if session_id and store is not None:
         try:
             turns = store.get_session_turns(session_id, limit=10)
         except Exception:
@@ -320,7 +320,8 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
         )
         print(f"[CCR] Auto-baseline: {fields['title']}")
     except Exception as exc:
-        _log_hook_error(f"Auto-baseline commit failed: {exc}")
+        import traceback as _tb
+        _log_hook_error(f"Auto-baseline commit failed: {_tb.format_exc()}")
 
 
 def main() -> None:
@@ -366,6 +367,7 @@ def main() -> None:
             session_id = stdin_session_id
 
         turn_count = 0
+        store = None
         if session_id:
             from ccr.core.session_store import SessionStore  # noqa: PLC0415
             store = SessionStore(os.path.join(mem.ccr_root, "sessions.db"))
@@ -376,15 +378,21 @@ def main() -> None:
                 inserted = _reconcile_transcript(store, session_id, transcript_path)
                 if inserted:
                     print(f"[CCR] Transcript reconciliation: inserted {inserted} missing turn(s).")
+        else:
+            _log_hook_error(
+                "on_stop: session_id is empty — skipping DB finalize and reconciliation. "
+                "Auto-baseline will still fire using file state only."
+            )
 
-            # Auto-baseline: create structural commit if no explicit gcc_commit was made
-            # Called AFTER reconciliation so reconciled turns are available in the DB
-            _auto_baseline_commit(mem, state, store, session_id)
+        # Auto-baseline: fires regardless of session_id so no session is ever silently dropped.
+        # When session_id is empty, store=None and _auto_baseline_commit falls back to
+        # file-only state (files_touched). This covers the case where _create_db_session
+        # silently failed at session start.
+        _auto_baseline_commit(mem, state, store, session_id)
 
-            # Read final turn count for reminder-overhead estimate in session metrics
+        # Read final turn count for reminder-overhead estimate in session metrics
+        if session_id and store is not None:
             try:
-                sessions = store.list_sessions(limit=1)
-                # list_sessions returns newest-first; find our session_id specifically
                 conn_rows = store.get_session_turns(session_id, limit=10000)
                 turn_count = len(conn_rows)
             except Exception:
