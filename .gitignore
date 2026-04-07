@@ -34,3 +34,7 @@ Thumbs.db
 .ruff_cache/
 htmlcov/
 .coverage
+
+# Worktrees
+.worktrees/
+.claude/worktrees/
