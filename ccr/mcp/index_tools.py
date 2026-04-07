@@ -5,7 +5,7 @@ from __future__ import annotations
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
 
-from ccr.context.indexer import RepoIndex
+from ccr.context.indexer import RepoIndex, _detect_mode
 from ccr.mcp.server import mcp
 from ccr.mcp_types import (
     IndexBuildResult,
@@ -151,20 +151,25 @@ def index_search(
     min_score: float = 0.0,
     symbols_only: bool = False,
     mode_hint: bool = False,
+    exclude_paths: list[str] | None = None,
 ) -> IndexSearchResult:
     """Search the repo index for files matching a query.
 
-    Three search modes:
+    Four search modes:
       - "keyword": Fast substring matching on paths, symbols, and content.
         Best for specific file names or symbol names.
       - "semantic": Meaning-based search using embeddings (or BM25 fallback).
         Best for conceptual queries like "authentication logic".
       - "hybrid" (default): Combines keyword + semantic scores.
         Best general-purpose mode for natural language queries.
+      - "auto": Automatically selects keyword/semantic/hybrid based on query
+        shape (A-RAG §3.2). Short/symbol queries → keyword; question-form
+        queries → semantic; everything else → hybrid. resolved_mode in result
+        shows which mode was chosen.
 
     Args:
         query: Search term or natural language description.
-        mode: "keyword", "semantic", or "hybrid" (default).
+        mode: "keyword", "semantic", "hybrid" (default), or "auto".
         top_k: Maximum results to return (1-100, default 10).
         return_snippets: If True, include a brief code snippet in each result
             (hybrid mode only; requires chunk embeddings for semantic snippets,
@@ -178,9 +183,15 @@ def index_search(
             Best for "find all implementations of AuthService" queries.
         mode_hint: If True, appends a recommended mode suggestion based on the query
             shape (long query → semantic, path/extension → keyword, else → hybrid).
+        exclude_paths: Optional list of file paths to exclude from results
+            (A-RAG C^read filter). Useful to skip already-read files in
+            multi-turn exploration sessions.
     """
-    if mode not in ("keyword", "semantic", "hybrid"):
-        raise ToolError(f"Invalid mode '{mode}'. Use 'keyword', 'semantic', or 'hybrid'.")
+    if mode not in ("keyword", "semantic", "hybrid", "auto"):
+        raise ToolError(f"Invalid mode '{mode}'. Use 'keyword', 'semantic', 'hybrid', or 'auto'.")
+
+    # A-RAG §3.2: auto-detect mode from query shape
+    resolved_mode = _detect_mode(query) if mode == "auto" else mode
 
     top_k = max(1, min(top_k, 100))  # M3: bound top_k to prevent excessive results
     idx = _srv._ensure_index()
@@ -198,11 +209,11 @@ def index_search(
         hint_suffix = f"\n[mode_hint: recommended mode is '{suggestion}']"
 
     suffix = ""
-    if return_snippets and mode != "hybrid":
-        suffix = f" (note: return_snippets only supported in hybrid mode; ignored for {mode})"
-    if mode == "keyword":
+    if return_snippets and resolved_mode != "hybrid":
+        suffix = f" (note: return_snippets only supported in hybrid mode; ignored for {resolved_mode})"
+    if resolved_mode == "keyword":
         results = idx.search(query, file_glob=file_glob)[:top_k]
-    elif mode == "semantic":
+    elif resolved_mode == "semantic":
         if _srv._embedding_model is not None and idx._embeddings:
             results = idx.semantic_search(query, _srv._embedding_model, top_k=top_k, file_glob=file_glob)
         else:
@@ -219,6 +230,10 @@ def index_search(
         if _srv._embedding_model is None or not idx._embeddings:
             suffix = " (BM25 fallback)"
 
+    # A-RAG C^read: exclude already-seen paths before top-k truncation
+    if exclude_paths:
+        results = [r for r in results if r.get("path") not in exclude_paths]
+
     # Apply min_score filter
     if min_score > 0.0:
         results = [r for r in results if r.get("score", 0.0) >= min_score]
@@ -231,15 +246,16 @@ def index_search(
             if any(q_lower in s.lower() for s in r.get("symbols", []))
         ]
 
+    auto_suffix = f" [auto→{resolved_mode}]" if mode == "auto" else ""
     if not results:
-        text = f"No files matching '{query}' ({mode} mode)."
+        text = f"No files matching '{query}' ({resolved_mode} mode{auto_suffix})."
         if min_score > 0.0:
             text += f" (min_score={min_score} may be filtering results)"
         if symbols_only:
             text += " (symbols_only=True: no symbol matched query)"
         if hint_suffix:
             text += hint_suffix
-        return IndexSearchResult(result_count=0, mode=mode, message=text)
+        return IndexSearchResult(result_count=0, mode=resolved_mode, resolved_mode=resolved_mode, message=text)
 
     # Normalize scores to [0.0, 1.0] relative to top result
     max_score = max((r.get("score", 0) for r in results), default=1)
@@ -248,7 +264,7 @@ def index_search(
     for r in results:
         r["score"] = round(r.get("score", 0) / max_score, 4)
 
-    lines = [f"# {mode} search{suffix}"]
+    lines = [f"# {resolved_mode} search{suffix}{auto_suffix}"]
     for r in results:
         syms = ", ".join(r["symbols"][:5]) if r["symbols"] else ""
         line = (
@@ -261,7 +277,7 @@ def index_search(
     if hint_suffix:
         lines.append(hint_suffix)
     text = "\n".join(lines)
-    return IndexSearchResult(result_count=len(results), mode=mode, message=text)
+    return IndexSearchResult(result_count=len(results), mode=resolved_mode, resolved_mode=resolved_mode, message=text)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))

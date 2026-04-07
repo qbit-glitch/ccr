@@ -341,3 +341,92 @@ class TestIndexBuildProgressInterval:
         progress_msgs = [r for r in caplog.records if "Index progress:" in r.message]
         # At least the two sample files should trigger messages with interval=1
         assert len(progress_msgs) >= 1
+
+
+# ===========================================================================
+# F1: mode="auto" + resolved_mode (A-RAG §3.2)
+# ===========================================================================
+
+
+class TestAutoMode:
+    """index_search with mode='auto' resolves to keyword/semantic/hybrid."""
+
+    def test_symbol_query_resolves_keyword(self, tmp_path):
+        """Short symbol-like query → auto resolves to keyword."""
+        index_build()
+        result = index_search("greet", mode="auto")
+        assert result["resolved_mode"] == "keyword"
+        assert "auto→keyword" in result["message"]
+
+    def test_question_query_resolves_semantic(self, tmp_path):
+        """Question-form query → auto resolves to semantic."""
+        index_build()
+        result = index_search("how does greet function work", mode="auto")
+        assert result["resolved_mode"] == "semantic"
+        assert "auto→semantic" in result["message"]
+
+    def test_general_query_resolves_hybrid(self, tmp_path):
+        """Multi-token general query (>3 tokens) → auto resolves to hybrid."""
+        index_build()
+        result = index_search("helper utility function module", mode="auto")
+        assert result["resolved_mode"] == "hybrid"
+        assert "auto→hybrid" in result["message"]
+
+    def test_non_auto_mode_resolved_mode_matches(self, tmp_path):
+        """Explicit mode → resolved_mode equals mode."""
+        index_build()
+        result = index_search("greet", mode="keyword")
+        assert result["resolved_mode"] == "keyword"
+        assert result["mode"] == "keyword"
+
+    def test_invalid_mode_raises(self, tmp_path):
+        """Unknown mode string → ToolError."""
+        from mcp.server.fastmcp.exceptions import ToolError
+        index_build()
+        with pytest.raises(ToolError):
+            index_search("greet", mode="fuzzy")
+
+
+# ===========================================================================
+# F5: exclude_paths filter (A-RAG C^read)
+# ===========================================================================
+
+
+class TestExcludePaths:
+    """index_search exclude_paths removes specified paths from results."""
+
+    def test_excluded_path_absent_from_results(self, tmp_path):
+        """Path in exclude_paths does not appear in results."""
+        index_build()
+        # First search to find what paths exist
+        all_results = index_search("helper", mode="keyword")
+        paths = [line.split("] ", 1)[-1].split(" (")[0]
+                 for line in all_results["message"].splitlines()
+                 if line.startswith("[")]
+        if not paths:
+            pytest.skip("No results to exclude")
+        exclude = [paths[0]]
+        filtered = index_search("helper", mode="keyword", exclude_paths=exclude)
+        filtered_paths = [line.split("] ", 1)[-1].split(" (")[0]
+                          for line in filtered["message"].splitlines()
+                          if line.startswith("[")]
+        assert paths[0] not in filtered_paths
+
+    def test_exclude_empty_list_no_effect(self, tmp_path):
+        """Empty exclude_paths → same results as no filter."""
+        index_build()
+        r1 = index_search("greet", mode="keyword")
+        r2 = index_search("greet", mode="keyword", exclude_paths=[])
+        assert r1["result_count"] == r2["result_count"]
+
+    def test_exclude_all_paths_returns_zero(self, tmp_path):
+        """Excluding all result paths → result_count=0."""
+        index_build()
+        all_results = index_search("helper", mode="keyword")
+        paths = [line.split("] ", 1)[-1].split(" (")[0]
+                 for line in all_results["message"].splitlines()
+                 if line.startswith("[")]
+        if not paths:
+            pytest.skip("No results to exclude")
+        result = index_search("helper", mode="keyword", exclude_paths=paths)
+        assert result["result_count"] == 0

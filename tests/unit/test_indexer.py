@@ -627,3 +627,51 @@ class TestSnippetExtraction:
         text = "This is a test line. python is used here for scripting. Another line."
         snippet = RepoIndex.extract_snippet(text, "Python")
         assert "python" in snippet.lower()
+
+
+# ===========================================================================
+# F1: Auto Search-Mode Detection (_detect_mode) — A-RAG §3.2
+# ===========================================================================
+
+class TestDetectMode:
+    """Unit tests for _detect_mode() heuristic (A-RAG §3.2)."""
+
+    def test_symbol_query_returns_keyword(self):
+        """Short symbol-like query → keyword."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("gcc_commit") == "keyword"
+
+    def test_short_query_returns_keyword(self):
+        """≤3 tokens → keyword even if not a symbol."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("auth login") == "keyword"
+
+    def test_file_path_returns_keyword(self):
+        """File path pattern → keyword."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("ccr/mcp/gcc_tools.py") == "keyword"
+
+    def test_question_prefix_returns_semantic(self):
+        """Starts with question word → semantic."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("how does admission formula work") == "semantic"
+
+    def test_question_mark_returns_semantic(self):
+        """Ends with '?' → semantic."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("what is the A-MAC admission threshold?") == "semantic"
+
+    def test_why_prefix_returns_semantic(self):
+        """'why' prefix → semantic."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("why was the auth middleware removed") == "semantic"
+
+    def test_general_query_returns_hybrid(self):
+        """Multi-token non-question query → hybrid."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("embedding search performance optimization") == "hybrid"
+
+    def test_explain_prefix_returns_semantic(self):
+        """'explain' prefix → semantic."""
+        from ccr.context.indexer import _detect_mode
+        assert _detect_mode("explain the BFS traversal logic") == "semantic"

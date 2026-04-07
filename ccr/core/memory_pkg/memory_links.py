@@ -22,6 +22,51 @@ from ccr.core.types import CommitLink
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# F2: Temporal Link Aging — EverMemOS + MAGMA (arXiv:2601.02163 + 2601.03236)
+# ---------------------------------------------------------------------------
+
+def _link_age_weight(link: dict) -> float:
+    """Softer exponential decay for link age (λ=0.005/day).
+
+    A link created 30 days ago retains ~86% weight; 60 days → ~74%.
+    When ``created_at`` is absent (legacy links), returns 1.0 (no aging).
+    """
+    created_at = link.get("created_at", "")
+    if not created_at:
+        return 1.0
+    try:
+        dt = datetime.fromisoformat(created_at).replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+        return math.exp(-0.005 * days)
+    except Exception:
+        return 1.0
+
+
+# ---------------------------------------------------------------------------
+# F3: Adaptive Beam Width — MAGMA Algorithm 1 (arXiv:2601.03236)
+# ---------------------------------------------------------------------------
+
+def _prune_frontier(
+    candidates: list[tuple[float, str]], adaptive: bool
+) -> list[tuple[float, str]]:
+    """Prune low-scoring candidates from a BFS frontier (MAGMA Alg. 1).
+
+    Removes candidates whose score falls below ``mean - 0.5 * std``.
+    Always keeps at least 2 candidates to avoid empty frontiers.
+    When ``adaptive=False`` or fewer than 3 candidates, returns unchanged.
+    """
+    if not adaptive or len(candidates) < 3:
+        return candidates
+    scores = [s for s, _ in candidates]
+    mean = sum(scores) / len(scores)
+    variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+    std = variance ** 0.5
+    threshold = mean - 0.5 * std
+    pruned = [(s, cid) for s, cid in candidates if s >= threshold]
+    return pruned if len(pruned) >= 2 else candidates[:2]
+
+
 class LinksMixin:
     """Cross-linking, clustering, and embedding methods for MemoryManager."""
 
@@ -311,6 +356,9 @@ class LinksMixin:
             else:
                 entry = link.to_dict()
                 entry["target"] = tgt
+                # F2: stamp creation time for temporal aging
+                if "created_at" not in entry:
+                    entry["created_at"] = datetime.now(timezone.utc).isoformat()
                 bucket.append(entry)
 
     @staticmethod
@@ -479,6 +527,7 @@ class LinksMixin:
         max_hops: int = 1,
         query: str | None = None,
         max_results: int | None = None,
+        adaptive: bool = True,
     ) -> list[dict]:
         """Priority-queue traversal of commit links (MAGMA-inspired adaptive).
 
@@ -509,6 +558,10 @@ class LinksMixin:
                    ``query_score`` field when query is used.
             max_results: Maximum number of results to return.
                          Defaults to ``config.link_max_results`` (10).
+            adaptive: If True (default), apply MAGMA-style beam pruning to
+                      each hop's frontier — removes candidates whose score
+                      falls below mean - 0.5*std (F3, arXiv:2601.03236).
+                      Set False for exhaustive BFS without pruning.
         """
         data = self._load_links()
         branch = self.get_active_branch()
@@ -562,6 +615,7 @@ class LinksMixin:
             data, commit_id, types, visited, heap, tie_counter,
             hop=1, query=query, use_onnx_scoring=use_onnx_scoring,
             branch=branch, all_cached=all_cached, query_vec=query_vec,
+            adaptive=adaptive,
         )
         tie_counter += len(heap)
 
@@ -594,6 +648,7 @@ class LinksMixin:
                     data, tgt, types, visited, heap, tie_counter,
                     hop=hop + 1, query=query, use_onnx_scoring=use_onnx_scoring,
                     branch=branch, all_cached=all_cached, query_vec=query_vec,
+                    adaptive=adaptive,
                 )
                 tie_counter += added
 
@@ -638,11 +693,13 @@ class LinksMixin:
         branch: str,
         all_cached: dict,
         query_vec: Any,
+        adaptive: bool = True,
     ) -> int:
         """Push neighbors of ``src`` onto the priority heap.
 
         Computes edge scores using ``quick_cosine(query, commit_what)`` when
         ONNX is available, otherwise uses stored heuristic link scores.
+        Applies temporal age decay (F2) and optional adaptive beam pruning (F3).
 
         Args:
             data: Full link graph data.
@@ -657,12 +714,14 @@ class LinksMixin:
             branch: Active branch name for commit text lookup.
             all_cached: Pre-loaded commit embedding vectors.
             query_vec: Pre-embedded query vector (numpy array or None).
+            adaptive: If True, apply _prune_frontier() before pushing (F3).
 
         Returns:
             Number of entries pushed onto the heap.
         """
         node = data.get("links", {}).get(src, {})
-        pushed = 0
+        # Collect all candidates before pruning
+        candidates: list[tuple[float, str, str, dict]] = []  # (score, tgt, lt, entry)
         for lt in types:
             for link_entry in node.get(lt, []):
                 tgt = link_entry.get("target", "")
@@ -692,12 +751,25 @@ class LinksMixin:
                 else:
                     edge_score = link_entry.get("score", 0.0)
 
-                # Max-heap: negate score for heapq (min-heap)
-                heapq.heappush(
-                    heap,
-                    (-edge_score, tie_counter + pushed, hop, tgt, lt, link_entry),
-                )
-                pushed += 1
+                # F2: apply temporal age decay to traversal priority
+                edge_score = edge_score * _link_age_weight(link_entry)
+
+                candidates.append((edge_score, tgt, lt, link_entry))
+
+        # F3: adaptive beam pruning — remove low-score frontier candidates
+        pruned = _prune_frontier([(s, tgt) for s, tgt, _, _ in candidates], adaptive)
+        pruned_tgts = {tgt for _, tgt in pruned}
+
+        pushed = 0
+        for edge_score, tgt, lt, link_entry in candidates:
+            if tgt not in pruned_tgts:
+                continue
+            # Max-heap: negate score for heapq (min-heap)
+            heapq.heappush(
+                heap,
+                (-edge_score, tie_counter + pushed, hop, tgt, lt, link_entry),
+            )
+            pushed += 1
         return pushed
 
     @staticmethod

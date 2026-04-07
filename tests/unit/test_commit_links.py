@@ -919,3 +919,100 @@ class TestLargeHistory:
                          ["shared.py"], "N", admission_threshold=1.0)
         linked = memory.get_linked_commits("C001", max_hops=5)
         assert len(linked) <= 5
+
+
+# ===========================================================================
+# F2: Temporal Link Aging — EverMemOS + MAGMA
+# ===========================================================================
+
+
+class TestLinkAgeWeight:
+    """_link_age_weight() applies exponential decay based on link created_at."""
+
+    def test_no_created_at_returns_one(self):
+        """Missing created_at → weight = 1.0 (no decay)."""
+        from ccr.core.memory_pkg.memory_links import _link_age_weight
+        assert _link_age_weight({}) == 1.0
+        assert _link_age_weight({"score": 0.9}) == 1.0
+
+    def test_fresh_link_near_one(self):
+        """Link created just now → weight ≈ 1.0."""
+        from ccr.core.memory_pkg.memory_links import _link_age_weight
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        w = _link_age_weight({"created_at": now})
+        assert 0.999 <= w <= 1.001
+
+    def test_old_link_lower_weight(self):
+        """60-day-old link has lower weight than 1-day-old link."""
+        from ccr.core.memory_pkg.memory_links import _link_age_weight
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        assert _link_age_weight({"created_at": old}) < _link_age_weight({"created_at": fresh})
+
+    def test_invalid_created_at_returns_one(self):
+        """Malformed created_at → weight = 1.0 (graceful)."""
+        from ccr.core.memory_pkg.memory_links import _link_age_weight
+        assert _link_age_weight({"created_at": "not-a-date"}) == 1.0
+
+    def test_new_link_has_created_at(self, memory):
+        """Links stored via memory.commit() get created_at stamped."""
+        memory.commit("A", "Did A", "Why A", ["a.py", "common.py"], "N", admission_threshold=1.0)
+        memory.commit("B", "Did B", "Why B", ["b.py", "common.py"], "N", admission_threshold=1.0)
+        data = memory._load_links()
+        all_entries = [
+            entry
+            for node in data.get("links", {}).values()
+            for lt_list in node.values()
+            for entry in lt_list
+        ]
+        assert any("created_at" in e for e in all_entries), "At least one link should have created_at"
+
+
+# ===========================================================================
+# F3: Adaptive Beam Width — MAGMA Algorithm 1
+# ===========================================================================
+
+
+class TestPruneFrontier:
+    """_prune_frontier() removes low-score candidates from BFS frontier."""
+
+    def test_adaptive_false_returns_unchanged(self):
+        """adaptive=False → candidates unchanged."""
+        from ccr.core.memory_pkg.memory_links import _prune_frontier
+        candidates = [(0.9, "C001"), (0.8, "C002"), (0.1, "C003"), (0.05, "C004"), (0.07, "C005")]
+        result = _prune_frontier(candidates, adaptive=False)
+        assert result == candidates
+
+    def test_fewer_than_3_unchanged(self):
+        """< 3 candidates → no pruning even when adaptive=True."""
+        from ccr.core.memory_pkg.memory_links import _prune_frontier
+        two = [(0.9, "C001"), (0.1, "C002")]
+        assert _prune_frontier(two, adaptive=True) == two
+
+    def test_low_scores_pruned(self):
+        """High/low score mix → very low scores removed."""
+        from ccr.core.memory_pkg.memory_links import _prune_frontier
+        candidates = [(0.9, "C001"), (0.85, "C002"), (0.88, "C003"), (0.05, "C004"), (0.02, "C005")]
+        result = _prune_frontier(candidates, adaptive=True)
+        result_ids = [cid for _, cid in result]
+        assert "C004" not in result_ids
+        assert "C005" not in result_ids
+
+    def test_at_least_two_kept(self):
+        """Even with all-low scores, at least 2 are kept."""
+        from ccr.core.memory_pkg.memory_links import _prune_frontier
+        candidates = [(0.1, "C001"), (0.09, "C002"), (0.08, "C003")]
+        result = _prune_frontier(candidates, adaptive=True)
+        assert len(result) >= 2
+
+    def test_adaptive_param_forwarded(self, memory):
+        """get_linked_commits(adaptive=False) returns same or more results than adaptive=True."""
+        memory.commit("A", "Did A", "Why A", ["common.py"], "N", admission_threshold=1.0)
+        memory.commit("B", "Did B", "Why B", ["common.py"], "N", admission_threshold=1.0)
+        memory.commit("C", "Did C", "Why C", ["common.py"], "N", admission_threshold=1.0)
+        r_adaptive = memory.get_linked_commits("C001", adaptive=True)
+        r_exhaustive = memory.get_linked_commits("C001", adaptive=False)
+        # adaptive=False should return >= results (no pruning)
+        assert len(r_exhaustive) >= len(r_adaptive)

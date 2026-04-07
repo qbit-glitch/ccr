@@ -83,6 +83,26 @@ DEFAULT_IGNORES = [
 ]
 
 
+_AUTO_QUESTION_WORDS = {"how", "why", "what", "when", "where", "explain", "describe"}
+_AUTO_SYMBOL_RE = re.compile(r'^[\w./:-]+$')
+
+
+def _detect_mode(query: str) -> str:
+    """A-RAG §3.2: infer best search mode from query shape.
+
+    Rules (in priority order):
+    - ≤3 tokens OR looks like a symbol/path → keyword
+    - Ends with '?' OR starts with a question word → semantic
+    - Otherwise → hybrid
+    """
+    tokens = query.strip().split()
+    if len(tokens) <= 3 or bool(_AUTO_SYMBOL_RE.match(query.strip())):
+        return "keyword"
+    if query.rstrip().endswith("?") or (tokens and tokens[0].lower() in _AUTO_QUESTION_WORDS):
+        return "semantic"
+    return "hybrid"
+
+
 @dataclass
 class ChunkEntry:
     """A sentence/paragraph-level chunk of a file (A-RAG §3.1)."""

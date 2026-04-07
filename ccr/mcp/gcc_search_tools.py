@@ -20,6 +20,7 @@ from ccr.mcp_types import (
     GccExperimentsResult,
     GccLinksResult,
     GccPatternsResult,
+    GccScratchpadSearchResult,
     GccSearchResult,
 )
 
@@ -56,6 +57,7 @@ def gcc_links(
     link_types: str | None = None,
     max_hops: int = 1,
     query: str | None = None,
+    adaptive: bool = True,
 ) -> GccLinksResult:
     """Retrieve cross-links for a commit.
 
@@ -76,6 +78,9 @@ def gcc_links(
         query: Optional natural language search intent. When provided, BFS traversal
                is weighted by query relevance (MAGMA intent-aware traversal, Alg. 1).
                Example: query="why was the auth system changed"
+        adaptive: If True (default), prune low-relevance BFS candidates at each
+                  hop using MAGMA Algorithm 1 beam pruning. Set False for exhaustive
+                  traversal when you want all linked commits regardless of score.
     """
     _VALID_LINK_TYPES = {"entity", "causal", "supersession", "semantic"}
     max_hops = max(1, min(max_hops, 5))
@@ -88,7 +93,7 @@ def gcc_links(
         if invalid:
             raise ToolError(f"Invalid link_type(s): {invalid!r}. Valid: {sorted(_VALID_LINK_TYPES)}")
         types = parsed if parsed else None
-    linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops, query=query)
+    linked = mem.get_linked_commits(commit_id, link_types=types, max_hops=max_hops, query=query, adaptive=adaptive)
     if not linked:
         # Still show direct link summary even if BFS returned nothing
         direct = mem.get_commit_links(commit_id)
@@ -497,3 +502,47 @@ def gcc_search(
         sources_searched=searched,
         message=message,
     )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_scratchpad_search(
+    query: str,
+    top_k: int = 5,
+) -> GccScratchpadSearchResult:
+    """Search working memory scratchpad by semantic similarity to query.
+
+    Inspired by AgeMem (arXiv:2601.01885) unified LTM/STM retrieval.
+    Uses ONNX semantic embeddings when available, falls back to BM25-style
+    word overlap. Useful for locating previously stored hypotheses, debug
+    focus notes, or intermediate reasoning state in a multi-turn session.
+
+    Args:
+        query: Search text.
+        top_k: Maximum number of results to return (default 5).
+
+    Returns:
+        total: Number of matching entries returned.
+        results: List of {key, value, score, created_at, updated_at} dicts.
+        message: Formatted markdown table of results.
+    """
+    scratchpad = _srv._scratchpad
+    if scratchpad is None:
+        return GccScratchpadSearchResult(total=0, results=[], message="Scratchpad not initialized.")
+
+    results = scratchpad.search(query, top_k=top_k)
+    if not results:
+        return GccScratchpadSearchResult(
+            total=0, results=[],
+            message=f"No scratchpad entries matching '{query}'."
+        )
+
+    lines = [f"# Scratchpad Search ({len(results)} result{'s' if len(results) != 1 else ''})",
+             "", "| Key | Value | Score |", "|-----|-------|-------|"]
+    for r in results:
+        key = r["key"]
+        val = str(r["value"])[:60].replace("\n", " ")
+        score = f"{r['score']:.3f}"
+        lines.append(f"| {key} | {val} | {score} |")
+    message = "\n".join(lines)
+
+    return GccScratchpadSearchResult(total=len(results), results=results, message=message)

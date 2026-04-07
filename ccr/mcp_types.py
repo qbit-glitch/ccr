@@ -22,6 +22,7 @@ class GccCommitResult(TypedDict):
     title: str
     admission_decision: str  # "created" | "merged" | "rejected"
     message: str
+    trigger_suggestions: NotRequired[list[dict]]  # ERL-style trigger/action pairs (F7)
 
 
 class GccBranchResult(TypedDict):
@@ -192,6 +193,7 @@ class IndexBuildResult(TypedDict):
 class IndexSearchResult(TypedDict):
     result_count: int
     mode: str
+    resolved_mode: str  # same as mode unless mode="auto" (A-RAG §3.2)
     message: str
 
 
@@ -214,6 +216,12 @@ class IndexStatusResult(TypedDict):
 class GccSearchResult(TypedDict):
     total: int
     sources_searched: list[str]
+    message: str
+
+
+class GccScratchpadSearchResult(TypedDict):
+    total: int
+    results: list[dict]  # [{key, value, score, created_at, updated_at}]
     message: str
 
 
