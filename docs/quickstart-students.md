@@ -21,9 +21,50 @@ Claude Max ($100/mo) — no API keys needed. Also works with an Anthropic API ke
 
 ---
 
+## Prerequisites
+
+Before installing CCR, you need three things:
+
+1. **Claude Code CLI** — the terminal app that CCR hooks into.
+   ```bash
+   npm install -g @anthropic-ai/claude-code   # requires Node.js 18+
+   claude --version                           # verify
+   ```
+
+2. **Python 3.11+** — CCR requires Python 3.11 or newer.
+   ```bash
+   python3 --version    # must show 3.11.x or higher
+   # If too old, install via pyenv: pyenv install 3.11.9 && pyenv global 3.11.9
+   ```
+
+3. **A Claude subscription or API key:**
+   | Option | Cost | Notes |
+   |--------|------|-------|
+   | Claude Pro | $20/mo | Claude Code access with rate limits |
+   | Claude Max | $100/mo | Higher rate limits for heavy daily use |
+   | Anthropic API key | ~$2–4/mo | Pay-per-token; cheapest for students |
+
+   > **Students on tight budgets**: The API key path is cheapest. Set `ANTHROPIC_API_KEY` in your
+   > shell and `claude` uses it automatically. With typical research usage (~10 sessions/week,
+   > ~3,000 tokens/session of injected context), expect ~$2–4/month with the Haiku model.
+
+---
+
 ## 3-Step Setup
 
-> **Platform:** macOS and Linux only. Windows is not yet supported.
+> **Platform:** macOS and Linux only. Windows is not yet supported natively.
+>
+> **Windows users — use WSL2 (Windows Subsystem for Linux):**
+> ```bash
+> # 1. Enable WSL2 (run in PowerShell as Administrator, then restart):
+> wsl --install
+> # 2. Open Ubuntu from the Start menu. Inside Ubuntu terminal:
+> sudo apt update && sudo apt install python3.11 python3.11-venv nodejs npm -y
+> pip install ccr-memory && ccr install
+> # 3. Open Claude Code from WSL terminal:
+> claude
+> ```
+> WSL2 gives you a full Linux environment. All CCR features work without modification.
 
 ```bash
 # Step 1: Install CCR
@@ -51,6 +92,16 @@ That's it. Claude will now automatically load your project memory at the start o
 | `gcc_status` | Quick overview: active branch, recent milestones |
 | `index_search(query="...")` | Find files or past decisions by description |
 | `ace_get_playbook` | View strategies Claude has learned about your project |
+
+### For researchers: additional commands
+
+| Command | When to use |
+|---------|-------------|
+| `gcc_search("topic")` | Unified search across commits, discussions, experiments, and session history |
+| `gcc_discuss(topic="...", decision="...", rationale="...")` | Log an architectural or experimental decision for future sessions |
+| `gcc_experiments(metric_filter={"val_loss": {"lt": 0.3}})` | Browse experiment history; filter by metric thresholds |
+| `gcc_branch(name="exp-lr-warmup", purpose="...")` | Isolate a hypothesis so it doesn't pollute main memory |
+| `gcc_merge(branch="exp-lr-warmup", outcome="success", conclusion="...")` | Merge a successful experiment back into main |
 
 ### Minimal example for a research session:
 
@@ -165,6 +216,32 @@ zero by eliminating the "re-explain everything" tax. Note: context injection gro
 project history deepens. A 3-month project injects more than a week-old one — that's still
 far less than reconstructing context manually.
 
+*Token counts are estimates (measured at ~4 chars/token). Actual usage varies by model
+and project history depth.*
+
+Track your real savings with `ccr stats`:
+
+```bash
+ccr stats                     # ROI dashboard for current project
+ccr stats --last 10           # last 10 sessions only
+ccr stats --multiplier 1      # measured tokens only (no re-typing estimate)
+```
+
+Sample output:
+```
+=== CCR Stats Dashboard ===
+
+Project memory (main)
+  Commits:          23
+  Rolling summary:  810/1500 chars (54%)
+
+Session history (last 30 sessions)
+  Est. context injected:  45,200 tokens (1,507/session avg, 30 sessions)
+  Gross savings:          180,800 tokens (context injected ×4 re-typing heuristic)
+  Net savings:            179,680 tokens
+  Avg session duration:   32 min
+```
+
 ---
 
 ## How Automatic Memory Capture Works
@@ -233,3 +310,8 @@ A: Yes. Just use any folder as your "project". Track drafts, feedback, and decis
 **Q: Is my research data private?**
 A: All data lives in `.ccr/` inside your project folder. Nothing is sent to external
 servers. CCR is pure local storage + the Claude Code session you already have.
+
+**Q: How much disk space does CCR use?**
+A: Typical usage is 10–50 MB for a 3-month project. The `.ccr/` directory contains
+commits (plain text), playbook, and an optional repo index (~5 MB for a medium codebase).
+Run `du -sh .ccr/` to check. The `sessions.db` grows ~1 KB per Q&A turn.

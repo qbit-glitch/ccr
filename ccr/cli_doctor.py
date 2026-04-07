@@ -79,6 +79,16 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     else:
         issues.append(f"Python {py_ver} — requires 3.11+")
 
+    # 1b. Claude Code CLI
+    import shutil as _shutil
+    if _shutil.which("claude"):
+        ok_items.append("Claude Code CLI found")
+    else:
+        issues.append(
+            "Claude Code CLI not found — install: npm install -g @anthropic-ai/claude-code\n"
+            "         (CCR hooks require claude to be available in PATH)"
+        )
+
     # 2. .ccr/ directory
     if os.path.isdir(ccr_dir):
         ok_items.append(f".ccr/ exists at {ccr_dir}")
@@ -131,8 +141,13 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
             scope = " (global)" if _from_global else ""
             if "Stop" in hooks or "UserPromptSubmit" in hooks:
                 ok_items.append(f"Auto-commit hooks configured{scope}")
+                ok_items.append("Session logging enabled (Q&A turns saved to sessions.db)")
             else:
                 issues.append("Hooks not configured — run 'ccr install'")
+                issues.append(
+                    "Session logging disabled — hooks file exists but Stop/UserPromptSubmit not configured\n"
+                    "         Fix: run 'ccr install' to enable automatic session capture"
+                )
             # Check for duplicate hook commands (from running ccr install twice before fix)
             for event, cmds in hooks.items():
                 commands = [c.get("command", "") for c in cmds if isinstance(c, dict)]
@@ -144,7 +159,7 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
             stale_items = _check_stale_hook_paths(hooks)
             if stale_items:
                 for stale_msg in stale_items:
-                    notices.append(stale_msg)
+                    issues.append(stale_msg)  # Stale paths are blockers, not notices
             else:
                 # Only emit OK when hooks are actually configured
                 if "Stop" in hooks or "UserPromptSubmit" in hooks:
@@ -153,6 +168,10 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
             issues.append("settings.local.json exists but unreadable")
     else:
         issues.append("No hooks configured — run 'ccr install' for auto-commit")
+        issues.append(
+            "Session logging disabled — no hooks file found (.claude/settings.local.json)\n"
+            "         Fix: run 'ccr install' to enable automatic session capture"
+        )
 
     # 8. Hook error log
     hook_errors_log = os.path.join(ccr_dir, ".hook_errors.log")

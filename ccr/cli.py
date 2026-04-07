@@ -338,6 +338,17 @@ def install(project: str, preset: str) -> None:
         json.dump(existing_mcp, f, indent=2)
         f.write("\n")
 
+    # Warn early if Claude Code CLI is not installed
+    import shutil as _shutil
+    if not _shutil.which("claude"):
+        click.echo(
+            "\n[WARN] Claude Code CLI not found in PATH.\n"
+            "  CCR is installed but hooks won't fire until Claude Code is available.\n"
+            "  Install Claude Code: npm install -g @anthropic-ai/claude-code\n"
+            "  Then re-run: ccr install",
+            err=True,
+        )
+
     click.echo(f"\n\u2705 CCR installed in {project}  [preset: {preset}]")
     click.echo(f"\n  Hooks ({claude_dir}/settings.local.json):")
     click.echo(f"    UserPromptSubmit \u2192 injects memory context at session start")

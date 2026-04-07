@@ -123,6 +123,22 @@ def gcc_commit(
                     _seen.add(_k)
                     _deduped.append(p.strip())
             patterns_learned = _deduped if _deduped else None
+
+        # Warn on files that don't exist on disk (don't block — may have been deleted intentionally)
+        _proj_root = getattr(_srv, "_project_root", "") or ""
+        _missing_files: list[str] = []
+        if _proj_root and files_changed:
+            for _f in files_changed:
+                _abs = _f if os.path.isabs(_f) else os.path.join(_proj_root, _f)
+                if not os.path.exists(_abs):
+                    _missing_files.append(_f)
+        if _missing_files:
+            _warnings.append(
+                f"{len(_missing_files)} file(s) not found on disk: "
+                f"{', '.join(_missing_files[:3])}"
+                f"{'...' if len(_missing_files) > 3 else ''} "
+                f"(check paths are relative to project root)"
+            )
         # --- End validation ---
 
         with _srv._state_lock:

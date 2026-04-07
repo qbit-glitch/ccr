@@ -24,6 +24,27 @@ from ccr.mcp_types import (
 )
 
 
+def _log_search_error(source: str, query: str, exc: Exception) -> None:
+    """Write non-fatal gcc_search error to .ccr/.hook_errors.log (never raises)."""
+    import traceback as _tb
+    try:
+        import ccr.mcp.server as _srv2
+        proj = getattr(_srv2, "_project_root", None) or ""
+        if proj:
+            import os as _os2
+            import datetime as _dt2
+            log_path = _os2.path.join(proj, ".ccr", ".hook_errors.log")
+            if _os2.path.isdir(_os2.path.dirname(log_path)):
+                ts = _dt2.datetime.now(_dt2.timezone.utc).isoformat()
+                with open(log_path, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"\n--- {ts} [gcc_search:{source}] query={query!r} ---\n"
+                        f"{_tb.format_exc()}\n"
+                    )
+    except Exception:
+        pass
+
+
 # ===========================================================================
 # GCC Search & Query Tools
 # ===========================================================================
@@ -406,8 +427,8 @@ def gcc_search(
                 if count:
                     total += count
                     sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{commits_text.strip()}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log_search_error("commits", query, _exc)
 
     # --- Discussions ---
     if "discussions" in active_sources:
@@ -417,8 +438,8 @@ def gcc_search(
             if result["count"]:
                 total += result["count"]
                 sections.append(f"## Discussions ({result['count']} match{'es' if result['count'] != 1 else ''})\n\n{result['message']}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log_search_error("discussions", query, _exc)
 
     # --- Experiments ---
     if "experiments" in active_sources:
@@ -441,8 +462,8 @@ def gcc_search(
                 count = len(all_exp_records)
                 total += count
                 sections.append(f"## Experiments ({count} match{'es' if count != 1 else ''})\n\n{_format_experiment_table(all_exp_records[:limit])}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log_search_error("experiments", query, _exc)
 
     # --- Sessions ---
     if "sessions" in active_sources:
@@ -463,8 +484,8 @@ def gcc_search(
                         snippet = (t.get("assistant_message") or t.get("user_message") or "")[:80].replace("\n", " ")
                         session_lines.append(f"| {date} | {sid} | {snippet}... |")
                     sections.append(f"## Sessions ({len(turns)} match{'es' if len(turns) != 1 else ''})\n\n" + "\n".join(session_lines))
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log_search_error("sessions", query, _exc)
 
     if not sections:
         message = f"No results for '{query}' in {', '.join(searched)}."

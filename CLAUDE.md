@@ -63,7 +63,9 @@ tests/unit/         # ~1993 tests
 
 ## Key Patterns
 
-- **32 MCP tools** always active (gcc×14, ace×8, rlm×3, index×3, session×4)
+- **34 MCP tools** always active (gcc×16, ace×8, rlm×3, index×3, session×4)
+  (Note: `grep "@mcp.tool" ccr/mcp/*.py` counts 37 — 3 extra hits are in comment strings
+  in `__init__.py` and `server.py`. Actual tool-function count = 34.)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
 - **Two-tier playbook**: Global (~/.ccr/) + project (.ccr/); `scope="global"|"project"` on ACE tools

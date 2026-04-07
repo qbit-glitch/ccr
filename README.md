@@ -9,7 +9,13 @@ CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a
 
 ## Quick Start
 
+> **Requirements**: macOS/Linux · Python 3.11+ · Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
+
 ```bash
+# 0. Prerequisites (if not already installed)
+# - Python 3.11+:  python3 --version
+# - Claude Code:   npm install -g @anthropic-ai/claude-code
+
 # 1. Install
 pip install ccr-memory  # or: pip install -e . (from source)
 

@@ -263,13 +263,13 @@ class TestDoctorHookPathCheck:
             }
         }))
 
-        _ok, _issues, notices = _run_doctor_checks(str(project))
-        warn_notices = [n for n in notices if "Hook path stale" in n]
-        assert warn_notices, "Expected a stale-path WARN notice for missing python executable"
-        assert "python" in warn_notices[0], f"WARN should mention python path: {warn_notices[0]}"
+        _ok, issues, _notices = _run_doctor_checks(str(project))
+        stale_issues = [n for n in issues if "Hook path stale" in n]
+        assert stale_issues, "Expected a stale-path issue for missing python executable"
+        assert "python" in stale_issues[0], f"Issue should mention python path: {stale_issues[0]}"
 
     def test_missing_script_emits_warn(self, project):
-        """When the hook script path in a hook is missing, doctor emits a WARN notice."""
+        """When the hook script path in a hook is missing, doctor emits a stale-path issue."""
         from ccr.cli_doctor import _run_doctor_checks
 
         settings_dir = project / ".claude"
@@ -283,10 +283,10 @@ class TestDoctorHookPathCheck:
             }
         }))
 
-        _ok, _issues, notices = _run_doctor_checks(str(project))
-        warn_notices = [n for n in notices if "Hook path stale" in n]
-        assert warn_notices, "Expected a stale-path WARN notice for missing script"
-        assert "script" in warn_notices[0], f"WARN should mention script path: {warn_notices[0]}"
+        _ok, issues, _notices = _run_doctor_checks(str(project))
+        stale_issues = [n for n in issues if "Hook path stale" in n]
+        assert stale_issues, "Expected a stale-path issue for missing script"
+        assert "script" in stale_issues[0], f"Issue should mention script path: {stale_issues[0]}"
 
     def test_non_ccr_hooks_not_flagged(self, project):
         """Hooks from other tools (not CCR scripts) are not flagged as stale."""
