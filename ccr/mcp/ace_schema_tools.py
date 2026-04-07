@@ -5,16 +5,66 @@ Extracted from ace_tools.py to satisfy 800-line coding-style limit.
 
 from __future__ import annotations
 
+import random
 from datetime import datetime, timezone
 
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
 
-from ccr.core.types import PlaybookSchema, SchemaMetrics  # noqa: F401
+from ccr.core.types import PlaybookSchema, SchemaMetrics, SchemaProposal  # noqa: F401
 from ccr.mcp.server import mcp
 import ccr.mcp.server as _srv
 
 from ccr.mcp_types import AceEvolveSchemaResult
+
+
+# ---------------------------------------------------------------------------
+# F8: Stochastic Schema Exploration — MCE (arXiv:2601.21557)
+# ---------------------------------------------------------------------------
+
+def _stochastic_proposal(schema: PlaybookSchema) -> SchemaProposal:
+    """Generate one stochastic MCE proposal by randomly perturbing a parameter.
+
+    Confidence is capped at 0.4 to distinguish exploratory from deterministic proposals.
+    """
+    param = random.choice(["decay_rate", "pruning_threshold", "link_semantic_threshold"])
+    if param == "decay_rate":
+        delta = random.uniform(-0.02, 0.02)
+        new_val = round(max(0.85, min(0.99, schema.decay_rate + delta)), 4)
+        return SchemaProposal(
+            change_type="ADJUST_DECAY",
+            description=(
+                f"MCE stochastic exploration: decay_rate {schema.decay_rate} → {new_val} "
+                f"(±{abs(delta):.3f} random perturbation). Low confidence — evaluate effect."
+            ),
+            details={"new_rate": new_val, "old_rate": schema.decay_rate},
+            confidence=0.4,
+        )
+    elif param == "pruning_threshold":
+        delta = random.choice([-1, 1])
+        new_val = max(1, schema.prune_min_harmful + delta)
+        return SchemaProposal(
+            change_type="ADJUST_PRUNING",
+            description=(
+                f"MCE stochastic exploration: prune_min_harmful {schema.prune_min_harmful} → {new_val} "
+                f"({'stricter' if delta > 0 else 'looser'} pruning threshold). Low confidence."
+            ),
+            details={"new_min_harmful": new_val, "old_min_harmful": schema.prune_min_harmful},
+            confidence=0.35,
+        )
+    else:  # link_semantic_threshold
+        delta = random.uniform(-0.05, 0.05)
+        new_val = round(max(0.05, min(0.9, schema.link_semantic_threshold + delta)), 3)
+        return SchemaProposal(
+            change_type="ADJUST_SEARCH_THRESHOLD",
+            description=(
+                f"MCE stochastic exploration: link_semantic_threshold "
+                f"{schema.link_semantic_threshold} → {new_val} "
+                f"(random ±{abs(delta):.3f}). Low confidence — evaluate retrieval impact."
+            ),
+            details={"new_threshold": new_val, "old_threshold": schema.link_semantic_threshold},
+            confidence=0.38,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +182,7 @@ def ace_evolve_schema(
     scope: str = "project",
     apply_proposal: int | None = None,
     rollback: bool = False,
+    explore: bool = False,
 ) -> AceEvolveSchemaResult:
     """Evolve playbook structure — sections, thresholds, decay parameters.
 
@@ -149,6 +200,10 @@ def ace_evolve_schema(
         scope: "project" or "global".
         apply_proposal: 1-indexed proposal to apply (None = evaluate only).
         rollback: Revert to parent schema version.
+        explore: If True, append one stochastic MCE proposal (confidence <= 0.4)
+                 alongside deterministic proposals (F8, arXiv:2601.21557).
+                 Useful for discovering parameter settings not covered by
+                 deterministic heuristics. Apply with care.
     """
     try:
         with _srv._state_lock:
@@ -308,6 +363,10 @@ def ace_evolve_schema(
             # Only propose retrieval adjustments when no structural proposals pending
             if not proposals:
                 proposals.extend(_build_retrieval_proposals(metrics, schema, sc))
+
+            # F8: stochastic MCE exploration (confidence <= 0.4)
+            if explore:
+                proposals.append(_stochastic_proposal(schema))
 
             parts = [
                 f"# Schema Health Report (v{schema.version})",

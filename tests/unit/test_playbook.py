@@ -2446,3 +2446,100 @@ class TestSM2AdaptiveDecay:
             assert abs(restored.personal_decay_rate - 0.97) < 1e-9
         finally:
             os.unlink(path)
+
+
+# ===========================================================================
+# F8: Stochastic Schema Exploration — MCE (arXiv:2601.21557)
+# ===========================================================================
+
+
+class TestStochasticProposal:
+    """_stochastic_proposal() generates a valid MCE exploratory proposal."""
+
+    def _make_schema(self):
+        from ccr.core.types import PlaybookSchema
+        return PlaybookSchema.default()
+
+    def test_confidence_at_most_04(self):
+        """Stochastic proposal always has confidence <= 0.4."""
+        from ccr.mcp.ace_schema_tools import _stochastic_proposal
+        schema = self._make_schema()
+        for _ in range(20):
+            proposal = _stochastic_proposal(schema)
+            assert proposal.confidence <= 0.4, f"Expected confidence <=0.4, got {proposal.confidence}"
+
+    def test_change_type_is_valid(self):
+        """change_type is one of the recognized schema adjustment types."""
+        from ccr.mcp.ace_schema_tools import _stochastic_proposal
+        valid_types = {"ADJUST_DECAY", "ADJUST_PRUNING", "ADJUST_SEARCH_THRESHOLD"}
+        schema = self._make_schema()
+        for _ in range(20):
+            proposal = _stochastic_proposal(schema)
+            assert proposal.change_type in valid_types
+
+    def test_decay_rate_in_bounds(self):
+        """ADJUST_DECAY proposal keeps decay_rate in [0.85, 0.99]."""
+        from ccr.mcp.ace_schema_tools import _stochastic_proposal
+        import random
+        random.seed(42)
+        schema = self._make_schema()
+        for _ in range(50):
+            proposal = _stochastic_proposal(schema)
+            if proposal.change_type == "ADJUST_DECAY":
+                new_rate = proposal.details["new_rate"]
+                assert 0.85 <= new_rate <= 0.99, f"decay_rate {new_rate} out of bounds"
+
+    def test_search_threshold_in_bounds(self):
+        """ADJUST_SEARCH_THRESHOLD keeps threshold in [0.05, 0.9]."""
+        from ccr.mcp.ace_schema_tools import _stochastic_proposal
+        import random
+        random.seed(7)
+        schema = self._make_schema()
+        for _ in range(50):
+            proposal = _stochastic_proposal(schema)
+            if proposal.change_type == "ADJUST_SEARCH_THRESHOLD":
+                new_t = proposal.details["new_threshold"]
+                assert 0.05 <= new_t <= 0.9, f"threshold {new_t} out of bounds"
+
+    def test_pruning_min_at_least_one(self):
+        """ADJUST_PRUNING keeps prune_min_harmful >= 1."""
+        from ccr.mcp.ace_schema_tools import _stochastic_proposal
+        import random
+        random.seed(3)
+        schema = self._make_schema()
+        schema.prune_min_harmful = 1  # minimum baseline
+        for _ in range(50):
+            proposal = _stochastic_proposal(schema)
+            if proposal.change_type == "ADJUST_PRUNING":
+                new_val = proposal.details["new_min_harmful"]
+                assert new_val >= 1, f"prune_min_harmful {new_val} < 1"
+
+    def test_explore_true_adds_stochastic_to_proposals(self):
+        """ace_evolve_schema(explore=True) returns a proposal with confidence <= 0.4."""
+        import os
+        from ccr.mcp_server import _init
+        from ccr.mcp_server import ace_evolve_schema
+        import ccr.mcp_server as mcp_mod
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = os.path.join(tmp, "global_ccr")
+            os.makedirs(fake_home)
+            orig = os.path.expanduser
+
+            def mock_eu(p):
+                if p.startswith("~/.ccr"):
+                    return fake_home + p[5:]
+                return orig(p)
+
+            import unittest.mock as mock
+            with mock.patch("os.path.expanduser", side_effect=mock_eu):
+                _init(tmp)
+                try:
+                    result = ace_evolve_schema(scope="project", explore=True)
+                    assert "confidence: 0." in result["message"] or "0.3" in result["message"] or "0.4" in result["message"]
+                finally:
+                    mcp_mod._memory = None
+                    mcp_mod._playbook = None
+                    mcp_mod._global_playbook = None
+                    mcp_mod._repo_index = None
+                    mcp_mod._repl = None

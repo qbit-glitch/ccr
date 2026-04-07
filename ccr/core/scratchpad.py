@@ -184,6 +184,48 @@ class Scratchpad:
         with self._lock:
             return len(self._entries)
 
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Search scratchpad entries by semantic similarity to query (AgeMem arXiv:2601.01885).
+
+        Tries ONNX semantic embeddings first; falls back to BM25-style word overlap.
+        Returns list of dicts with keys: key, value, score, created_at, updated_at.
+
+        Args:
+            query: Search text.
+            top_k: Maximum number of results to return (default 5).
+        """
+        entries = self.list_entries()
+        if not entries:
+            return []
+
+        # Try ONNX semantic similarity
+        try:
+            from ccr.context.embeddings import get_embedding_model
+            import numpy as np
+            model = get_embedding_model()
+            if model is not None:
+                q_vec = model.embed_query(query)
+                scored = []
+                for e in entries:
+                    v = model.embed_query(str(e.value))
+                    score = float(np.dot(q_vec, v))
+                    scored.append({"key": e.key, "value": e.value, "score": score,
+                                   "created_at": e.created_at, "updated_at": e.updated_at})
+                return sorted(scored, key=lambda x: -x["score"])[:top_k]
+        except Exception:
+            pass
+
+        # BM25-style word overlap fallback
+        q_tokens = set(query.lower().split())
+        scored = []
+        for e in entries:
+            val_tokens = set(str(e.value).lower().split())
+            union = q_tokens | val_tokens
+            overlap = len(q_tokens & val_tokens) / max(len(union), 1)
+            scored.append({"key": e.key, "value": e.value, "score": overlap,
+                           "created_at": e.created_at, "updated_at": e.updated_at})
+        return sorted(scored, key=lambda x: -x["score"])[:top_k]
+
     def format_for_context(self) -> str:
         """Format scratchpad entries for inclusion in gcc_context output.
 

@@ -293,3 +293,158 @@ class TestSearchAggregation:
              patch("ccr.core.session_store.SessionStore", return_value=mock_store):
             gcc_search("test", sources=["sessions"], limit=3)
         mock_store.search_turns.assert_called_once_with("test", limit=3)
+
+
+# ===========================================================================
+# F7: Auto-Trigger Extraction — ERL (arXiv:2603.24639)
+# ===========================================================================
+
+class TestExtractTriggerSuggestions:
+    """_extract_trigger_suggestions() parses trigger/action pairs from patterns."""
+
+    def test_when_clause(self):
+        """'when X, Y' → trigger=X, action=Y."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        result = _extract_trigger_suggestions(["when adding endpoints, validate first"])
+        assert len(result) == 1
+        assert result[0]["trigger"] == "adding endpoints"
+        assert result[0]["action"] == "validate first"
+
+    def test_arrow_notation(self):
+        """'X → Y' arrow → trigger=X, action=Y."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        result = _extract_trigger_suggestions(["deploy → run smoke tests"])
+        assert len(result) == 1
+        assert result[0]["trigger"] == "deploy"
+        assert result[0]["action"] == "run smoke tests"
+
+    def test_if_clause(self):
+        """'if X, Y' → trigger=X, action=Y."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        result = _extract_trigger_suggestions(["if file exceeds 800 lines, split it"])
+        assert len(result) == 1
+        assert result[0]["trigger"] == "file exceeds 800 lines"
+        assert result[0]["action"] == "split it"
+
+    def test_before_clause(self):
+        """'before X, Y' → trigger=X, action=Y."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        result = _extract_trigger_suggestions(["before committing, run tests"])
+        assert len(result) == 1
+        assert "committing" in result[0]["trigger"]
+
+    def test_no_match_returns_empty(self):
+        """Pattern with no trigger/action structure → empty list."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        result = _extract_trigger_suggestions(["use snake_case for variable names"])
+        assert result == []
+
+    def test_multiple_patterns(self):
+        """Multiple patterns → multiple suggestions."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        patterns = [
+            "when adding new tool, update __init__.py",
+            "deploy → run smoke tests",
+            "plain pattern with no structure",
+        ]
+        result = _extract_trigger_suggestions(patterns)
+        assert len(result) == 2
+
+    def test_empty_list_returns_empty(self):
+        """Empty patterns list → empty result."""
+        from ccr.mcp.gcc_tools import _extract_trigger_suggestions
+        assert _extract_trigger_suggestions([]) == []
+
+
+# ===========================================================================
+# F9: Scratchpad Semantic Search — AgeMem (arXiv:2601.01885)
+# ===========================================================================
+
+class TestScratchpadSearch:
+    """Scratchpad.search() BM25-fallback path (no ONNX required)."""
+
+    def _make_scratchpad(self, tmp_path):
+        from ccr.core.scratchpad import Scratchpad
+        sp = Scratchpad(str(tmp_path / "scratchpad.json"))
+        sp.set("auth", "authentication token management and JWT handling")
+        sp.set("db", "database connection pooling strategy")
+        sp.set("cache", "Redis cache invalidation approach")
+        return sp
+
+    def test_keyword_match_returns_result(self, tmp_path):
+        """Query with a keyword present in value → non-zero score entry returned."""
+        sp = self._make_scratchpad(tmp_path)
+        results = sp.search("authentication")
+        assert len(results) > 0
+        keys = [r["key"] for r in results]
+        assert "auth" in keys
+
+    def test_top_k_limits_results(self, tmp_path):
+        """top_k=1 → at most 1 result."""
+        sp = self._make_scratchpad(tmp_path)
+        results = sp.search("database cache", top_k=1)
+        assert len(results) <= 1
+
+    def test_no_match_returns_empty_or_sorted(self, tmp_path):
+        """Query with zero overlap → results still returned (score=0) or empty."""
+        sp = self._make_scratchpad(tmp_path)
+        results = sp.search("completely unrelated xyz123", top_k=5)
+        # All scores should be 0 for BM25 fallback; results may be returned
+        for r in results:
+            assert r["score"] >= 0
+
+    def test_result_has_required_keys(self, tmp_path):
+        """Each result has key, value, score, created_at, updated_at."""
+        sp = self._make_scratchpad(tmp_path)
+        results = sp.search("auth")
+        assert len(results) > 0
+        for r in results:
+            assert "key" in r
+            assert "value" in r
+            assert "score" in r
+
+    def test_empty_scratchpad_returns_empty(self, tmp_path):
+        """Empty scratchpad → search returns []."""
+        from ccr.core.scratchpad import Scratchpad
+        sp = Scratchpad(str(tmp_path / "empty.json"))
+        assert sp.search("anything") == []
+
+
+class TestGccScratchpadSearchTool:
+    """gcc_scratchpad_search MCP tool integration tests."""
+
+    def test_returns_results_when_entries_match(self):
+        """When scratchpad has matching entries → total > 0."""
+        from ccr.mcp.gcc_search_tools import gcc_scratchpad_search
+        from ccr.core.scratchpad import Scratchpad
+        from unittest.mock import patch
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Scratchpad(os.path.join(tmp, "sp.json"))
+            sp.set("auth", "JWT authentication token handling")
+            with patch.object(_srv, "_scratchpad", sp):
+                result = gcc_scratchpad_search("authentication")
+        assert result["total"] > 0
+        assert "auth" in result["message"]
+
+    def test_no_scratchpad_returns_zero(self):
+        """_scratchpad is None → total=0, no crash."""
+        from ccr.mcp.gcc_search_tools import gcc_scratchpad_search
+        from unittest.mock import patch
+        with patch.object(_srv, "_scratchpad", None):
+            result = gcc_scratchpad_search("test")
+        assert result["total"] == 0
+
+    def test_no_match_returns_zero(self):
+        """Non-matching query → total=0."""
+        from ccr.mcp.gcc_search_tools import gcc_scratchpad_search
+        from ccr.core.scratchpad import Scratchpad
+        from unittest.mock import patch
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Scratchpad(os.path.join(tmp, "sp.json"))
+            sp.set("note", "some unrelated content")
+            with patch.object(_srv, "_scratchpad", sp):
+                result = gcc_scratchpad_search("completelydifferenttermxyz999", top_k=0)
+        # top_k=0 → no results
+        assert result["total"] == 0

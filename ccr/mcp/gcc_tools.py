@@ -34,6 +34,32 @@ from ccr.mcp_types import (
 )
 
 
+# ---------------------------------------------------------------------------
+# F7: Auto-Trigger Extraction — ERL (arXiv:2603.24639)
+# ---------------------------------------------------------------------------
+
+_TRIGGER_PATTERNS = [
+    re.compile(r'(?:when|if)\s+(.+?),\s*(.+)', re.I),
+    re.compile(r'(?:before|after)\s+(.+?),\s*(.+)', re.I),
+    re.compile(r'(.+?)\s*→\s*(.+)'),  # "X → Y" arrow notation
+]
+
+
+def _extract_trigger_suggestions(patterns: list[str]) -> list[dict]:
+    """Extract ERL-style trigger/action pairs from pattern strings."""
+    suggestions: list[dict] = []
+    for p in patterns:
+        for rx in _TRIGGER_PATTERNS:
+            m = rx.search(p)
+            if m:
+                suggestions.append({
+                    "trigger": m.group(1).strip(),
+                    "action": m.group(2).strip(),
+                })
+                break
+    return suggestions
+
+
 # ===========================================================================
 # GCC Core Memory Tools
 # ===========================================================================
@@ -217,13 +243,19 @@ def gcc_commit(
             result += "\n\n[Warnings: " + " ".join(_warnings) + "]"
 
         branch = mem.get_active_branch()
-        return GccCommitResult(
+        commit_result = GccCommitResult(
             commit_id=cid,
             branch=branch,
             title=title,
             admission_decision=admission_decision,
             message=result,
         )
+        # F7: extract ERL trigger/action suggestions from patterns
+        if patterns_learned:
+            trigger_suggestions = _extract_trigger_suggestions(patterns_learned)
+            if trigger_suggestions:
+                commit_result["trigger_suggestions"] = trigger_suggestions
+        return commit_result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:

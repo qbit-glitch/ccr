@@ -2459,7 +2459,8 @@ class TestAdaptiveTraversal:
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
-            results = memory.get_linked_commits("C001", query="test query")
+            # adaptive=False: test is about sort order, not beam pruning
+            results = memory.get_linked_commits("C001", query="test query", adaptive=False)
 
         assert len(results) == 3
         # Highest cosine first (post-traversal sort by query_score)
