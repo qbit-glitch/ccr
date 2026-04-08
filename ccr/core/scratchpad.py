@@ -76,7 +76,7 @@ class Scratchpad:
             "entries": {k: v.to_dict() for k, v in self._entries.items()},
         }
         tmp_path = self._path + ".tmp"
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.flush()

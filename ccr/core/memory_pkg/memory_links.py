@@ -273,10 +273,25 @@ class LinksMixin:
 
         Unlike _load_commit_embeddings(ids) which filters by ID,
         this returns the entire cache for search operations.
+        Tries sqlite-vec first, falls back to gzip JSON.
         Returns dict[str, np.ndarray]. Empty dict on error.
         """
         try:
             import numpy as np
+            # Try sqlite-vec first (mirrors _load_commit_embeddings pattern)
+            from ccr.context.vec_store import get_vec_store
+            db_path = os.path.join(self.ccr_root, "embeddings.db")
+            store = get_vec_store(db_path)
+            if store is not None:
+                all_ids = store.list_ids(namespace="commit")
+                if all_ids:
+                    batch = store.get_batch(all_ids)
+                    if batch:
+                        return {
+                            cid: np.array(vec, dtype=np.float32)
+                            for cid, vec in batch.items()
+                        }
+            # Fallback: gzip JSON
             raw = load_embeddings(self._get_commit_embeddings_path())
             return {
                 cid: np.array(vec, dtype=np.float32)

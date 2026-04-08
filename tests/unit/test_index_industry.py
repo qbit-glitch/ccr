@@ -219,19 +219,21 @@ class TestIndexSearchNormalized:
 
 
 class TestIndexSearchModeHintLong:
-    """Long queries (>50 chars) get 'semantic' suggestion."""
+    """Question-form queries get 'semantic' suggestion via _detect_mode."""
 
     def test_long_query_suggests_semantic(self, tmp_path):
+        # _detect_mode: question-word prefix → semantic
         index_build()
-        long_query = "a" * 51  # > 50 chars
+        long_query = "how does the authentication flow work in this system"
         result = index_search(long_query, mode_hint=True)
         msg = result["message"]
         assert "mode_hint" in msg, f"Expected mode_hint in result: {msg!r}"
         assert "semantic" in msg, f"Expected 'semantic' suggestion: {msg!r}"
 
     def test_long_query_exactly_51_chars(self, tmp_path):
+        # _detect_mode: ends with '?' → semantic
         index_build()
-        query = "x" * 51
+        query = "what is the purpose of the main entry point here?"
         result = index_search(query, mode_hint=True)
         assert "semantic" in result["message"]
 

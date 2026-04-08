@@ -183,6 +183,25 @@ class TestSearchExperiments:
             result = gcc_search("test", sources=["experiments"])
         assert "experiments" in result["sources_searched"]
 
+    def test_experiments_not_double_counted(self):
+        """Records matching both hypothesis search and full scan must appear only once."""
+        shared_record = {
+            "commit_id": "C001",
+            "id": "exp-1",
+            "hypothesis": "test query hypothesis",
+            "metrics": {},
+            "conclusion": "",
+        }
+        mem = _patch_mem()
+        mem.get_experiments.side_effect = [
+            {"records": [shared_record], "count": 1, "message": ""},  # first call (hypothesis_contains)
+            {"records": [shared_record], "count": 1, "message": ""},  # second call (full scan)
+        ]
+        with patch.object(_srv, "_memory", mem):
+            result = gcc_search("test query", sources=["experiments"])
+        # The record appears in both calls but must only be counted once
+        assert result["total"] == 1
+
 
 # ===========================================================================
 # Sessions source

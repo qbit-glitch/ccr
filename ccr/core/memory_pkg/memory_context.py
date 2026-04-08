@@ -237,7 +237,7 @@ class ContextMixin:
 
     def _update_branch_conclusion(self, branch: str, outcome: str, conclusion: str) -> None:
         path = self._get_commits_path(branch)
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 r"\(Fill in at merge time — success/failure/partial\)",

@@ -395,7 +395,7 @@ class CommitMixin:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         files_str = ", ".join(files_changed) if files_changed else ""
 
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
 
             # Find the target commit block
@@ -429,10 +429,8 @@ class CommitMixin:
                 # Cap length
                 if len(merged_what) > 500:
                     merged_what = merged_what[-500:]
-                new_block = new_block.replace(
-                    what_match.group(0),
-                    f"{what_match.group(1)}{merged_what}",
-                )
+                replacement = f"{what_match.group(1)}{merged_what}"
+                new_block = new_block[:what_match.start()] + replacement + new_block[what_match.end():]
 
             # Append to Why
             why_match = re.search(r"(\*\*Why\*\*:\s*)(.*)", new_block)
@@ -443,10 +441,8 @@ class CommitMixin:
                     merged_why = f"{old_why}; {why}"
                     if len(merged_why) > 300:
                         merged_why = merged_why[-300:]
-                    new_block = new_block.replace(
-                        why_match.group(0),
-                        f"{why_match.group(1)}{merged_why}",
-                    )
+                    replacement = f"{why_match.group(1)}{merged_why}"
+                    new_block = new_block[:why_match.start()] + replacement + new_block[why_match.end():]
 
             # Union files
             files_match_re = re.search(r"(\*\*Files\*\*:\s*)(.*)", new_block)
@@ -455,10 +451,8 @@ class CommitMixin:
                 old_set = {f.strip() for f in old_files_str.split(",") if f.strip() and f.strip() != "(none)"}
                 new_set = {f.strip() for f in files_changed if f.strip()}
                 all_files = sorted(old_set | new_set)
-                new_block = new_block.replace(
-                    files_match_re.group(0),
-                    f"{files_match_re.group(1)}{', '.join(all_files)}",
-                )
+                replacement = f"{files_match_re.group(1)}{', '.join(all_files)}"
+                new_block = new_block[:files_match_re.start()] + replacement + new_block[files_match_re.end():]
 
             # Union patterns (CER-inspired)
             if patterns_learned:
@@ -466,10 +460,8 @@ class CommitMixin:
                 if patterns_match_re:
                     old_patterns = [p.strip() for p in patterns_match_re.group(2).split("|") if p.strip()]
                     merged_patterns = list(dict.fromkeys(old_patterns + patterns_learned))
-                    new_block = new_block.replace(
-                        patterns_match_re.group(0),
-                        f"{patterns_match_re.group(1)}{' | '.join(merged_patterns)}",
-                    )
+                    replacement = f"{patterns_match_re.group(1)}{' | '.join(merged_patterns)}"
+                    new_block = new_block[:patterns_match_re.start()] + replacement + new_block[patterns_match_re.end():]
                 else:
                     # Insert patterns line before **Next** or **Score**
                     insert_match = re.search(r"(\*\*(?:Next|Score)\*\*:)", new_block)
@@ -480,10 +472,8 @@ class CommitMixin:
             # Replace Next with newer value
             next_match = re.search(r"(\*\*Next\*\*:\s*)(.*)", new_block)
             if next_match:
-                new_block = new_block.replace(
-                    next_match.group(0),
-                    f"{next_match.group(1)}{next_step}",
-                )
+                replacement = f"{next_match.group(1)}{next_step}"
+                new_block = new_block[:next_match.start()] + replacement + new_block[next_match.end():]
 
             content = content[:match.start()] + new_block + content[match.end():]
             self._write_file_unlocked(path, content)
@@ -502,18 +492,34 @@ class CommitMixin:
         latest = max(int(m) for m in matches)
         return f"C{latest + 1:03d}"
 
+    def _parse_next_commit_id(self, content: str) -> str:
+        """Extract next C### from already-read commits content. No I/O."""
+        if not content:
+            return "C001"
+        matches = re.findall(r"\[C(\d{3,})\]", content)
+        if not matches:
+            return "C001"
+        latest = max(int(m) for m in matches)
+        return f"C{latest + 1:03d}"
+
     def _prepend_commit(self, branch: str, entry: str) -> None:
         """Insert commit at top of Milestone Journal section."""
         path = self._get_commits_path(branch)
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
+            # Fix TOCTOU: re-derive correct ID inside the lock
+            correct_id = self._parse_next_commit_id(content)
+            id_match = re.search(r"## \[(C\d{3,})\]", entry)
+            if id_match:
+                stale_id = id_match.group(1)
+                if stale_id != correct_id:
+                    entry = entry.replace(f"[{stale_id}]", f"[{correct_id}]", 1)
             anchor = "# Milestone Journal\n\n"
             idx = content.find(anchor)
             if idx >= 0:
                 insert_at = idx + len(anchor)
                 content = content[:insert_at] + entry + content[insert_at:]
             else:
-                # Fallback: append
                 content = content + "\n" + entry
             self._write_file_unlocked(path, content)
             self._invalidate_commit_index(branch)
@@ -521,12 +527,12 @@ class CommitMixin:
     def _update_main_milestones(self, date: str, branch: str, title: str) -> None:
         """Update Recent Milestones in main.md."""
         path = os.path.join(self.ccr_root, "main.md")
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
             new_entry = f"- [{date}] ({branch}) {title}"
 
             section_match = re.search(
-                r"(## Recent Milestones\n)(.*?)(\n## |\Z)",
+                r"(## Recent Milestones\n)(.*?)(?=\n## |\Z)",
                 content,
                 re.DOTALL,
             )
@@ -536,8 +542,7 @@ class CommitMixin:
                 lines.insert(0, new_entry)
                 lines = lines[: self.config.milestones_kept]
                 new_section = section_match.group(1) + "\n".join(lines) + "\n"
-                end = section_match.group(3)
-                content = content[: section_match.start()] + new_section + end
+                content = content[: section_match.start()] + new_section + content[section_match.end():]
             else:
                 content += f"\n## Recent Milestones\n{new_entry}\n"
 
@@ -555,11 +560,11 @@ class CommitMixin:
     def _update_current_focus(self, title: str, next_step: str) -> None:
         """Update the Current Focus section in main.md."""
         path = os.path.join(self.ccr_root, "main.md")
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
             new_focus = f"{title}. Next: {next_step}"
             content = re.sub(
-                r"(## Current Focus\n).*?(?=\n## )",
+                r"(## Current Focus\n).*?(?=\n## |\Z)",
                 lambda m: f"{m.group(1)}{new_focus}\n",
                 content,
                 count=1,

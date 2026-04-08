@@ -249,6 +249,7 @@ def ace_apply_delta(
                         restored = Playbook(snapshot)
                         pb._bullets = restored._bullets  # type: ignore[attr-defined]
                         pb._next_id = restored._next_id  # type: ignore[attr-defined]
+                        pb._id_index = restored._id_index  # type: ignore[attr-defined]
                         save_fn()
                     except Exception:
                         pass

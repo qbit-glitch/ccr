@@ -14,6 +14,7 @@ import math
 import os
 import re
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -624,6 +625,12 @@ class RepoIndex:
         Note: keyword_weight / semantic_weight params are kept for API
         compatibility but are no longer used in scoring (RRF is rank-only).
         """
+        if keyword_weight != 0.3 or semantic_weight != 0.7:
+            warnings.warn(
+                "keyword_weight and semantic_weight are deprecated and ignored; RRF scoring is used.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         # Keyword ranked list
         kw_results = self.search(query, file_glob=file_glob)
 

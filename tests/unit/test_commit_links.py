@@ -1016,3 +1016,84 @@ class TestPruneFrontier:
         r_exhaustive = memory.get_linked_commits("C001", adaptive=False)
         # adaptive=False should return >= results (no pruning)
         assert len(r_exhaustive) >= len(r_adaptive)
+
+
+# ===========================================================================
+# Test 4A — _load_all_commit_embeddings sqlite-vec path
+# ===========================================================================
+
+
+class TestLoadAllCommitEmbeddings:
+    """Tests that _load_all_commit_embeddings tries sqlite-vec before gzip JSON."""
+
+    def _make_stub(self, tmp_path):
+        """Create a minimal LinksMixin stub with a temp .ccr root."""
+        import os
+        ccr_root = os.path.join(tmp_path, ".ccr")
+        os.makedirs(ccr_root, exist_ok=True)
+        from ccr.core.memory_pkg.memory_links import LinksMixin
+
+        class _Stub(LinksMixin):
+            def __init__(self):
+                self.ccr_root = ccr_root
+
+        return _Stub()
+
+    def test_sqlite_vec_path_used_when_available(self, tmp_path):
+        """When sqlite-vec store has IDs, _load_all_commit_embeddings returns them."""
+        from unittest.mock import MagicMock, patch
+
+        stub = self._make_stub(str(tmp_path))
+        mock_store = MagicMock()
+        mock_store.list_ids.return_value = ["C001", "C002"]
+        mock_store.get_batch.return_value = {
+            "C001": [0.1, 0.2, 0.3],
+            "C002": [0.4, 0.5, 0.6],
+        }
+        with patch("ccr.context.vec_store.get_vec_store", return_value=mock_store):
+            result = stub._load_all_commit_embeddings()
+
+        assert "C001" in result
+        assert "C002" in result
+        assert len(result) == 2
+
+    def test_falls_back_to_gzip_json_when_store_is_none(self, tmp_path):
+        """When get_vec_store returns None, falls back to gzip JSON."""
+        import gzip
+        import json
+        import os
+        from unittest.mock import patch
+
+        stub = self._make_stub(str(tmp_path))
+        emb_path = stub._get_commit_embeddings_path()
+        os.makedirs(os.path.dirname(emb_path), exist_ok=True)
+        data = {"C003": [0.7, 0.8]}
+        with gzip.open(emb_path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        with patch("ccr.context.vec_store.get_vec_store", return_value=None):
+            result = stub._load_all_commit_embeddings()
+
+        assert "C003" in result
+
+    def test_falls_back_when_store_returns_empty(self, tmp_path):
+        """When sqlite-vec has no IDs, falls back to gzip JSON."""
+        import gzip
+        import json
+        import os
+        from unittest.mock import MagicMock, patch
+
+        stub = self._make_stub(str(tmp_path))
+        mock_store = MagicMock()
+        mock_store.list_ids.return_value = []  # no IDs
+
+        emb_path = stub._get_commit_embeddings_path()
+        os.makedirs(os.path.dirname(emb_path), exist_ok=True)
+        data = {"C004": [0.1, 0.2]}
+        with gzip.open(emb_path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        with patch("ccr.context.vec_store.get_vec_store", return_value=mock_store):
+            result = stub._load_all_commit_embeddings()
+
+        assert "C004" in result

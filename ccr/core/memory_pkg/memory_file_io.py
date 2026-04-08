@@ -69,13 +69,13 @@ class FileIOMixin:
 
     def _append_log(self, branch: str, line: str) -> None:
         path = self._get_log_path(branch)
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
             lines = content.strip().split("\n") if content.strip() else []
             lines.append(line)
             # Rotate
             if len(lines) > self.config.log_max_lines:
-                lines = lines[-200:]
+                lines = lines[-self.config.log_max_lines:]
             self._write_file_unlocked(path, "\n".join(lines) + "\n")
 
     # --- Gitignore ---
@@ -136,7 +136,6 @@ class FileIOMixin:
         # Sanitize surrogates that can't be encoded in UTF-8
         content = content.encode("utf-8", errors="replace").decode("utf-8")
         # Atomic write: write to tmp file, fsync, then os.replace
-        dir_name = os.path.dirname(path) or "."
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:

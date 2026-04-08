@@ -48,7 +48,6 @@ class SqliteVecStore:
         self._db_path = db_path
         self._dim = dim
         self._local = threading.local()
-        self._init_lock = threading.Lock()
         self._ensure_db()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -69,7 +68,11 @@ class SqliteVecStore:
         return conn
 
     def _ensure_db(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist.
+
+        SQLite CREATE TABLE IF NOT EXISTS is idempotent; no explicit lock needed.
+        WAL mode ensures safe concurrent reads during table creation.
+        """
         parent = os.path.dirname(self._db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -96,18 +99,16 @@ class SqliteVecStore:
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
         vec_bytes = serialize_float32(vector)
-        # Upsert metadata
-        conn.execute(
-            "INSERT OR REPLACE INTO vec_metadata (id, namespace, created_at) VALUES (?, ?, ?)",
-            (id, namespace, now),
-        )
-        # Upsert vector (delete + insert for virtual tables)
-        conn.execute("DELETE FROM vec_embeddings WHERE id = ?", (id,))
-        conn.execute(
-            "INSERT INTO vec_embeddings (id, embedding) VALUES (?, ?)",
-            (id, vec_bytes),
-        )
-        conn.commit()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO vec_metadata (id, namespace, created_at) VALUES (?, ?, ?)",
+                (id, namespace, now),
+            )
+            conn.execute("DELETE FROM vec_embeddings WHERE id = ?", (id,))
+            conn.execute(
+                "INSERT INTO vec_embeddings (id, embedding) VALUES (?, ?)",
+                (id, vec_bytes),
+            )
 
     def search(
         self, query_vec: list[float], namespace: str = "commit", top_k: int = 10
@@ -170,9 +171,9 @@ class SqliteVecStore:
     def delete(self, id: str) -> bool:
         """Delete a vector. Returns True if it existed."""
         conn = self._get_conn()
-        cursor = conn.execute("DELETE FROM vec_metadata WHERE id = ?", (id,))
-        conn.execute("DELETE FROM vec_embeddings WHERE id = ?", (id,))
-        conn.commit()
+        with conn:
+            cursor = conn.execute("DELETE FROM vec_metadata WHERE id = ?", (id,))
+            conn.execute("DELETE FROM vec_embeddings WHERE id = ?", (id,))
         return cursor.rowcount > 0
 
     def count(self, namespace: str | None = None) -> int:

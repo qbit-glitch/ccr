@@ -255,7 +255,8 @@ def gcc_experiments(
         # LoRA experiments from last month
         gcc_experiments(hypothesis_contains="LoRA", date_range=["2026-03-01", "2026-04-05"])
     """
-    mem = _srv._ensure_memory()
+    with _srv._state_lock:
+        mem = _srv._ensure_memory()
 
     result = mem.get_experiments(
         experiment_id=experiment_id,
@@ -315,7 +316,8 @@ def gcc_discuss(
             linked_commit="C041",
         )
     """
-    mem = _srv._ensure_memory()
+    with _srv._state_lock:
+        mem = _srv._ensure_memory()
 
     result = mem.add_discussion(
         topic=topic,
@@ -361,7 +363,8 @@ def gcc_discussions(
         gcc_discussions(search="optimizer")
         gcc_discussions(date_range=["2026-03-01", "2026-04-05"])
     """
-    mem = _srv._ensure_memory()
+    with _srv._state_lock:
+        mem = _srv._ensure_memory()
 
     result = mem.get_discussions(
         search=search,
@@ -408,7 +411,8 @@ def gcc_search(
         gcc_search("val_loss", sources=["commits", "experiments"])
         gcc_search("dataset", date_range=["2026-03-01", "2026-04-05"])
     """
-    mem = _srv._ensure_memory()
+    with _srv._state_lock:
+        mem = _srv._ensure_memory()
 
     all_sources = ["commits", "discussions", "experiments", "sessions"]
     if sources:
@@ -450,18 +454,14 @@ def gcc_search(
     if "experiments" in active_sources:
         searched.append("experiments")
         try:
-            result = mem.get_experiments(
-                hypothesis_contains=query,
-                date_range=date_range,
-            )
-            # Also try metric key match
-            result2 = mem.get_experiments()
-            exp_matches = [
-                r for r in result2["records"]
-                if query.lower() in str(r).lower()
-                and r not in result["records"]
+            result = mem.get_experiments(date_range=date_range)
+            q_lower = query.lower()
+            # Match on hypothesis OR any field (metric keys, values, etc.)
+            all_exp_records = [
+                r for r in result["records"]
+                if q_lower in str(r.get("hypothesis", "")).lower()
+                or q_lower in str(r).lower()
             ]
-            all_exp_records = result["records"] + exp_matches
             if all_exp_records:
                 from ccr.core.memory_pkg.memory_experiments import _format_experiment_table
                 count = len(all_exp_records)

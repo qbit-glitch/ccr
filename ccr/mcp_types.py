@@ -6,8 +6,6 @@ TypedDict includes a ``message`` field (str) that carries the same human-readabl
 text previously returned as a plain string, ensuring backward compatibility.
 """
 
-from __future__ import annotations
-
 from typing import NotRequired, TypedDict
 
 

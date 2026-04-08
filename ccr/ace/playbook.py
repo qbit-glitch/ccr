@@ -33,17 +33,12 @@ DEFAULT_SECTIONS = [
 
 # Section name → slug prefix mapping
 _SLUG_MAP = {
-    "strategies_&_insights": "str",
     "strategies_and_insights": "str",
-    "code_snippets_&_templates": "code",
     "code_snippets_and_templates": "code",
     "common_mistakes_to_avoid": "mis",
     "problem-solving_heuristics": "heu",
     "problem_solving_heuristics": "heu",
-    "context_clues_&_indicators": "ctx",
     "context_clues_and_indicators": "ctx",
-    "formulas_&_calculations": "cal",
-    "formulas_and_calculations": "cal",
     "others": "oth",
     "general": "gen",
 }
@@ -554,6 +549,8 @@ class Playbook:
         # Combine counts
         keeper.helpful += absorbed.helpful
         keeper.harmful += absorbed.harmful
+        keeper.weighted_helpful += absorbed.weighted_helpful
+        keeper.weighted_harmful += absorbed.weighted_harmful
         # Combine failure lessons from both bullets
         keeper.failure_lessons.extend(absorbed.failure_lessons)
         # Combine trigger/action fields (ERL-inspired)

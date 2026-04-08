@@ -2543,3 +2543,176 @@ class TestStochasticProposal:
                     mcp_mod._global_playbook = None
                     mcp_mod._repo_index = None
                     mcp_mod._repl = None
+
+
+# ===========================================================================
+# Test 4B — Atomic rollback restores _id_index
+# ===========================================================================
+
+
+class TestAtomicRollbackRestoresIdIndex:
+    """Atomic rollback (ace_apply_delta atomic=True) must restore _id_index."""
+
+    def test_rollback_clears_stale_id_index_entries(self):
+        """After a failed atomic apply, _id_index and _bullets are in sync."""
+        pb = Playbook("")
+
+        # Add a baseline bullet so we have something before the failing delta
+        pb.apply_delta([DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                                       content="baseline bullet")])
+        baseline_ids = {b.id for b in pb._bullets}
+
+        # Take a snapshot (as the atomic logic does)
+        snapshot = pb.serialize()
+
+        # Simulate partial application: add one bullet, then fail
+        call_count = [0]
+        original_apply_add = pb._apply_add
+
+        def failing_apply_add(op):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise RuntimeError("Simulated failure")
+            return original_apply_add(op)
+
+        pb._apply_add = failing_apply_add
+
+        # Apply two ADDs; the second will fail
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError):
+            pb.apply_delta([
+                DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                               content="good bullet"),
+                DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                               content="bad bullet"),
+            ])
+
+        # Simulate the atomic rollback from ace_apply_delta
+        restored = Playbook(snapshot)
+        pb._bullets = restored._bullets
+        pb._next_id = restored._next_id
+        pb._id_index = restored._id_index
+
+        # After rollback, _bullets and _id_index must be in sync
+        for b in pb._bullets:
+            assert b.id in pb._id_index, "Every bullet in _bullets must be in _id_index"
+        for bid, b in pb._id_index.items():
+            assert b in pb._bullets, "Every entry in _id_index must have bullet in _bullets"
+        # No new bullets beyond baseline
+        current_ids = {b.id for b in pb._bullets}
+        assert current_ids == baseline_ids
+
+    def test_rollback_id_index_no_stale_entries_from_partial_add(self):
+        """Partial add that is rolled back must not leave orphaned _id_index entries."""
+        pb = Playbook("")
+        pb.apply_delta([DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                                       content="existing")])
+        snapshot = pb.serialize()
+
+        # Simulate: one ADD succeeds, then exception raised outside _apply_add
+        pb.apply_delta([DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                                       content="partially-added")])
+        # At this point the new bullet IS in the index (before rollback)
+        assert len(pb._bullets) == 2
+
+        # Now perform the rollback
+        restored = Playbook(snapshot)
+        pb._bullets = restored._bullets
+        pb._next_id = restored._next_id
+        pb._id_index = restored._id_index
+
+        assert len(pb._bullets) == 1
+        # Index must exactly mirror _bullets
+        assert set(pb._id_index.keys()) == {b.id for b in pb._bullets}
+
+
+# ===========================================================================
+# Test 4C — Merge preserves weighted counters
+# ===========================================================================
+
+
+class TestMergePreservesWeightedCounters:
+    """_apply_merge must combine weighted_helpful and weighted_harmful."""
+
+    def test_merge_combines_weighted_counters(self):
+        """After MERGE, keeper has sum of both bullets' weighted counters."""
+        pb = Playbook("")
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="keeper bullet"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="absorbed bullet"),
+        ])
+        bullets = pb._bullets
+        assert len(bullets) == 2
+        keeper_id = bullets[0].id
+        absorbed_id = bullets[1].id
+
+        # Manually set weighted counters
+        pb._id_index[keeper_id].weighted_helpful = 2.5
+        pb._id_index[keeper_id].weighted_harmful = 0.5
+        pb._id_index[absorbed_id].weighted_helpful = 1.5
+        pb._id_index[absorbed_id].weighted_harmful = 0.3
+
+        # Apply MERGE
+        pb.apply_delta([
+            DeltaOperation(op_type="MERGE", section="", content="merged content",
+                           bullet_id=keeper_id, merge_target=absorbed_id)
+        ])
+
+        keeper = pb.get_bullet(keeper_id)
+        assert keeper is not None
+        import math
+        assert math.isclose(keeper.weighted_helpful, 4.0, rel_tol=1e-9)
+        assert math.isclose(keeper.weighted_harmful, 0.8, rel_tol=1e-9)
+        # Absorbed bullet removed
+        assert pb.get_bullet(absorbed_id) is None
+
+    def test_merge_weighted_counters_zero_baseline(self):
+        """When weighted counters are 0 (default), merge leaves them at 0."""
+        pb = Playbook("")
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="alpha"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="beta"),
+        ])
+        keeper_id = pb._bullets[0].id
+        absorbed_id = pb._bullets[1].id
+
+        pb.apply_delta([
+            DeltaOperation(op_type="MERGE", section="", content="merged",
+                           bullet_id=keeper_id, merge_target=absorbed_id)
+        ])
+
+        keeper = pb.get_bullet(keeper_id)
+        assert keeper is not None
+        assert keeper.weighted_helpful == 0.0
+        assert keeper.weighted_harmful == 0.0
+
+    def test_merge_weighted_counters_asymmetric(self):
+        """Only one bullet has weighted counters set; other is zero."""
+        pb = Playbook("")
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="has-weights"),
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="no-weights"),
+        ])
+        keeper_id = pb._bullets[0].id
+        absorbed_id = pb._bullets[1].id
+
+        pb._id_index[keeper_id].weighted_helpful = 3.0
+        pb._id_index[keeper_id].weighted_harmful = 1.0
+        # absorbed has default 0.0
+
+        pb.apply_delta([
+            DeltaOperation(op_type="MERGE", section="", content="combined",
+                           bullet_id=keeper_id, merge_target=absorbed_id)
+        ])
+
+        keeper = pb.get_bullet(keeper_id)
+        assert keeper is not None
+        import math
+        assert math.isclose(keeper.weighted_helpful, 3.0, rel_tol=1e-9)
+        assert math.isclose(keeper.weighted_harmful, 1.0, rel_tol=1e-9)

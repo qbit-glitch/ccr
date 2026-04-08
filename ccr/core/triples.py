@@ -93,6 +93,7 @@ class TripleStore:
         self._path = path
         self._lock = threading.Lock()
         self._triples: list[Triple] = []
+        self._triple_keys: set[tuple[str, str, str]] = set()
         self._load()
 
     def _load(self) -> None:
@@ -103,6 +104,9 @@ class TripleStore:
             with open(self._path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self._triples = [Triple.from_dict(t) for t in data.get("triples", [])]
+            self._triple_keys = {
+                (t.subject, t.predicate, t.object) for t in self._triples
+            }
         except (json.JSONDecodeError, OSError, KeyError) as exc:
             logger.warning("Failed to load %s: %s", self._path, exc)
 
@@ -113,7 +117,7 @@ class TripleStore:
             "triples": [t.to_dict() for t in self._triples],
         }
         tmp_path = self._path + ".tmp"
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.flush()
@@ -165,6 +169,7 @@ class TripleStore:
             for triple in candidates:
                 if not self._is_duplicate(triple):
                     self._triples.append(triple)
+                    self._triple_keys.add((triple.subject, triple.predicate, triple.object))
                     new_triples.append(triple)
             if new_triples:
                 self._save()
@@ -172,13 +177,8 @@ class TripleStore:
         return new_triples
 
     def _is_duplicate(self, new: Triple) -> bool:
-        """Check if a triple already exists (same subject+predicate+object)."""
-        for existing in self._triples:
-            if (existing.subject == new.subject
-                    and existing.predicate == new.predicate
-                    and existing.object == new.object):
-                return True
-        return False
+        """O(1) check: triple already exists (same subject+predicate+object)."""
+        return (new.subject, new.predicate, new.object) in self._triple_keys
 
     def search(self, query: str, top_k: int = 10) -> list[Triple]:
         """Search triples by word Jaccard similarity against query."""

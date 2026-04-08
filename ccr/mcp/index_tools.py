@@ -199,20 +199,14 @@ def index_search(
     # Compute mode_hint suggestion upfront (independent of search results)
     hint_suffix = ""
     if mode_hint:
-        _file_extensions = {".py", ".ts", ".js", ".go", ".rs", ".yaml", ".json", ".md"}
-        if len(query) > 50:
-            suggestion = "semantic"
-        elif "/" in query or any(query.endswith(ext) for ext in _file_extensions):
-            suggestion = "keyword"
-        else:
-            suggestion = "hybrid"
+        suggestion = _detect_mode(query)
         hint_suffix = f"\n[mode_hint: recommended mode is '{suggestion}']"
 
     suffix = ""
     if return_snippets and resolved_mode != "hybrid":
         suffix = f" (note: return_snippets only supported in hybrid mode; ignored for {resolved_mode})"
     if resolved_mode == "keyword":
-        results = idx.search(query, file_glob=file_glob)[:top_k]
+        results = idx.search(query, file_glob=file_glob)
     elif resolved_mode == "semantic":
         if _srv._embedding_model is not None and idx._embeddings:
             results = idx.semantic_search(query, _srv._embedding_model, top_k=top_k, file_glob=file_glob)
@@ -245,6 +239,9 @@ def index_search(
             r for r in results
             if any(q_lower in s.lower() for s in r.get("symbols", []))
         ]
+
+    # Final top-k truncation — applied once after all filters
+    results = results[:top_k]
 
     auto_suffix = f" [auto→{resolved_mode}]" if mode == "auto" else ""
     if not results:

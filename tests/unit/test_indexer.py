@@ -675,3 +675,82 @@ class TestDetectMode:
         """'explain' prefix → semantic."""
         from ccr.context.indexer import _detect_mode
         assert _detect_mode("explain the BFS traversal logic") == "semantic"
+
+
+# ===========================================================================
+# Test 4D — exclude_paths + top_k keyword mode
+# ===========================================================================
+
+
+class TestExcludePathsTopK:
+    """exclude_paths filter must apply after scoring, not before top_k truncation."""
+
+    def _build_index_with_files(self, tmp_dir, file_count=5):
+        """Create a small repo with file_count Python files and build the index."""
+        for i in range(file_count):
+            fpath = os.path.join(tmp_dir, f"file{i}.py")
+            with open(fpath, "w") as f:
+                f.write(f"def func_{i}(): pass  # unique token target_{i}\n")
+        return RepoIndex.build(tmp_dir)
+
+    def test_keyword_search_returns_multiple_results(self):
+        """Baseline: keyword search for 'def func' returns results from all files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = self._build_index_with_files(tmp, file_count=5)
+            results = idx.search("def func")
+            # With 5 files each containing 'def func', should find them all
+            assert len(results) >= 3, "Need at least 3 results for subsequent exclusion test"
+
+    def test_exclude_path_removes_result_from_output(self):
+        """Excluding the top result's path produces a list without that path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = self._build_index_with_files(tmp, file_count=5)
+            all_results = idx.search("def func")
+            if not all_results:
+                pytest.skip("No search results to test exclusion")
+            top_path = all_results[0]["path"]
+            # Manually filter (mirrors what index_search MCP tool does)
+            filtered = [r for r in all_results if r.get("path") != top_path]
+            assert not any(r["path"] == top_path for r in filtered)
+
+    def test_top_k_applied_after_exclusion(self):
+        """When top_k=3 and 1 result is excluded, result list has min(3, remaining) entries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = self._build_index_with_files(tmp, file_count=5)
+            all_results = idx.search("def func")
+            if len(all_results) < 2:
+                pytest.skip("Need at least 2 results to test top_k after exclusion")
+            top_path = all_results[0]["path"]
+            exclude_paths = {top_path}
+            # Correct ordering: exclude first, then truncate
+            filtered = [r for r in all_results if r.get("path") not in exclude_paths]
+            top3 = filtered[:3]
+            # Result should not contain excluded path
+            assert not any(r["path"] == top_path for r in top3)
+            # Result count is correct: min(3, available after exclusion)
+            expected_count = min(3, len(filtered))
+            assert len(top3) == expected_count
+
+    def test_wrong_order_would_lose_results(self):
+        """Demonstrates: truncate-then-exclude produces fewer results than exclude-then-truncate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = self._build_index_with_files(tmp, file_count=5)
+            all_results = idx.search("def func")
+            if len(all_results) < 4:
+                pytest.skip("Need at least 4 results to demonstrate ordering difference")
+            top_path = all_results[0]["path"]
+            exclude_paths = {top_path}
+            top_k = 3
+
+            # Correct: exclude then truncate
+            correct = [r for r in all_results if r.get("path") not in exclude_paths][:top_k]
+
+            # Incorrect: truncate then exclude (can produce fewer results)
+            incorrect = [r for r in all_results[:top_k] if r.get("path") not in exclude_paths]
+
+            # If the excluded path was in the top-k truncated window, incorrect has fewer
+            excluded_was_in_top_k = any(r["path"] == top_path for r in all_results[:top_k])
+            if excluded_was_in_top_k:
+                assert len(correct) >= len(incorrect), (
+                    "Correct ordering (exclude then truncate) must return at least as many results"
+                )

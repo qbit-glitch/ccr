@@ -7,6 +7,12 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+import ccr.mcp.server as _srv_mod
+import ccr.mcp_server as mcp_mod
+from ccr.mcp_server import _init
+from ccr.mcp.gcc_search_tools import gcc_experiments
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from ccr.core.memory_pkg.memory_experiments import (
@@ -198,3 +204,56 @@ class TestExperimentsMixinIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# pytest fixture + MCP-layer integration tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def setup_project(tmp_path, monkeypatch):
+    """Initialize CCR in a temp directory."""
+    fake_home_ccr = tmp_path / "global_ccr"
+    fake_home_ccr.mkdir()
+    original_expanduser = os.path.expanduser
+
+    def mock_expanduser(path):
+        if path.startswith("~/.ccr"):
+            return str(fake_home_ccr) + path[5:]
+        return original_expanduser(path)
+
+    monkeypatch.setattr(os.path, "expanduser", mock_expanduser)
+    (tmp_path / "hello.py").write_text("def greet(): pass\n")
+    _init(str(tmp_path))
+    yield tmp_path
+    mcp_mod._memory = None
+    mcp_mod._playbook = None
+    mcp_mod._global_playbook = None
+    mcp_mod._repo_index = None
+    mcp_mod._repl = None
+
+
+class TestGccExperimentsToolLayer:
+    """Integration tests for the gcc_experiments MCP tool (not just the mixin)."""
+
+    def test_returns_empty_on_fresh_project(self, setup_project):
+        """gcc_experiments returns count=0 on a project with no commits."""
+        fn = getattr(gcc_experiments, "__wrapped__", gcc_experiments)
+        result = fn()
+        assert result["count"] == 0
+        assert result["records"] == []
+
+    def test_ensure_memory_called_with_state_lock(self, setup_project, monkeypatch):
+        """gcc_experiments must call _ensure_memory() while holding _state_lock."""
+        lock_was_held = []
+        original_ensure = _srv_mod._ensure_memory
+
+        def spy_ensure():
+            lock_was_held.append(_srv_mod._state_lock.locked())
+            return original_ensure()
+
+        monkeypatch.setattr(_srv_mod, "_ensure_memory", spy_ensure)
+        fn = getattr(gcc_experiments, "__wrapped__", gcc_experiments)
+        fn()
+        assert lock_was_held, "_ensure_memory spy was never called"
+        assert lock_was_held[0], "_ensure_memory() was called WITHOUT _state_lock held"
