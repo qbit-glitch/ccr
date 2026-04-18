@@ -92,6 +92,43 @@ CREATE TRIGGER IF NOT EXISTS index_fts_au AFTER UPDATE ON index_files BEGIN
 END;
 """
 
+# ── Phase 3: chunk-level FTS5 on index_chunks.text ────────────────────
+# Mirrors the Phase 2 memory.db pattern (external content + 4 triggers).
+
+_CHUNKS_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS index_chunks_fts USING fts5(
+    text,
+    content='index_chunks',
+    content_rowid='rowid'
+);
+"""
+
+_CHUNKS_FTS_TRIGGER_AI = """
+CREATE TRIGGER IF NOT EXISTS index_chunks_fts_ai AFTER INSERT ON index_chunks BEGIN
+    INSERT INTO index_chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+"""
+
+_CHUNKS_FTS_TRIGGER_AD = """
+CREATE TRIGGER IF NOT EXISTS index_chunks_fts_ad AFTER DELETE ON index_chunks BEGIN
+    INSERT INTO index_chunks_fts(index_chunks_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+END;
+"""
+
+_CHUNKS_FTS_TRIGGER_BU = """
+CREATE TRIGGER IF NOT EXISTS index_chunks_fts_bu BEFORE UPDATE ON index_chunks BEGIN
+    INSERT INTO index_chunks_fts(index_chunks_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+END;
+"""
+
+_CHUNKS_FTS_TRIGGER_AU = """
+CREATE TRIGGER IF NOT EXISTS index_chunks_fts_au AFTER UPDATE ON index_chunks BEGIN
+    INSERT INTO index_chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+"""
+
 
 class IndexDB:
     """SQLite persistence for the repo index.
@@ -125,10 +162,23 @@ class IndexDB:
             conn.executescript(_FTS_TRIGGER_INSERT)
             conn.executescript(_FTS_TRIGGER_DELETE)
             conn.executescript(_FTS_TRIGGER_UPDATE)
+            conn.executescript(_CHUNKS_FTS_DDL)
+            conn.executescript(_CHUNKS_FTS_TRIGGER_AI)
+            conn.executescript(_CHUNKS_FTS_TRIGGER_AD)
+            conn.executescript(_CHUNKS_FTS_TRIGGER_BU)
+            conn.executescript(_CHUNKS_FTS_TRIGGER_AU)
             self._fts_available = True
         except sqlite3.OperationalError:
             logger.debug("FTS5 not available, falling back to LIKE search")
             self._fts_available = False
+            return
+        # Schema-version guard: backfill existing chunks on first upgrade.
+        # v0 → pre-Phase-3 (no chunks_fts index); v1 → chunks backfilled.
+        cur_ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_ver < 1:
+            self._backfill_chunks_fts()
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
 
     # ── File CRUD ────────────────────────────────────────────────
 
@@ -398,6 +448,128 @@ class IndexDB:
             if clean:
                 tokens.append(f'"{clean}"')
         return " OR ".join(tokens)
+
+    # ── Chunk-level FTS5 search (Phase 3) ────────────────────────
+
+    def chunk_search(self, query: str, top_k: int = 10) -> list[dict]:
+        """Full-text search on chunk code content via FTS5.
+
+        Falls back to LIKE search if FTS5 is unavailable or query is malformed.
+        Returns up to ``top_k`` chunk dicts ordered by BM25 rank (best first).
+        """
+        if self._fts_available:
+            safe = self._sanitize_fts_query(query)
+            if safe:
+                try:
+                    rows = self.conn.execute(
+                        """SELECT c.file_path, c.chunk_idx, c.start_line, c.end_line,
+                                  c.text, rank AS score
+                           FROM index_chunks_fts f
+                           JOIN index_chunks c ON f.rowid = c.rowid
+                           WHERE index_chunks_fts MATCH ?
+                           ORDER BY rank
+                           LIMIT ?""",
+                        (safe, top_k),
+                    ).fetchall()
+                    return [
+                        {
+                            "file_path": r["file_path"],
+                            "chunk_idx": r["chunk_idx"],
+                            "start_line": r["start_line"],
+                            "end_line": r["end_line"],
+                            "text": r["text"],
+                            "score": abs(r["score"]) if r["score"] else 0,
+                        }
+                        for r in rows
+                    ]
+                except sqlite3.OperationalError:
+                    pass  # Fall through to LIKE
+        pat = f"%{query}%"
+        rows = self.conn.execute(
+            """SELECT file_path, chunk_idx, start_line, end_line, text, 0 AS score
+               FROM index_chunks
+               WHERE text LIKE ?
+               LIMIT ?""",
+            (pat, top_k),
+        ).fetchall()
+        return [
+            {
+                "file_path": r["file_path"],
+                "chunk_idx": r["chunk_idx"],
+                "start_line": r["start_line"],
+                "end_line": r["end_line"],
+                "text": r["text"],
+                "score": 0,
+            }
+            for r in rows
+        ]
+
+    def chunk_search_with_snippet(
+        self, query: str, top_k: int = 10,
+    ) -> list[dict]:
+        """FTS5-only chunk search returning BM25 rank + highlighted snippet.
+
+        Returns empty list if FTS5 is unavailable or query is malformed —
+        callers should fall back to ``chunk_search`` (LIKE) in those cases.
+        The snippet wraps matches in ``[...]`` and uses ``...`` ellipsis for
+        elided context, with up to 12 surrounding tokens.
+        """
+        if not self._fts_available:
+            return []
+        safe = self._sanitize_fts_query(query)
+        if not safe:
+            return []
+        try:
+            rows = self.conn.execute(
+                """SELECT c.file_path, c.chunk_idx, c.start_line, c.end_line,
+                          c.text,
+                          snippet(index_chunks_fts, -1, '[', ']', '...', 12)
+                              AS snippet_text,
+                          rank
+                   FROM index_chunks_fts f
+                   JOIN index_chunks c ON f.rowid = c.rowid
+                   WHERE index_chunks_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (safe, top_k),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            {
+                "file_path": r["file_path"],
+                "chunk_idx": r["chunk_idx"],
+                "start_line": r["start_line"],
+                "end_line": r["end_line"],
+                "text": r["text"],
+                "snippet": r["snippet_text"],
+                "rank": r["rank"],
+            }
+            for r in rows
+        ]
+
+    def _backfill_chunks_fts(self) -> int:
+        """Rebuild index_chunks_fts from index_chunks.
+
+        Uses the FTS5 'rebuild' command — triggers do not fire during rebuild.
+        Returns the row count in the FTS index after rebuild.
+        """
+        if not self._fts_available:
+            return 0
+        got = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("index_chunks_fts",),
+        ).fetchone()
+        if got is None:
+            return 0
+        self.conn.execute(
+            "INSERT INTO index_chunks_fts(index_chunks_fts) VALUES ('rebuild')"
+        )
+        n = self.conn.execute(
+            "SELECT count(*) FROM index_chunks_fts"
+        ).fetchone()[0]
+        self.conn.commit()
+        return n
 
     # ── Meta KV ──────────────────────────────────────────────────
 

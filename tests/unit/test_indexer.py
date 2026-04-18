@@ -754,3 +754,81 @@ class TestExcludePathsTopK:
                 assert len(correct) >= len(incorrect), (
                     "Correct ordering (exclude then truncate) must return at least as many results"
                 )
+
+
+# ===========================================================================
+# Phase 3.5 — mode="code" chunk search via MCP tool
+# ===========================================================================
+
+
+class TestIndexSearchCodeMode:
+    """index_search(mode='code') returns chunk hits from index_chunks with snippets."""
+
+    def test_code_mode_returns_chunk_hits(self, tmp_path, monkeypatch):
+        """mode='code' hits index_chunks.text and returns file_path:lines + snippet."""
+        from ccr.mcp import server as srv
+        from ccr.context.index_db import IndexDB
+        from ccr.mcp.index_tools import index_search
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "src").mkdir()
+        (project / "src" / "auth.py").write_text(
+            "def authenticate(user, password):\n"
+            "    return verify_password(user, password)\n"
+        )
+        db_path = project / ".ccr" / "index.db"
+        db_path.parent.mkdir(exist_ok=True)
+        db = IndexDB(str(db_path))
+        db.save_chunks_batch([{
+            "file_path": "src/auth.py",
+            "chunk_idx": 0,
+            "start_line": 1,
+            "end_line": 2,
+            "text": (
+                "def authenticate(user, password):\n"
+                "    return verify_password(user, password)"
+            ),
+        }])
+        monkeypatch.setattr(srv, "_project_root", str(project))
+        monkeypatch.setattr(srv, "_index_db", db)
+
+        result = index_search(query="authenticate", mode="code", top_k=5)
+        assert result["result_count"] >= 1
+        assert result["mode"] == "code"
+        assert "src/auth.py" in result["message"]
+        assert "authenticate" in result["message"]
+        db.close()
+
+    def test_code_mode_no_index_db(self, tmp_path, monkeypatch):
+        """mode='code' with no index_db returns a friendly error message."""
+        from ccr.mcp import server as srv
+        from ccr.mcp.index_tools import index_search
+
+        monkeypatch.setattr(srv, "_index_db", None)
+        result = index_search(query="anything", mode="code", top_k=5)
+        assert result["result_count"] == 0
+        assert result["mode"] == "code"
+        assert "index" in result["message"].lower()
+
+    def test_code_mode_no_matches(self, tmp_path, monkeypatch):
+        """mode='code' with index_db but zero hits returns empty message."""
+        from ccr.mcp import server as srv
+        from ccr.context.index_db import IndexDB
+        from ccr.mcp.index_tools import index_search
+
+        db_path = tmp_path / "index.db"
+        db = IndexDB(str(db_path))
+        db.save_chunks_batch([{
+            "file_path": "a.py",
+            "chunk_idx": 0,
+            "start_line": 1,
+            "end_line": 1,
+            "text": "hello world",
+        }])
+        monkeypatch.setattr(srv, "_index_db", db)
+
+        result = index_search(query="zzzznonexistent", mode="code", top_k=5)
+        assert result["result_count"] == 0
+        assert result["mode"] == "code"
+        db.close()

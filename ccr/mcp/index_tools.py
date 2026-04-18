@@ -176,6 +176,55 @@ def index_build(
         raise ToolError(f"{type(e).__name__}: {e}") from e
 
 
+def _code_mode_search(query: str, top_k: int) -> IndexSearchResult:
+    """Phase 3: chunk-level FTS5 search over ``index_chunks.text``.
+
+    Prefers ``chunk_search_with_snippet`` (FTS5 BM25 + bracketed snippet) and
+    falls back to ``chunk_search`` (LIKE substring) when FTS5 is unavailable
+    or the query is malformed.
+    """
+    db = getattr(_srv, "_index_db", None)
+    if db is None:
+        return IndexSearchResult(
+            result_count=0,
+            mode="code",
+            resolved_mode="code",
+            message="No SQLite index available. Run index_build first.",
+        )
+    hits: list[dict] = []
+    if getattr(db, "fts_available", False):
+        try:
+            hits = db.chunk_search_with_snippet(query, top_k=top_k)
+        except Exception:
+            hits = []
+    if not hits:
+        try:
+            hits = db.chunk_search(query, top_k=top_k)
+        except Exception:
+            hits = []
+    if not hits:
+        return IndexSearchResult(
+            result_count=0,
+            mode="code",
+            resolved_mode="code",
+            message=f"No code matches for '{query}'.",
+        )
+    lines = [f"# code search — {len(hits)} chunk hit(s) for '{query}'"]
+    for h in hits:
+        fp = h["file_path"]
+        sl, el = h["start_line"], h["end_line"]
+        snippet = h.get("snippet") or h.get("text", "")[:200]
+        snippet = snippet.replace("\n", " ")
+        lines.append(f"- {fp}:{sl}-{el}")
+        lines.append(f"    {snippet}")
+    return IndexSearchResult(
+        result_count=len(hits),
+        mode="code",
+        resolved_mode="code",
+        message="\n".join(lines),
+    )
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 def index_search(
     query: str,
@@ -190,7 +239,7 @@ def index_search(
 ) -> IndexSearchResult:
     """Search the repo index for files matching a query.
 
-    Four search modes:
+    Five search modes:
       - "keyword": Fast substring matching on paths, symbols, and content.
         Best for specific file names or symbol names.
       - "semantic": Meaning-based search using embeddings (or BM25 fallback).
@@ -201,10 +250,13 @@ def index_search(
         shape (A-RAG §3.2). Short/symbol queries → keyword; question-form
         queries → semantic; everything else → hybrid. resolved_mode in result
         shows which mode was chosen.
+      - "code": Chunk-level FTS5 search on indexed code content (Phase 3).
+        Returns hits as `path:start-end` with a BM25-ranked snippet. Falls
+        back to LIKE substring search if FTS5 is unavailable.
 
     Args:
         query: Search term or natural language description.
-        mode: "keyword", "semantic", "hybrid" (default), or "auto".
+        mode: "keyword", "semantic", "hybrid" (default), "auto", or "code".
         top_k: Maximum results to return (1-100, default 10).
         return_snippets: If True, include a brief code snippet in each result
             (hybrid mode only; requires chunk embeddings for semantic snippets,
@@ -222,13 +274,20 @@ def index_search(
             (A-RAG C^read filter). Useful to skip already-read files in
             multi-turn exploration sessions.
     """
-    if mode not in ("keyword", "semantic", "hybrid", "auto"):
-        raise ToolError(f"Invalid mode '{mode}'. Use 'keyword', 'semantic', 'hybrid', or 'auto'.")
+    if mode not in ("keyword", "semantic", "hybrid", "auto", "code"):
+        raise ToolError(
+            f"Invalid mode '{mode}'. Use 'keyword', 'semantic', 'hybrid', 'auto', or 'code'."
+        )
 
     # A-RAG §3.2: auto-detect mode from query shape
     resolved_mode = _detect_mode(query) if mode == "auto" else mode
 
     top_k = max(1, min(top_k, 100))  # M3: bound top_k to prevent excessive results
+
+    # Phase 3: mode="code" — chunk-level FTS5 search (doesn't require RepoIndex)
+    if resolved_mode == "code":
+        return _code_mode_search(query, top_k)
+
     idx = _srv._ensure_index()
 
     # Compute mode_hint suggestion upfront (independent of search results)
