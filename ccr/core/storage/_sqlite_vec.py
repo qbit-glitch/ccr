@@ -55,8 +55,10 @@ def install_vec(conn: sqlite3.Connection) -> bool:
     """Create ``commits_vec`` virtual table. Idempotent. Returns False if sqlite-vec missing."""
     if not vec_available(conn):
         return False
-    conn.execute(CREATE_COMMITS_VEC)
-    conn.commit()
+    # DDL autocommits in SQLite; wrapping in `with conn:` just ensures any
+    # in-flight implicit transaction from the caller doesn't tangle with us.
+    with conn:
+        conn.execute(CREATE_COMMITS_VEC)
     return True
 
 
@@ -75,12 +77,15 @@ def backfill_vec(conn: sqlite3.Connection, ccr_root: str) -> Dict[str, int]:
 
     legacy_db = os.path.join(ccr_root, "embeddings.db")
     if os.path.exists(legacy_db):
+        src = None
         try:
             import sqlite_vec  # soft dep
             src = sqlite3.connect(legacy_db)
             src.enable_load_extension(True)
-            sqlite_vec.load(src)
-            src.enable_load_extension(False)
+            try:
+                sqlite_vec.load(src)
+            finally:
+                src.enable_load_extension(False)
             rows = src.execute(
                 "SELECT id, embedding FROM vec_embeddings"
             ).fetchall()
@@ -93,9 +98,14 @@ def backfill_vec(conn: sqlite3.Connection, ccr_root: str) -> Dict[str, int]:
                 )
                 seen.add(cid)
                 counts["sqlite_vec"] += 1
-            src.close()
         except Exception as exc:
             logger.warning("backfill_vec: legacy embeddings.db import failed: %s", exc)
+        finally:
+            if src is not None:
+                try:
+                    src.close()
+                except Exception:
+                    pass
 
     legacy_json = os.path.join(ccr_root, "commit_embeddings.json.gz")
     if os.path.exists(legacy_json):
@@ -114,6 +124,6 @@ def backfill_vec(conn: sqlite3.Connection, ccr_root: str) -> Dict[str, int]:
         except Exception as exc:
             logger.warning("backfill_vec: gzip JSON import failed: %s", exc)
 
-    conn.commit()
+    # Caller wraps in `with self.memory_conn:` for atomicity w/ set_user_version.
     counts["total"] = counts["sqlite_vec"] + counts["gzip_json"]
     return counts

@@ -121,10 +121,10 @@ class TestSemanticSearch:
         assert {h["id"] for h in hits} == {"C100"}
         backend.close()
 
-    def test_semantic_search_rejects_wrong_dim(self, tmp_path):
+    def test_semantic_search_returns_empty_on_wrong_dim(self, tmp_path):
+        """Wrong-dim query silently returns [] so callers stay backend-agnostic."""
         backend = SqliteStorageBackend(str(tmp_path / "ccr"))
-        with pytest.raises(ValueError, match="dim"):
-            backend.commit_semantic_search("main", [0.1] * 10, top_k=5)
+        assert backend.commit_semantic_search("main", [0.1] * 10, top_k=5) == []
         backend.close()
 
 

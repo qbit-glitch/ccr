@@ -336,13 +336,19 @@ class SqliteConnectionManager:
         conn.row_factory = sqlite3.Row
         # Phase 4: Load sqlite-vec extension if available. Silent failure is
         # correct — backends probe vec_available() and fall back cleanly.
+        # try/finally ensures enable_load_extension(False) runs even if
+        # sqlite_vec.load() raises, closing the dynamic-loading window.
         try:
             import sqlite_vec  # soft dep
             conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except Exception:
-            pass
+            try:
+                sqlite_vec.load(conn)
+            finally:
+                conn.enable_load_extension(False)
+        except Exception as exc:
+            logger.debug(
+                "sqlite-vec not loaded (%s): %s", type(exc).__name__, exc,
+            )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -409,12 +415,16 @@ class SqliteStorageBackend(
 
         # Phase 4 migration: backfill legacy embeddings into commits_vec.
         # user_version 1 -> 2 guard (1 = Phase 2 FTS5 backfill complete).
+        # Wrapped in a single transaction so a crash between backfill and
+        # the user_version bump leaves user_version=1 (backfill re-runs,
+        # but INSERT OR REPLACE makes it idempotent).
         if self._vec_available:
             current_version = self._memory_mgr.get_user_version()
             if current_version < 2:
                 from ._sqlite_vec import backfill_vec
-                backfill_vec(self.memory_conn, ccr_root)
-                self._memory_mgr.set_user_version(2)
+                with self.memory_conn:
+                    backfill_vec(self.memory_conn, ccr_root)
+                    self._memory_mgr.set_user_version(2)
 
     def _ensure_phase1_tables(self) -> None:
         self.memory_conn.executescript(_PHASE1_TABLES)

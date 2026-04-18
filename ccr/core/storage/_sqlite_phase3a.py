@@ -114,12 +114,16 @@ class Phase3aMixin:
 
         Over-fetches 3x to tolerate branch filtering in the wrapping SELECT.
         Returns list of dicts with keys: id, title, raw_block, distance.
+        Returns [] on wrong-dim inputs so callers can remain backend-agnostic.
         """
         if not getattr(self, "_vec_available", False):
             return []
         if top_k <= 0:
             return []
-        blob = _serialize_vec(query_vec)  # raises ValueError on wrong dim
+        try:
+            blob = _serialize_vec(query_vec)
+        except ValueError:
+            return []
         fetch_k = max(top_k * 3, top_k)
         conn = self.memory_conn
         try:
@@ -154,6 +158,11 @@ class Phase3aMixin:
 
         vec0 does not honour INSERT OR REPLACE semantics, so we DELETE-then-INSERT
         inside a single transaction.
+
+        NOTE: vec0 virtual tables do not support FOREIGN KEY constraints. Any
+        future ``commit_delete`` MUST also ``DELETE FROM commits_vec`` to avoid
+        orphaned vectors. The ``commit_semantic_search`` JOIN drops orphans on
+        read, so stale vec rows are harmless at read time but waste space.
         """
         if not getattr(self, "_vec_available", False):
             return
