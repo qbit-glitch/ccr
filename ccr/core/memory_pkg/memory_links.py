@@ -11,11 +11,9 @@ and memory metrics — the shared infrastructure used by all sub-mixins.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
 
 from ccr.context.embeddings import get_embedding_model, load_embeddings, save_embeddings
 from ccr.core.memory_pkg.memory_links_clustering import LinkClusterMixin
@@ -45,59 +43,21 @@ class LinksMixin(LinkComputeMixin, LinkTraversalMixin, LinkClusterMixin):
     # --- Memory Metrics (ALMA-inspired retrieval parameter evolution) ---
 
     def _get_memory_metrics_path(self) -> str:
-        """Return path to .ccr/memory_metrics.json."""
         return os.path.join(self.ccr_root, "memory_metrics.json")
 
     def _increment_memory_metric(self, key: str, amount: int = 1) -> None:
-        """Thread-safe increment of a memory metric counter."""
-        path = self._get_memory_metrics_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-            if raw:
-                try:
-                    data = json.loads(raw)
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.warning("Failed to load %s: %s", path, exc)
-                    data = {}
-            else:
-                data = {}
-            data.setdefault("search_calls", 0)
-            data.setdefault("search_zero_results", 0)
-            data.setdefault("link_creations", 0)
-            data.setdefault("total_commits", 0)
-            data[key] = data.get(key, 0) + amount
-            data["last_updated"] = datetime.now(timezone.utc).isoformat()
-            self._write_file_unlocked(path, json.dumps(data, indent=2, ensure_ascii=False))
+        """Increment a memory metric counter via storage backend."""
+        self._storage.metrics_increment(key, amount)
 
     def get_memory_metrics(self) -> dict:
-        """Load and return current memory metrics. Returns zeros if no file."""
-        path = self._get_memory_metrics_path()
-        raw = self._read_file(path)
-        if not raw:
-            return {
-                "search_calls": 0,
-                "search_zero_results": 0,
-                "link_creations": 0,
-                "total_commits": 0,
-                "last_updated": "",
-            }
-        try:
-            data = json.loads(raw)
-            data.setdefault("search_calls", 0)
-            data.setdefault("search_zero_results", 0)
-            data.setdefault("link_creations", 0)
-            data.setdefault("total_commits", 0)
-            data.setdefault("last_updated", "")
-            return data
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("Failed to load %s: %s", path, exc)
-            return {
-                "search_calls": 0,
-                "search_zero_results": 0,
-                "link_creations": 0,
-                "total_commits": 0,
-                "last_updated": "",
-            }
+        """Load and return current memory metrics."""
+        data = self._storage.metrics_get()
+        data.setdefault("search_calls", 0)
+        data.setdefault("search_zero_results", 0)
+        data.setdefault("link_creations", 0)
+        data.setdefault("total_commits", 0)
+        data.setdefault("last_updated", "")
+        return data
 
     # --- Commit Embeddings ---
 
@@ -209,60 +169,19 @@ class LinksMixin(LinkComputeMixin, LinkTraversalMixin, LinkClusterMixin):
     # --- Link Graph Persistence ---
 
     def _load_links(self) -> dict:
-        """Load the commit link graph from JSON. Returns default if missing/corrupt."""
-        path = self._get_links_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-        if not raw:
-            return {"version": 1, "links": {}}
-        try:
-            data = json.loads(raw)
-            if not isinstance(data.get("links"), dict):
-                return {"version": 1, "links": {}}
-            return data
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("Failed to load %s: %s", path, exc)
-            return {"version": 1, "links": {}}
+        """Load the commit link graph via storage backend."""
+        return {"version": 1, "links": self._storage.link_get_all()}
 
     def _save_links(self, data: dict) -> None:
-        """Atomically save the commit link graph."""
+        """Atomically save the commit link graph (used by tests)."""
+        import json as _json
         path = self._get_links_path()
-        content = json.dumps(data, indent=2, ensure_ascii=False)
+        content = _json.dumps(data, indent=2, ensure_ascii=False)
         with self._locks[path], self._file_lock(path):
             self._write_file_unlocked(path, content)
-
-    def _update_links(self, commit_id: str, links: list[CommitLink]) -> None:
-        """Load, modify, and save links under a single lock (avoids TOCTOU)."""
-        path = self._get_links_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-            if not raw:
-                data: dict = {"version": 1, "links": {}}
-            else:
-                try:
-                    data = json.loads(raw)
-                    if not isinstance(data.get("links"), dict):
-                        data = {"version": 1, "links": {}}
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.warning("Failed to load %s: %s", path, exc)
-                    data = {"version": 1, "links": {}}
-            for cl in links:
-                self._add_link(data, commit_id, cl.target, cl)
-            self._prune_link_graph(data)
-            content = json.dumps(data, indent=2, ensure_ascii=False)
-            self._write_file_unlocked(path, content)
-        # Track link creation metrics (ALMA-inspired retrieval parameter evolution)
-        try:
-            self._increment_memory_metric("link_creations", len(links))
-        except Exception:
-            pass  # Metrics are supplementary — never fail the link update
 
     def _prune_link_graph(self, data: dict) -> None:
-        """Evict oldest commit nodes if graph exceeds link_graph_max_nodes.
-
-        Must be called under the links lock. Keeps the most recent N commit
-        nodes by numeric commit ID. Removes dangling edges from surviving nodes.
-        """
+        """Evict oldest commit nodes if graph exceeds link_graph_max_nodes."""
         links = data.get("links", {})
         max_nodes = self.config.link_graph_max_nodes
         if len(links) <= max_nodes:
@@ -279,7 +198,6 @@ class LinksMixin(LinkComputeMixin, LinkTraversalMixin, LinkClusterMixin):
         for cid in evict_set:
             del links[cid]
 
-        # Remove dangling edges from surviving nodes
         for typed_links in links.values():
             for lt in list(typed_links.keys()):
                 typed_links[lt] = [
@@ -288,3 +206,32 @@ class LinksMixin(LinkComputeMixin, LinkTraversalMixin, LinkClusterMixin):
                 ]
                 if not typed_links[lt]:
                     del typed_links[lt]
+
+    def _update_links(self, commit_id: str, links: list[CommitLink]) -> None:
+        """Insert bidirectional links and prune via storage backend."""
+        forward: list[dict] = []
+        reverse_by_target: dict[str, list[dict]] = {}
+        for cl in links:
+            entry = {
+                "target": cl.target,
+                "link_type": cl.link_type,
+                "score": cl.score,
+                "shared_files": cl.shared_files,
+                "snippet": cl.snippet,
+            }
+            forward.append(entry)
+            reverse_by_target.setdefault(cl.target, []).append({
+                "target": commit_id,
+                "link_type": cl.link_type,
+                "score": cl.score,
+                "shared_files": cl.shared_files,
+                "snippet": cl.snippet,
+            })
+        self._storage.link_insert_batch(commit_id, forward)
+        for target_id, rev_links in reverse_by_target.items():
+            self._storage.link_insert_batch(target_id, rev_links)
+        self._storage.link_prune(self.config.link_graph_max_nodes)
+        try:
+            self._increment_memory_metric("link_creations", len(links))
+        except Exception:
+            pass

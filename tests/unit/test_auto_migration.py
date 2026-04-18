@@ -12,14 +12,14 @@ from ccr.core.storage.sqlite_backend import SqliteStorageBackend
 from ccr.core.types import CCRConfig
 
 
-class TestSqliteDefault:
-    def test_default_is_sqlite(self):
+class TestStorageDefault:
+    def test_default_is_files(self):
         cfg = CCRConfig()
-        assert cfg.storage_backend == "sqlite"
-
-    def test_override_to_files(self):
-        cfg = CCRConfig(storage_backend="files")
         assert cfg.storage_backend == "files"
+
+    def test_override_to_sqlite(self):
+        cfg = CCRConfig(storage_backend="sqlite")
+        assert cfg.storage_backend == "sqlite"
 
 
 class TestNeedsMigration:

@@ -476,8 +476,8 @@ class CCRConfig:
     session_logging_enabled: bool = True
     session_db_path: str = ""          # defaults to .ccr/sessions.db when empty
     session_fts_enabled: bool = True   # FTS5 full-text search across turns
-    # Storage backend: "sqlite" (default, v4) or "files" (legacy flat-file)
-    storage_backend: str = "sqlite"
+    # Storage backend: "files" (default) or "sqlite" (v4 — opt-in until wiring complete)
+    storage_backend: str = "files"
 
 
 @dataclass

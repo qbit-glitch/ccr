@@ -68,15 +68,7 @@ class FileIOMixin:
     # --- Log ---
 
     def _append_log(self, branch: str, line: str) -> None:
-        path = self._get_log_path(branch)
-        with self._locks[path], self._file_lock(path):
-            content = self._read_file_unlocked(path) or ""
-            lines = content.strip().split("\n") if content.strip() else []
-            lines.append(line)
-            # Rotate
-            if len(lines) > self.config.log_max_lines:
-                lines = lines[-self.config.log_max_lines:]
-            self._write_file_unlocked(path, "\n".join(lines) + "\n")
+        self._storage.log_append(branch, line, self.config.log_max_lines)
 
     # --- Gitignore ---
 

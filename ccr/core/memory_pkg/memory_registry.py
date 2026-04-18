@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from typing import Any
-
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -100,32 +96,12 @@ class RegistryMixin:
     def _load_metadata(self) -> dict:
         from ccr.core.memory_pkg.memory_types import METADATA_TEMPLATE
 
-        path = self._get_metadata_path()
-        with self._locks[path]:
-            if not os.path.isfile(path):
-                return dict(METADATA_TEMPLATE)
-            with open(path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or dict(METADATA_TEMPLATE)
+        data = self._storage.metadata_load()
+        return data if data else dict(METADATA_TEMPLATE)
 
     def _save_metadata(self, data: dict) -> None:
-        """Save metadata atomically via tmp + fsync + os.replace (H4)."""
-        path = self._get_metadata_path()
-        with self._locks[path]:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            content = yaml.dump(data, default_flow_style=False, sort_keys=False, Dumper=yaml.SafeDumper)
-            tmp_path = path + ".tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+        """Save metadata via storage backend."""
+        self._storage.metadata_save(data)
 
     def _update_metadata_branch(self, name: str, status: str, created: str, parent: str) -> None:
         meta = self._load_metadata()

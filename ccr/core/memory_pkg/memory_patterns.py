@@ -8,7 +8,6 @@ update_pattern_quality, get_patterns, _pattern_recency_weight_at.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -30,27 +29,12 @@ class PatternsMixin:
         return os.path.join(self.ccr_root, "patterns.json")
 
     def _load_patterns(self) -> dict:
-        """Load pattern buffer from JSON. Returns default if missing/corrupt."""
-        path = self._get_patterns_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-        if not raw:
-            return {"version": 1, "patterns": {}, "next_id": 1}
-        try:
-            data = json.loads(raw)
-            if not isinstance(data.get("patterns"), dict):
-                return {"version": 1, "patterns": {}, "next_id": 1}
-            return data
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("Failed to load %s: %s", path, exc)
-            return {"version": 1, "patterns": {}, "next_id": 1}
+        """Load pattern buffer via storage backend."""
+        return self._storage.pattern_load_all()
 
     def _save_patterns(self, data: dict) -> None:
-        """Atomically save the pattern buffer."""
-        path = self._get_patterns_path()
-        content = json.dumps(data, indent=2, ensure_ascii=False)
-        with self._locks[path], self._file_lock(path):
-            self._write_file_unlocked(path, content)
+        """Save the pattern buffer via storage backend."""
+        self._storage.pattern_save_all(data)
 
     def _find_matching_pattern(self, data: dict, new_text: str) -> str | None:
         """Find existing pattern matching new_text. Primary: ONNX cosine. Fallback: word Jaccard.
@@ -98,70 +82,49 @@ class PatternsMixin:
         Returns list of promotion suggestion dicts for patterns that crossed
         the promotion threshold.
         """
-        path = self._get_patterns_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-            if not raw:
-                data: dict = {"version": 1, "patterns": {}, "next_id": 1}
+        data = self._load_patterns()
+        promotion_suggestions: list[dict] = []
+
+        for pattern_text in patterns:
+            pattern_text = pattern_text.strip()
+            if not pattern_text:
+                continue
+
+            matched_id = self._find_matching_pattern(data, pattern_text)
+
+            if matched_id:
+                entry = data["patterns"][matched_id]
+                if commit_id not in entry.get("commit_ids", []):
+                    entry.setdefault("commit_ids", []).append(commit_id)
+                    entry["occurrence_count"] = len(entry["commit_ids"])
+                entry["last_seen"] = timestamp
+
+                if (entry.get("occurrence_count", 0) >= self.config.pattern_promotion_count
+                        and not entry.get("promoted", False)):
+                    promotion_suggestions.append({
+                        "pattern_id": matched_id,
+                        "text": entry["text"],
+                        "count": entry["occurrence_count"],
+                        "commit_ids": entry.get("commit_ids", []),
+                    })
             else:
-                try:
-                    data = json.loads(raw)
-                    if not isinstance(data.get("patterns"), dict):
-                        data = {"version": 1, "patterns": {}, "next_id": 1}
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.warning("Failed to load %s: %s", path, exc)
-                    data = {"version": 1, "patterns": {}, "next_id": 1}
+                pid = f"P{data['next_id']:03d}"
+                data["next_id"] = data["next_id"] + 1
+                data["patterns"][pid] = {
+                    "text": pattern_text,
+                    "first_seen": commit_id,
+                    "commit_ids": [commit_id],
+                    "occurrence_count": 1,
+                    "created_at": timestamp,
+                    "promoted": False,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "quality_score": 0.5,
+                    "last_quality_update": "",
+                }
 
-            promotion_suggestions: list[dict] = []
-
-            for pattern_text in patterns:
-                pattern_text = pattern_text.strip()
-                if not pattern_text:
-                    continue
-
-                # Dedup: find existing pattern with word Jaccard >= threshold
-                matched_id = self._find_matching_pattern(data, pattern_text)
-
-                if matched_id:
-                    # Update existing pattern's occurrence
-                    entry = data["patterns"][matched_id]
-                    if commit_id not in entry["commit_ids"]:
-                        entry["commit_ids"].append(commit_id)
-                        entry["occurrence_count"] = len(entry["commit_ids"])
-                    # CER recency tracking: update last_seen timestamp
-                    entry["last_seen"] = timestamp
-
-                    # Check promotion threshold
-                    if (entry["occurrence_count"] >= self.config.pattern_promotion_count
-                            and not entry.get("promoted", False)):
-                        promotion_suggestions.append({
-                            "pattern_id": matched_id,
-                            "text": entry["text"],
-                            "count": entry["occurrence_count"],
-                            "commit_ids": entry["commit_ids"],
-                        })
-                else:
-                    # New pattern — add to buffer
-                    pid = f"P{data['next_id']:03d}"
-                    data["next_id"] = data["next_id"] + 1
-                    data["patterns"][pid] = {
-                        "text": pattern_text,
-                        "first_seen": commit_id,
-                        "commit_ids": [commit_id],
-                        "occurrence_count": 1,
-                        "created_at": timestamp,
-                        "promoted": False,
-                        "success_count": 0,
-                        "failure_count": 0,
-                        "quality_score": 0.5,
-                        "last_quality_update": "",
-                    }
-
-            # Buffer size enforcement (CER S3.1 Dynamic Buffer)
-            self._enforce_pattern_buffer_size(data)
-
-            content = json.dumps(data, indent=2, ensure_ascii=False)
-            self._write_file_unlocked(path, content)
+        self._enforce_pattern_buffer_size(data)
+        self._save_patterns(data)
 
         return promotion_suggestions
 
@@ -229,28 +192,18 @@ class PatternsMixin:
 
         Returns: number of patterns marked promoted.
         """
-        path = self._get_patterns_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-            if not raw:
-                return 0
-            try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, TypeError) as exc:
-                logger.warning("Failed to load %s: %s", path, exc)
-                return 0
+        data = self._load_patterns()
+        matched_id = self._find_matching_pattern(data, text)
+        if matched_id is None:
+            return 0
 
-            matched_id = self._find_matching_pattern(data, text)
-            if matched_id is None:
-                return 0
+        entry = data["patterns"][matched_id]
+        if entry.get("promoted", False):
+            return 0
 
-            entry = data["patterns"][matched_id]
-            if entry.get("promoted", False):
-                return 0  # Already promoted
-
-            entry["promoted"] = True
-            self._write_file_unlocked(path, json.dumps(data, indent=2))
+        if self._storage.pattern_update(matched_id, {"promoted": True}):
             return 1
+        return 0
 
     def update_pattern_quality(self, pattern_text: str, success: bool) -> bool:
         """Update quality score for a pattern based on its promoted bullet's performance.
@@ -267,41 +220,23 @@ class PatternsMixin:
         Returns:
             True if a matching pattern was found and updated.
         """
-        path = self._get_patterns_path()
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-            if not raw:
-                return False
-            try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, TypeError) as exc:
-                logger.warning("Failed to load %s: %s", path, exc)
-                return False
+        data = self._load_patterns()
+        match_pid = self._find_matching_pattern(data, pattern_text)
+        if match_pid is None:
+            return False
 
-            # Find matching pattern by word Jaccard
-            match_pid = self._find_matching_pattern(data, pattern_text)
-            if match_pid is None:
-                return False
+        p = data["patterns"][match_pid]
+        sc = p.get("success_count", 0) + (1 if success else 0)
+        fc = p.get("failure_count", 0) + (0 if success else 1)
+        quality_score = (sc + 1) / (sc + fc + 2)
 
-            p = data["patterns"][match_pid]
-            # Ensure quality fields exist (backward compat with old format)
-            p.setdefault("success_count", 0)
-            p.setdefault("failure_count", 0)
-            if success:
-                p["success_count"] += 1
-            else:
-                p["failure_count"] += 1
-
-            # Recompute Bayesian quality score
-            sc = p["success_count"]
-            fc = p["failure_count"]
-            p["quality_score"] = (sc + 1) / (sc + fc + 2)
-            p["last_quality_update"] = datetime.now(timezone.utc).isoformat()
-
-            self._write_file_unlocked(
-                path, json.dumps(data, indent=2, ensure_ascii=False)
-            )
-            return True
+        updates = {
+            "success_count": sc,
+            "failure_count": fc,
+            "quality_score": quality_score,
+            "last_quality_update": datetime.now(timezone.utc).isoformat(),
+        }
+        return self._storage.pattern_update(match_pid, updates)
 
     def get_patterns(
         self,

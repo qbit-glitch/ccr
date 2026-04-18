@@ -11,7 +11,6 @@ Methods:
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 logger = logging.getLogger(__name__)
@@ -21,17 +20,8 @@ class RollingSummaryMixin:
     """Rolling summary management methods for MemoryManager."""
 
     def _get_rolling_summary(self, branch: str) -> str:
-        """Read the current rolling summary S_{t-1} from commits.md."""
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return ""
-        match = re.search(r"## Rolling Summary\n(.*?)(?=\n---|\n# |\Z)", content, re.DOTALL)
-        if match:
-            summary = match.group(1).strip()
-            if summary == "(none yet)":
-                return ""
-            return summary
-        return ""
+        """Read the current rolling summary via storage backend."""
+        return self._storage.rolling_summary_get(branch)
 
     def _update_rolling_summary(
         self, branch: str, what: str, why: str, next_step: str,
@@ -203,16 +193,6 @@ class RollingSummaryMixin:
         return result
 
     def _write_rolling_summary(self, branch: str, summary: str) -> None:
-        """Write the rolling summary into the commits.md file."""
-        path = self._get_commits_path(branch)
-        with self._locks[path], self._file_lock(path):
-            content = self._read_file_unlocked(path) or ""
-            content = re.sub(
-                r"(## Rolling Summary\n).*?(?=\n---|\n# |\Z)",
-                lambda m: f"{m.group(1)}{summary}\n",
-                content,
-                count=1,
-                flags=re.DOTALL,
-            )
-            self._write_file_unlocked(path, content)
+        """Write the rolling summary via storage backend."""
+        self._storage.rolling_summary_set(branch, summary)
         self._invalidate_commit_index(branch)

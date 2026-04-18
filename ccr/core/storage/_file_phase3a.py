@@ -69,7 +69,41 @@ class FilePhase3aMixin:
         return results
 
     def commit_insert(self, branch: str, data: dict) -> None:
-        pass
+        path = self._commits_path(branch)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw_block = data.get("raw_block", "")
+        if not raw_block:
+            return
+
+        with self._lock:
+            content = ""
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+
+            # TOCTOU: re-derive correct ID from content inside lock
+            matches = re.findall(r"\[C(\d{3,})\]", content)
+            correct_id = f"C{max(int(m) for m in matches) + 1:03d}" if matches else "C001"
+            id_match = re.search(r"## \[(C\d{3,})\]", raw_block)
+            if id_match:
+                stale_id = id_match.group(1)
+                if stale_id != correct_id:
+                    raw_block = raw_block.replace(f"[{stale_id}]", f"[{correct_id}]", 1)
+
+            anchor = "# Milestone Journal\n\n"
+            idx = content.find(anchor)
+            if idx >= 0:
+                insert_at = idx + len(anchor)
+                content = content[:insert_at] + raw_block + content[insert_at:]
+            else:
+                content = content + "\n" + raw_block
+
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
 
     def commit_get(self, branch: str, commit_id: str) -> dict | None:
         for c in self._parse_all_commits(branch):

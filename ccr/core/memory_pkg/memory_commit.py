@@ -199,7 +199,20 @@ class CommitMixin:
         if ota_slice:
             entry = entry.removesuffix("---\n\n") + f"**OTA Trace**: {ota_slice}\n\n---\n\n"
 
-        self._prepend_commit(branch, entry)
+        self._prepend_commit(branch, entry, data={
+            "id": commit_id,
+            "timestamp": now,
+            "title": title,
+            "what": what,
+            "why": why,
+            "files": files_changed,
+            "next_step": next_step,
+            "patterns": patterns_learned,
+            "score": admission_score_value,
+            "author": author,
+            "ci_context": ci_context,
+            "experiment": experiment,
+        })
 
         # Track commit count (ALMA-inspired retrieval parameter evolution)
         try:
@@ -310,68 +323,12 @@ class CommitMixin:
     # --- Admission Control (A-MAC inspired) ---
 
     def _parse_recent_commit_data(self, branch: str, k: int = 3) -> list[dict[str, Any]]:
-        """Parse last k commits from commits.md into structured dicts.
+        """Get last k commits via storage backend.
 
         Returns list of dicts, each with:
             id, timestamp, title, what, why, files (list[str]), next
         """
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return []
-        parts = re.split(r"(?=## \[C\d{3,}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
-
-        results = []
-        for part in commit_parts[:k]:
-            data: dict[str, Any] = {}
-            # Parse header: ## [C021] 2026-03-10 22:25 | branch:main | Title
-            header_match = re.match(
-                r"## \[(C\d{3,})\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|[^|]*\|\s*(.*)",
-                part.strip(),
-            )
-            if header_match:
-                data["id"] = header_match.group(1)
-                data["timestamp"] = header_match.group(2)
-                data["title"] = header_match.group(3).strip()
-            else:
-                continue
-
-            # Parse fields
-            what_match = re.search(r"\*\*What\*\*:\s*(.*)", part)
-            why_match = re.search(r"\*\*Why\*\*:\s*(.*)", part)
-            files_match = re.search(r"\*\*Files\*\*:\s*(.*)", part)
-            next_match = re.search(r"\*\*Next\*\*:\s*(.*)", part)
-            score_match = re.search(r"\*\*Score\*\*:\s*([\d.]+)", part)
-
-            data["what"] = what_match.group(1).strip() if what_match else ""
-            data["why"] = why_match.group(1).strip() if why_match else ""
-            data["next"] = next_match.group(1).strip() if next_match else ""
-
-            # Stored admission score (None if not present — backward compat)
-            if score_match:
-                try:
-                    data["stored_score"] = float(score_match.group(1))
-                except (ValueError, TypeError):
-                    data["stored_score"] = None
-            else:
-                data["stored_score"] = None
-
-            files_str = files_match.group(1).strip() if files_match else ""
-            if files_str and files_str != "(none)":
-                data["files"] = [f.strip() for f in files_str.split(",") if f.strip()]
-            else:
-                data["files"] = []
-
-            # CER patterns (backward compatible — empty list if absent)
-            patterns_match = re.search(r"\*\*Patterns\*\*:\s*(.*)", part)
-            if patterns_match:
-                raw_patterns = patterns_match.group(1).strip()
-                data["patterns"] = [p.strip() for p in raw_patterns.split("|") if p.strip()]
-            else:
-                data["patterns"] = []
-
-            results.append(data)
-        return results
+        return self._storage.commit_list(branch, limit=k)
 
     def _merge_into_last_commit(
         self,
@@ -482,15 +439,8 @@ class CommitMixin:
         return commit_id
 
     def _get_next_commit_id(self, branch: str) -> str:
-        """Parse latest C### from commits.md and increment."""
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return "C001"
-        matches = re.findall(r"\[C(\d{3,})\]", content)
-        if not matches:
-            return "C001"
-        latest = max(int(m) for m in matches)
-        return f"C{latest + 1:03d}"
+        """Get next C### ID via storage backend."""
+        return self._storage.commit_get_next_id(branch)
 
     def _parse_next_commit_id(self, content: str) -> str:
         """Extract next C### from already-read commits content. No I/O."""
@@ -502,27 +452,16 @@ class CommitMixin:
         latest = max(int(m) for m in matches)
         return f"C{latest + 1:03d}"
 
-    def _prepend_commit(self, branch: str, entry: str) -> None:
-        """Insert commit at top of Milestone Journal section."""
-        path = self._get_commits_path(branch)
-        with self._locks[path], self._file_lock(path):
-            content = self._read_file_unlocked(path) or ""
-            # Fix TOCTOU: re-derive correct ID inside the lock
-            correct_id = self._parse_next_commit_id(content)
-            id_match = re.search(r"## \[(C\d{3,})\]", entry)
-            if id_match:
-                stale_id = id_match.group(1)
-                if stale_id != correct_id:
-                    entry = entry.replace(f"[{stale_id}]", f"[{correct_id}]", 1)
-            anchor = "# Milestone Journal\n\n"
-            idx = content.find(anchor)
-            if idx >= 0:
-                insert_at = idx + len(anchor)
-                content = content[:insert_at] + entry + content[insert_at:]
-            else:
-                content = content + "\n" + entry
-            self._write_file_unlocked(path, content)
-            self._invalidate_commit_index(branch)
+    def _prepend_commit(self, branch: str, entry: str, *, data: dict | None = None) -> None:
+        """Insert commit at top of Milestone Journal via storage backend."""
+        commit_data = dict(data) if data else {}
+        commit_data["raw_block"] = entry
+        if "id" not in commit_data:
+            m = re.search(r"## \[(C\d{3,})\]", entry)
+            if m:
+                commit_data["id"] = m.group(1)
+        self._storage.commit_insert(branch, commit_data)
+        self._invalidate_commit_index(branch)
 
     def _update_main_milestones(self, date: str, branch: str, title: str) -> None:
         """Update Recent Milestones in main.md."""
@@ -549,13 +488,8 @@ class CommitMixin:
             self._write_file_unlocked(path, content)
 
     def _read_recent_commits(self, branch: str, count: int) -> str:
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return ""
-        # Split by ## [C markers
-        parts = re.split(r"(?=## \[C\d{3,}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
-        return "\n".join(commit_parts[:count])
+        records = self._storage.commit_list(branch, limit=count)
+        return "\n".join(r.get("raw_block", "") for r in records if r.get("raw_block"))
 
     def _update_current_focus(self, title: str, next_step: str) -> None:
         """Update the Current Focus section in main.md."""

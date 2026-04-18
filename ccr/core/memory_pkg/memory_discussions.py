@@ -126,24 +126,26 @@ class DiscussionsMixin:
         uncertainty: str = "",
         linked_commit: str | None = None,
     ) -> dict[str, Any]:
-        """Append a discussion record to discussions.md.
+        """Append a discussion record via storage backend.
 
         Returns dict with id, date, topic, message (formatted block).
         """
         branch = self.get_active_branch()
-        disc_path = self._get_discussions_path(branch)
-
-        # Read existing to find next ID
-        existing_text = ""
-        if os.path.isfile(disc_path):
-            try:
-                with open(disc_path, "r", encoding="utf-8") as f:
-                    existing_text = f.read()
-            except OSError:
-                pass
-
-        disc_id = _next_discussion_id(existing_text)
+        disc_id = self._storage.discussion_get_next_id(branch)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+        data = {
+            "id": disc_id,
+            "timestamp": now,
+            "topic": topic,
+            "hypothesis": hypothesis,
+            "alternatives": alternatives_considered,
+            "decision": decision,
+            "rationale": rationale,
+            "uncertainty": uncertainty,
+            "linked_commit": linked_commit or "",
+        }
+        self._storage.discussion_insert(branch, data)
 
         lines = [
             f"## [{disc_id}] {now} | {topic}",
@@ -157,38 +159,11 @@ class DiscussionsMixin:
         if linked_commit:
             lines.append(f"**Linked Commit**: {linked_commit}")
 
-        block = "\n".join(lines) + "\n\n---\n\n"
-
-        # Ensure parent directory exists
-        os.makedirs(os.path.dirname(disc_path), exist_ok=True)
-
-        # Prepend new discussion (most recent first, consistent with commits.md)
-        header = "# CCR Discussion Log\n\n"
-        if existing_text.startswith(header):
-            new_text = header + block + existing_text[len(header):]
-        elif existing_text:
-            new_text = block + existing_text
-        else:
-            new_text = header + block
-
-        tmp_path = disc_path + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
-            os.replace(tmp_path, disc_path)
-        except OSError:
-            if os.path.isfile(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            raise
-
         return {
             "id": disc_id,
             "date": now,
             "topic": topic,
-            "message": block.strip(),
+            "message": "\n".join(lines),
         }
 
     def get_discussions(
@@ -197,7 +172,7 @@ class DiscussionsMixin:
         topic: str | None = None,
         date_range: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Query discussion records.
+        """Query discussion records via storage backend.
 
         Args:
             search: Full-text substring match (case-insensitive) across all fields.
@@ -208,48 +183,15 @@ class DiscussionsMixin:
             dict with count, records, message (formatted markdown).
         """
         branch = self.get_active_branch()
-        disc_path = self._get_discussions_path(branch)
+        records = self._storage.discussion_list(branch, search, topic, date_range)
 
-        if not os.path.isfile(disc_path):
-            return {"count": 0, "records": [], "message": "No discussions logged yet."}
-
-        try:
-            with open(disc_path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except OSError:
-            return {"count": 0, "records": [], "message": "Could not read discussions file."}
-
-        records = _parse_discussion_blocks(text)
-
-        if topic:
-            records = [r for r in records if r["topic"].lower() == topic.lower()]
-
-        if search:
-            needle = search.lower()
-            def _matches(r: dict) -> bool:
-                haystack = " ".join(str(v) for v in r.values()).lower()
-                return needle in haystack
-            records = [r for r in records if _matches(r)]
-
-        if date_range and len(date_range) >= 2:
-            try:
-                from datetime import datetime as _dt, timezone as _tz
-                start = _dt.fromisoformat(date_range[0]).replace(tzinfo=_tz.utc)
-                end = _dt.fromisoformat(date_range[1]).replace(tzinfo=_tz.utc)
-                filtered = []
-                for r in records:
-                    try:
-                        dt = _dt.fromisoformat(r["date"].replace(" ", "T") + ":00+00:00")
-                        if start <= dt <= end:
-                            filtered.append(r)
-                    except (ValueError, TypeError):
-                        filtered.append(r)
-                records = filtered
-            except (ValueError, TypeError) as exc:
-                logger.warning("date_range parse failed: %s", exc)
+        for r in records:
+            if "timestamp" in r and "date" not in r:
+                r["date"] = r["timestamp"]
 
         if not records:
-            return {"count": 0, "records": [], "message": "No matching discussions found."}
+            msg = "No discussions logged yet." if not (search or topic or date_range) else "No matching discussions found."
+            return {"count": 0, "records": [], "message": msg}
 
         lines = [
             "| ID | Date | Topic | Decision | Rationale |",
@@ -257,8 +199,8 @@ class DiscussionsMixin:
         ]
         for r in records:
             lines.append(
-                f"| {r['id']} | {r['date']} | {r['topic'][:50]} "
-                f"| {r['decision'][:50]} | {r['rationale'][:60]} |"
+                f"| {r['id']} | {r.get('date', r.get('timestamp', ''))} | {r.get('topic', '')[:50]} "
+                f"| {r.get('decision', '')[:50]} | {r.get('rationale', '')[:60]} |"
             )
 
         return {"count": len(records), "records": records, "message": "\n".join(lines)}

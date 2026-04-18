@@ -18,6 +18,8 @@ class FakeMemory(DiscussionsMixin):
     def __init__(self, ccr_root: str):
         self.ccr_root = ccr_root
         self._branch = "main"
+        from ccr.core.storage import get_backend
+        self._storage = get_backend("files", ccr_root)
 
     def get_active_branch(self) -> str:
         return self._branch

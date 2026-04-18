@@ -121,7 +121,8 @@ def _init(project_root: str | None = None) -> None:
     global _session_store, _session_db_path, _current_session_id
 
     _project_root = os.path.abspath(project_root or os.getcwd())
-    storage_backend = os.environ.get("CCR_STORAGE_BACKEND", "sqlite")
+    _default_backend = CCRConfig().storage_backend
+    storage_backend = os.environ.get("CCR_STORAGE_BACKEND", _default_backend)
     _memory = MemoryManager(_project_root, CCRConfig(storage_backend=storage_backend))
     _memory.ensure_structure()
 

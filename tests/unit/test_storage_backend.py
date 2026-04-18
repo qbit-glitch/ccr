@@ -51,9 +51,9 @@ class TestGetBackend:
 
     def test_config_storage_backend_field(self):
         cfg = CCRConfig()
-        assert cfg.storage_backend == "sqlite"
-        cfg2 = CCRConfig(storage_backend="files")
-        assert cfg2.storage_backend == "files"
+        assert cfg.storage_backend == "files"
+        cfg2 = CCRConfig(storage_backend="sqlite")
+        assert cfg2.storage_backend == "sqlite"
 
 
 # ── SqliteConnectionManager ─────────────────────────────────────

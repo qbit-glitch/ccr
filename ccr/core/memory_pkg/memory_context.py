@@ -84,7 +84,7 @@ class ContextMixin:
         if main_content:
             parts.append(f"# Project Overview\n{main_content}")
         # Include generated overview if available (TiMem L5 profile)
-        overview = self._read_file(self._get_overview_path())
+        overview = self._storage.project_state_get("overview")
         if overview:
             parts.append(f"# Project Summary\n{overview}")
 
@@ -250,22 +250,13 @@ class ContextMixin:
     # --- Commit index (lazy-built, auto-invalidated) ---
 
     def _build_commit_index(self, branch: str) -> dict[str, str]:
-        """Parse commits.md once and build {commit_id: text_block} index.
+        """Build {commit_id: text_block} index via storage backend.
 
         Lazily called by _find_commit_by_id on cache miss. The index is
-        invalidated by _invalidate_commit_index whenever commits.md is mutated
-        (_prepend_commit, _merge_into_last_commit, _update_branch_conclusion).
+        invalidated by _invalidate_commit_index whenever commits are mutated.
         """
-        content = self._read_file(self._get_commits_path(branch))
-        index: dict[str, str] = {}
-        if not content:
-            self._commit_index[branch] = index
-            return index
-        parts = re.split(r"(?=## \[C\d{3,}\])", content)
-        for part in parts:
-            id_match = re.match(r"## \[(C\d{3,})\]", part.strip())
-            if id_match:
-                index[id_match.group(1)] = part.strip()
+        records = self._storage.commit_list(branch, limit=9999)
+        index = {r["id"]: r.get("raw_block", "") for r in records}
         self._commit_index[branch] = index
         return index
 
@@ -274,14 +265,14 @@ class ContextMixin:
         self._commit_index.pop(branch, None)
 
     def _find_commit_by_id(self, branch: str, commit_id: str) -> str:
-        """O(1) commit lookup using in-memory index (lazy-built, auto-invalidated)."""
+        """O(1) commit lookup using in-memory index, with backend fallback."""
         if branch not in self._commit_index:
             self._build_commit_index(branch)
         result = self._commit_index[branch].get(commit_id, "")
         if not result:
-            # Cache miss after index exists — rebuild once in case file changed externally
-            self._build_commit_index(branch)
-            result = self._commit_index[branch].get(commit_id, "")
+            record = self._storage.commit_get(branch, commit_id)
+            if record:
+                result = record.get("raw_block", "")
         return result
 
     # --- Search ---
@@ -338,32 +329,20 @@ class ContextMixin:
     def _search_commits(self, branch: str, term: str, max_results: int = 5) -> str:
         """Search commits using 3-phase strategy: exact -> semantic -> BM25.
 
-        Phase 1: Exact substring match (existing behavior, always first).
+        Phase 1: Exact text search via storage backend.
         Phase 2: ONNX embedding cosine similarity (when available).
         Phase 3: BM25 fallback (when ONNX unavailable and exact finds nothing).
-
-        Inspired by ExpRAG (arXiv:2603.18272) embedding-based experience retrieval.
         """
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return ""
-        parts = re.split(r"(?=## \[C\d{3,}\])", content)
+        # Phase 1: Text search via backend
+        text_results = self._storage.commit_search_text(branch, term, max_results)
+        exact_matches = [r.get("raw_block", "").strip() for r in text_results if r.get("raw_block")]
 
-        # Phase 1: Exact substring match
-        exact_matches = [p.strip() for p in parts if term.lower() in p.lower()]
-
-        # Extract commit IDs from exact matches to avoid duplicates
-        exact_ids: set[str] = set()
-        for m in exact_matches:
-            id_match = re.search(r"\[C(\d{3,})\]", m)
-            if id_match:
-                exact_ids.add(f"C{id_match.group(1)}")
+        exact_ids: set[str] = {r["id"] for r in text_results}
 
         remaining = max_results - len(exact_matches)
         semantic_matches: list[str] = []
 
         if remaining > 0:
-            # Phase 2: Semantic search via embeddings
             model = get_embedding_model()
             if model is not None:
                 try:
@@ -374,7 +353,7 @@ class ContextMixin:
                     if all_embeddings:
                         ids = list(all_embeddings.keys())
                         vecs = np.stack([all_embeddings[cid] for cid in ids])
-                        scores = vecs @ query_vec  # cosine (L2-normalized)
+                        scores = vecs @ query_vec
                         ranked = sorted(zip(ids, scores), key=lambda x: -x[1])
                         for cid, score in ranked:
                             if score < 0.3 or cid in exact_ids:
@@ -385,40 +364,34 @@ class ContextMixin:
                             if len(semantic_matches) >= remaining:
                                 break
                 except Exception:
-                    pass  # Fall through to BM25
+                    pass
 
-            # Phase 3: BM25 fallback when no ONNX and exact found nothing
             if not semantic_matches and not exact_matches:
+                all_records = self._storage.commit_list(branch, limit=9999)
+                parts = [r.get("raw_block", "") for r in all_records if r.get("raw_block")]
                 bm25_results = self._bm25_search_commits(parts, term, remaining)
                 semantic_matches = [block for _, block in bm25_results]
 
-        # Merge: exact first, then semantic/BM25
         combined = exact_matches[:max_results]
         remaining = max_results - len(combined)
         if remaining > 0 and semantic_matches:
             combined.extend(semantic_matches[:remaining])
 
-        # Track memory metrics (ALMA-inspired retrieval parameter evolution)
         result = "\n\n".join(combined[:max_results])
         try:
             self._increment_memory_metric("search_calls")
             if not result.strip():
                 self._increment_memory_metric("search_zero_results")
         except Exception:
-            pass  # Metrics are supplementary — never fail the search
+            pass
         return result
 
     # --- Windowed retrieval helpers ---
 
     def _read_commits_window(self, branch: str, offset: int, count: int) -> str:
-        """Read a window of commits: [offset:offset+count] from most recent."""
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return ""
-        parts = re.split(r"(?=## \[C\d{3,}\])", content)
-        commit_parts = [p for p in parts if re.match(r"## \[C\d{3,}\]", p.strip())]
-        windowed = commit_parts[offset:offset + count]
-        return "\n".join(windowed)
+        """Read a window of commits via storage backend."""
+        records = self._storage.commit_list(branch, limit=count, offset=offset)
+        return "\n".join(r.get("raw_block", "") for r in records if r.get("raw_block"))
 
     def _inject_evolved_tags(self, commits_text: str) -> str:
         """Replace **What**: <original> with **What** [evolved]: <evolved> for evolved commits.
@@ -453,14 +426,12 @@ class ContextMixin:
         return "".join(processed)
 
     def _read_log_window(self, branch: str, count: int) -> str:
-        """Read last N OTA entries from the branch log."""
-        content = self._read_file(self._get_log_path(branch))
+        """Read last N OTA entries from the branch log via storage backend."""
+        content = self._storage.log_read(branch, count * 10)
         if not content:
             return ""
-        # Split by OTA entry markers
         entries = re.split(r"(?=---\n\*\*\[OTA-)", content)
         entries = [e for e in entries if e.strip()]
-        # Also handle table-format entries
         if not entries:
             lines = content.strip().split("\n")
             return "\n".join(lines[-count:])

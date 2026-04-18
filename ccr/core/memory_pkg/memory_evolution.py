@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 
 from ccr.core.memory_pkg.memory_types import EvolvedSummary
@@ -26,52 +25,32 @@ class EvolutionMixin:
 
     # --- A-MEM Evolved Summary Storage (S3.3 Eq.7) ---
 
-    @property
-    def _evolved_path(self) -> str:
-        return os.path.join(self.ccr_root, "evolved_summaries.json")
-
     def _load_evolved_summaries(self) -> None:
-        """Load evolved summary overlays from JSON. Non-destructive if missing."""
-        path = self._evolved_path
-        with self._locks[path], self._file_lock(path):
-            raw = self._read_file_unlocked(path)
-        if not raw:
-            return
+        """Load evolved summary overlays from storage backend."""
         try:
-            data = json.loads(raw)
-            entries = data.get("evolved", {})
+            entries = self._storage.evolved_summary_all()
             for commit_id, ev in entries.items():
                 self._evolved_summaries[commit_id] = EvolvedSummary(
-                    commit_id=ev["commit_id"],
-                    evolved_what=ev["evolved_what"],
-                    evolution_reason=ev["evolution_reason"],
-                    evolved_at=ev["evolved_at"],
-                    source_commit_id=ev["source_commit_id"],
-                    original_what=ev["original_what"],
+                    commit_id=ev.get("commit_id", commit_id),
+                    evolved_what=ev.get("evolved_what", ""),
+                    evolution_reason=ev.get("evolution_reason", ""),
+                    evolved_at=ev.get("evolved_at", ""),
+                    source_commit_id=ev.get("source_commit_id", ""),
+                    original_what=ev.get("original_what", ""),
                 )
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            logger.warning("Failed to load %s: %s", path, exc)
+        except Exception as exc:
+            logger.warning("Failed to load evolved summaries: %s", exc)
 
     def _save_evolved_summaries(self) -> None:
-        """Persist the evolved_summaries dict to JSON."""
-        path = self._evolved_path
-        data = {
-            "version": 1,
-            "evolved": {
-                cid: {
-                    "commit_id": ev.commit_id,
-                    "evolved_what": ev.evolved_what,
-                    "evolution_reason": ev.evolution_reason,
-                    "evolved_at": ev.evolved_at,
-                    "source_commit_id": ev.source_commit_id,
-                    "original_what": ev.original_what,
-                }
-                for cid, ev in self._evolved_summaries.items()
-            },
-        }
-        content = json.dumps(data, indent=2, ensure_ascii=False)
-        with self._locks[path], self._file_lock(path):
-            self._write_file_unlocked(path, content)
+        """Persist the evolved_summaries cache to storage backend."""
+        for cid, ev in self._evolved_summaries.items():
+            self._storage.evolved_summary_set(cid, {
+                "evolved_what": ev.evolved_what,
+                "evolution_reason": ev.evolution_reason,
+                "evolved_at": ev.evolved_at,
+                "source_commit_id": ev.source_commit_id,
+                "original_what": ev.original_what,
+            })
 
     def get_evolved_what(self, commit_id: str) -> str | None:
         """Return evolved summary if available, else None (A-MEM S3.3 Eq.7)."""

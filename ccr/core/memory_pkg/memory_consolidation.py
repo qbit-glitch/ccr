@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
-
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -71,126 +68,39 @@ class ConsolidationMixin:
         }
 
     def _load_summary_meta(self) -> dict:
-        path = self._get_summary_meta_path()
-        with self._locks[path]:
-            if not os.path.isfile(path):
-                return self._default_summary_meta()
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-                return data if data else self._default_summary_meta()
+        data = self._storage.summary_meta_load()
+        return data if data else self._default_summary_meta()
 
     def _save_summary_meta(self, data: dict) -> None:
-        path = self._get_summary_meta_path()
-        with self._locks[path]:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            content = yaml.dump(data, default_flow_style=False, sort_keys=False, Dumper=yaml.SafeDumper)
-            tmp_path = path + ".tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+        self._storage.summary_meta_save(data)
 
     def _get_commit_count(self, branch: str) -> int:
-        """Count total commits on a branch."""
-        content = self._read_file(self._get_commits_path(branch))
-        if not content:
-            return 0
-        return len(re.findall(r"## \[C\d{3,}\]", content))
+        """Count total commits on a branch via storage backend."""
+        return self._storage.commit_count(branch)
 
     def _get_next_session_summary_id(self, branch: str) -> str:
         """Get next S### ID for session summaries on a branch."""
-        content = self._read_file(self._get_summaries_path(branch))
-        if not content:
-            return "S001"
-        matches = re.findall(r"\[S(\d{3,})\]", content)
-        if not matches:
-            return "S001"
-        return f"S{max(int(m) for m in matches) + 1:03d}"
+        return self._storage.session_summary_get_next_id(branch)
 
     def _get_next_phase_summary_id(self) -> str:
         """Get next P### ID for phase summaries."""
-        content = self._read_file(self._get_phases_path())
-        if not content:
-            return "P001"
-        matches = re.findall(r"\[P(\d{3,})\]", content)
-        if not matches:
-            return "P001"
-        return f"P{max(int(m) for m in matches) + 1:03d}"
+        return self._storage.phase_summary_get_next_id()
 
     def _read_session_summaries(self, branch: str, count: int = 3) -> list[dict]:
-        """Parse last `count` session summaries from summaries.md.
+        """Read last `count` session summaries via storage backend.
 
         Returns list of dicts with: id, start_date, end_date, branch,
         commits, accomplished, files, direction.
         """
-        content = self._read_file(self._get_summaries_path(branch))
-        if not content:
-            return []
-        parts = re.split(r"(?=## \[S\d{3,}\])", content)
-        summary_parts = [p for p in parts if re.match(r"## \[S\d{3,}\]", p.strip())]
-        results = []
-        for part in summary_parts[:count]:
-            data: dict[str, Any] = {}
-            header = re.match(
-                r"## \[(S\d{3,})\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*-\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(\S+)\s*\|\s*Session Summary",
-                part.strip(),
-            )
-            if header:
-                data["id"] = header.group(1)
-                data["start_date"] = header.group(2).strip()
-                data["end_date"] = header.group(3).strip()
-                data["branch"] = header.group(4).strip()
-            else:
-                continue
-            commits_m = re.search(r"\*\*Commits\*\*:\s*(.*)", part)
-            accomplished_m = re.search(r"\*\*Accomplished\*\*:\s*(.*)", part)
-            files_m = re.search(r"\*\*Files touched\*\*:\s*(.*)", part)
-            direction_m = re.search(r"\*\*Direction\*\*:\s*(.*)", part)
-            data["commits"] = commits_m.group(1).strip() if commits_m else ""
-            data["accomplished"] = accomplished_m.group(1).strip() if accomplished_m else ""
-            data["files"] = files_m.group(1).strip() if files_m else ""
-            data["direction"] = direction_m.group(1).strip() if direction_m else ""
-            results.append(data)
-        return results
+        records = self._storage.session_summary_list(branch, count)
+        for r in records:
+            r.setdefault("commits", r.get("commit_range", ""))
+            r.setdefault("files", r.get("files_touched", ""))
+        return records
 
     def _read_phase_summaries(self, count: int = 3) -> list[dict]:
-        """Parse last `count` phase summaries from phases.md."""
-        content = self._read_file(self._get_phases_path())
-        if not content:
-            return []
-        parts = re.split(r"(?=## \[P\d{3,}\])", content)
-        summary_parts = [p for p in parts if re.match(r"## \[P\d{3,}\]", p.strip())]
-        results = []
-        for part in summary_parts[:count]:
-            data: dict[str, Any] = {}
-            header = re.match(
-                r"## \[(P\d{3,})\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*-\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*Phase Summary",
-                part.strip(),
-            )
-            if header:
-                data["id"] = header.group(1)
-                data["start_date"] = header.group(2).strip()
-                data["end_date"] = header.group(3).strip()
-            else:
-                continue
-            scope_m = re.search(r"\*\*Scope\*\*:\s*(.*)", part)
-            goal_m = re.search(r"\*\*Goal\*\*:\s*(.*)", part)
-            outcome_m = re.search(r"\*\*Outcome\*\*:\s*(.*)", part)
-            accomplishments_m = re.search(r"\*\*Key accomplishments\*\*:\s*(.*?)(?=\n\*\*|\Z)", part, re.DOTALL)
-            data["scope"] = scope_m.group(1).strip() if scope_m else ""
-            data["goal"] = goal_m.group(1).strip() if goal_m else ""
-            data["outcome"] = outcome_m.group(1).strip() if outcome_m else ""
-            data["accomplishments"] = accomplishments_m.group(1).strip() if accomplishments_m else ""
-            results.append(data)
-        return results
+        """Read last `count` phase summaries via storage backend."""
+        return self._storage.phase_summary_list(count)
 
     # --- Session Summary Generation (TiMem §3.2 Phi_2) ---
 
@@ -279,11 +189,17 @@ class ConsolidationMixin:
             f"**Direction**: {direction}\n\n---\n\n"
         )
 
-        # Prepend to summaries.md
-        path = self._get_summaries_path(branch)
-        with self._locks[path], self._file_lock(path):
-            existing = self._read_file_unlocked(path) or ""
-            self._write_file_unlocked(path, entry + existing)
+        data = {
+            "id": summary_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "commit_range": commit_range,
+            "accomplished": accomplished,
+            "files_touched": files_str,
+            "key_decisions": decisions_str,
+            "direction": direction,
+        }
+        self._storage.session_summary_insert(branch, data)
 
         return entry
 
@@ -448,11 +364,18 @@ class ConsolidationMixin:
             entry += f"**Branch summary**: {branch_summary[:300]}\n"
         entry += "\n---\n\n"
 
-        # Prepend to phases.md
-        path = self._get_phases_path()
-        with self._locks[path], self._file_lock(path):
-            existing = self._read_file_unlocked(path) or ""
-            self._write_file_unlocked(path, entry + existing)
+        data = {
+            "id": phase_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "scope": scope,
+            "goal": goal,
+            "outcome": outcome,
+            "accomplishments": acc_text,
+            "files_changed": files_str,
+            "branch_summary": branch_summary[:300] if branch_summary else "",
+        }
+        self._storage.phase_summary_insert(data)
 
         # Update meta
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -486,8 +409,7 @@ class ConsolidationMixin:
             return result or "No phase summary generated (insufficient data)."
 
         # tier == "project": return prompt for Claude Code
-        overview_path = self._get_overview_path()
-        existing_overview = self._read_file(overview_path) or "(none)"
+        existing_overview = self._storage.project_state_get("overview") or "(none)"
 
         phases = self._read_phase_summaries(count=5)
         phases_text = ""
@@ -524,8 +446,7 @@ class ConsolidationMixin:
 
     def save_overview(self, content: str) -> None:
         """Persist a Claude-Code-generated project overview."""
-        path = self._get_overview_path()
-        self._write_file(path, content)
+        self._storage.project_state_set("overview", content)
         # Update meta
         meta = self._load_summary_meta()
         phases = self._read_phase_summaries(count=100)
@@ -571,7 +492,7 @@ class ConsolidationMixin:
                 parts.append("No phase summaries yet.")
 
         if tier in ("project", "all"):
-            overview = self._read_file(self._get_overview_path())
+            overview = self._storage.project_state_get("overview")
             if overview:
                 parts.append(f"# Project Overview\n{overview}")
                 # Check staleness: suggest regen if many phases since last overview
