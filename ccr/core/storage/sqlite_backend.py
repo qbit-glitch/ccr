@@ -22,6 +22,7 @@ import sqlite3
 import threading
 
 from ccr.core.storage._sqlite_fts5 import install_fts5
+from ccr.core.storage._sqlite_vec import install_vec
 from ccr.core.storage._sqlite_phase1 import Phase1Mixin
 from ccr.core.storage._sqlite_phase2 import Phase2Mixin
 from ccr.core.storage._sqlite_phase3a import Phase3aMixin
@@ -333,6 +334,15 @@ class SqliteConnectionManager:
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
+        # Phase 4: Load sqlite-vec extension if available. Silent failure is
+        # correct — backends probe vec_available() and fall back cleanly.
+        try:
+            import sqlite_vec  # soft dep
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -394,6 +404,18 @@ class SqliteStorageBackend(
                 backfill_fts5(conn)
                 self._memory_mgr.set_user_version(1)
 
+        # Phase 4: install commits_vec virtual table (graceful when sqlite-vec missing)
+        self._vec_available: bool = install_vec(self.memory_conn)
+
+        # Phase 4 migration: backfill legacy embeddings into commits_vec.
+        # user_version 1 -> 2 guard (1 = Phase 2 FTS5 backfill complete).
+        if self._vec_available:
+            current_version = self._memory_mgr.get_user_version()
+            if current_version < 2:
+                from ._sqlite_vec import backfill_vec
+                backfill_vec(self.memory_conn, ccr_root)
+                self._memory_mgr.set_user_version(2)
+
     def _ensure_phase1_tables(self) -> None:
         self.memory_conn.executescript(_PHASE1_TABLES)
 
@@ -426,6 +448,11 @@ class SqliteStorageBackend(
     def fts_available(self) -> bool:
         """True iff FTS5 virtual tables + triggers were installed at init."""
         return self._fts_available
+
+    @property
+    def vec_available(self) -> bool:
+        """True iff sqlite-vec extension loaded and commits_vec table created."""
+        return self._vec_available
 
     @property
     def memory_conn(self) -> sqlite3.Connection:

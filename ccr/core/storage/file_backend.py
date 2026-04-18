@@ -44,3 +44,7 @@ class FileStorageBackend(
     @property
     def fts_available(self) -> bool:
         return False
+
+    @property
+    def vec_available(self) -> bool:
+        return False
