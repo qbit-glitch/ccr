@@ -107,6 +107,45 @@ class Phase3aMixin:
         conn.commit()
         return changed > 0
 
+    def commit_semantic_search(
+        self, branch: str, query_vec: list[float], top_k: int,
+    ) -> list[dict]:
+        """vec0 KNN joined back to commits, filtered by branch.
+
+        Over-fetches 3x to tolerate branch filtering in the wrapping SELECT.
+        Returns list of dicts with keys: id, title, raw_block, distance.
+        """
+        if not getattr(self, "_vec_available", False):
+            return []
+        if top_k <= 0:
+            return []
+        blob = _serialize_vec(query_vec)  # raises ValueError on wrong dim
+        fetch_k = max(top_k * 3, top_k)
+        conn = self.memory_conn
+        try:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.title, c.raw_block, v.distance
+                FROM commits_vec v
+                JOIN commits c ON c.id = v.id
+                WHERE v.embedding MATCH ? AND k = ? AND c.branch = ?
+                ORDER BY v.distance
+                LIMIT ?
+                """,
+                (blob, fetch_k, branch, top_k),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # vec0 MATCH unavailable at runtime
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"] or "",
+                "raw_block": r["raw_block"] or "",
+                "distance": float(r["distance"]),
+            }
+            for r in rows
+        ]
+
     def commit_upsert_vector(self, commit_id: str, vector: list[float]) -> None:
         """Insert or replace a 384-dim L2-normalized embedding for a commit.
 

@@ -153,6 +153,12 @@ class FilePhase3aMixin:
         """File backend keeps using gzip JSON via MemoryManager._embed_commit."""
         return None
 
+    def commit_semantic_search(
+        self, branch: str, query_vec: list[float], top_k: int,
+    ) -> list[dict]:
+        """File backend has no KNN — always returns []."""
+        return []
+
     def commit_count(self, branch: str) -> int:
         path = self._commits_path(branch)
         if not os.path.isfile(path):
