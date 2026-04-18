@@ -67,14 +67,14 @@ class TestPlatformDetection:
         result = get_sandbox_type()
         assert result in ("seatbelt", "landlock", "none")
 
-    @mock.patch("ccr.rlm.sandbox.platform")
-    @mock.patch("ccr.rlm.sandbox.shutil")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.shutil")
     def test_seatbelt_detected_when_darwin(self, mock_shutil, mock_platform):
         mock_platform.system.return_value = "Darwin"
         mock_shutil.which.return_value = "/usr/bin/sandbox-exec"
         assert is_seatbelt_available() is True
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_seatbelt_not_detected_on_linux(self, mock_platform):
         mock_platform.system.return_value = "Linux"
         assert is_seatbelt_available() is False
@@ -84,13 +84,13 @@ class TestPlatformDetection:
         if _is_macos():
             assert is_landlock_available() is False
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_landlock_not_detected_on_macos(self, mock_platform):
         mock_platform.system.return_value = "Darwin"
         assert is_landlock_available() is False
 
-    @mock.patch("ccr.rlm.sandbox._landlock_probe")
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform._landlock_probe")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_is_landlock_available_on_linux_513(self, mock_platform, mock_probe):
         """Linux 5.13 with working syscall → True."""
         mock_platform.system.return_value = "Linux"
@@ -99,34 +99,34 @@ class TestPlatformDetection:
         mock_probe.return_value = None  # probe succeeds
         assert is_landlock_available() is True
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_is_landlock_not_available_old_kernel(self, mock_platform):
         """Linux 5.12 → False (too old)."""
         mock_platform.system.return_value = "Linux"
         mock_platform.release.return_value = "5.12.0-generic"
         assert is_landlock_available() is False
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_is_landlock_not_available_on_macos(self, mock_platform):
         """Darwin → False."""
         mock_platform.system.return_value = "Darwin"
         assert is_landlock_available() is False
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_landlock_syscall_nr_x86_64(self, mock_platform):
         """x86_64 create_ruleset → 444."""
         mock_platform.machine.return_value = "x86_64"
         assert _landlock_syscall_nr("create_ruleset") == 444
 
-    @mock.patch("ccr.rlm.sandbox.platform")
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
     def test_landlock_syscall_nr_unknown_arch(self, mock_platform):
         """Unknown arch → NotImplementedError."""
         mock_platform.machine.return_value = "riscv64"
         with pytest.raises(NotImplementedError, match="riscv64"):
             _landlock_syscall_nr("create_ruleset")
 
-    @mock.patch("ccr.rlm.sandbox.is_seatbelt_available", return_value=False)
-    @mock.patch("ccr.rlm.sandbox.is_landlock_available", return_value=True)
+    @mock.patch("ccr.rlm.sandbox_platform.is_seatbelt_available", return_value=False)
+    @mock.patch("ccr.rlm.sandbox_platform.is_landlock_available", return_value=True)
     def test_get_sandbox_type_returns_landlock_on_linux(self, mock_ll, mock_sb):
         """When landlock available and seatbelt not, get_sandbox_type() == 'landlock'."""
         assert get_sandbox_type() == "landlock"
@@ -862,3 +862,144 @@ class TestExpandHelper:
     def test_expand_already_absolute(self):
         result = _expand("/usr/bin")
         assert result == os.path.realpath("/usr/bin")
+
+
+# ---------------------------------------------------------------------------
+# Edge cases for sandbox_platform.py (apply_landlock_restrictions, detection)
+# ---------------------------------------------------------------------------
+
+class TestApplyLandlockEdgeCases:
+    """Edge cases for apply_landlock_restrictions (platform-gated)."""
+
+    def test_raises_on_non_linux(self):
+        """apply_landlock_restrictions must raise NotImplementedError on non-Linux."""
+        with mock.patch("ccr.rlm.sandbox_platform.platform") as mp:
+            mp.system.return_value = "Darwin"
+            with pytest.raises(NotImplementedError, match="Linux-only"):
+                apply_landlock_restrictions("/tmp/proj", "/tmp/sandbox", sys.executable)
+
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
+    def test_landlock_available_unusual_release_format(self, mock_plat):
+        """Kernel version with extra suffixes should still parse."""
+        mock_plat.system.return_value = "Linux"
+        mock_plat.release.return_value = "5.15.0-1-generic"
+        mock_plat.machine.return_value = "x86_64"
+        with mock.patch("ccr.rlm.sandbox_platform._landlock_probe"):
+            assert is_landlock_available() is True
+
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
+    def test_landlock_available_release_with_rc(self, mock_plat):
+        """Release candidate kernel should parse the major.minor correctly."""
+        mock_plat.system.return_value = "Linux"
+        mock_plat.release.return_value = "6.1-rc3"
+        mock_plat.machine.return_value = "x86_64"
+        with mock.patch("ccr.rlm.sandbox_platform._landlock_probe"):
+            # 6.1 >= 5.13, probe succeeds → True
+            assert is_landlock_available() is True
+
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
+    def test_landlock_available_malformed_release(self, mock_plat):
+        """Completely unparseable release string → False (not crash)."""
+        mock_plat.system.return_value = "Linux"
+        mock_plat.release.return_value = "unknown"
+        assert is_landlock_available() is False
+
+    @mock.patch("ccr.rlm.sandbox_platform.platform")
+    def test_landlock_probe_oserror_returns_false(self, mock_plat):
+        """When _landlock_probe raises OSError, should return False."""
+        mock_plat.system.return_value = "Linux"
+        mock_plat.release.return_value = "5.15.0"
+        mock_plat.machine.return_value = "x86_64"
+        with mock.patch("ccr.rlm.sandbox_platform._landlock_probe", side_effect=OSError("ENOSYS")):
+            assert is_landlock_available() is False
+
+    def test_landlock_syscall_nr_aarch64(self):
+        """aarch64 should have the same syscall numbers as x86_64."""
+        with mock.patch("ccr.rlm.sandbox_platform.platform") as mp:
+            mp.machine.return_value = "aarch64"
+            assert _landlock_syscall_nr("create_ruleset") == 444
+
+    def test_landlock_syscall_nr_arm64(self):
+        """arm64 alias for aarch64."""
+        with mock.patch("ccr.rlm.sandbox_platform.platform") as mp:
+            mp.machine.return_value = "arm64"
+            assert _landlock_syscall_nr("create_ruleset") == 444
+
+
+# ---------------------------------------------------------------------------
+# Edge cases for sandbox_seatbelt.py (_get_python_exec_paths, profile)
+# ---------------------------------------------------------------------------
+
+class TestPythonExecPaths:
+    """Tests for _get_python_exec_paths (macOS framework detection)."""
+
+    def test_returns_at_least_current_executable(self):
+        from ccr.rlm.sandbox import _get_python_exec_paths
+        paths = _get_python_exec_paths(os.path.realpath(sys.executable))
+        assert len(paths) >= 1
+        assert os.path.realpath(sys.executable) in paths
+
+    def test_no_duplicates(self):
+        from ccr.rlm.sandbox import _get_python_exec_paths
+        paths = _get_python_exec_paths(os.path.realpath(sys.executable))
+        assert len(paths) == len(set(paths))
+
+    def test_all_paths_are_absolute(self):
+        from ccr.rlm.sandbox import _get_python_exec_paths
+        paths = _get_python_exec_paths(os.path.realpath(sys.executable))
+        for p in paths:
+            assert os.path.isabs(p), f"Path {p} is not absolute"
+
+    @mock.patch("ccr.rlm.sandbox_seatbelt.sysconfig")
+    def test_no_framework_prefix(self, mock_sysconfig):
+        """When PYTHONFRAMEWORKPREFIX is None, should still return base paths."""
+        from ccr.rlm.sandbox import _get_python_exec_paths
+        mock_sysconfig.get_config_var.return_value = None
+        paths = _get_python_exec_paths(os.path.realpath(sys.executable))
+        assert len(paths) >= 1
+
+
+class TestSeatbeltProfileEdgeCases:
+    def test_profile_with_none_executable(self):
+        """When python_executable is None, should use sys.executable."""
+        with tempfile.TemporaryDirectory() as proj:
+            with tempfile.TemporaryDirectory() as tmp:
+                profile = generate_seatbelt_profile(proj, tmp, python_executable=None)
+                assert "deny default" in profile
+                # Should contain the real python path
+                real_py = os.path.realpath(sys.executable)
+                assert real_py in profile
+
+    def test_profile_contains_both_dirs(self):
+        """Profile must include both project and temp directory write rules."""
+        with tempfile.TemporaryDirectory() as proj:
+            with tempfile.TemporaryDirectory() as tmp:
+                profile = generate_seatbelt_profile(proj, tmp)
+                assert os.path.realpath(proj) in profile
+                assert os.path.realpath(tmp) in profile
+
+
+class TestSandboxResultEdgeCases:
+    def test_default_values(self):
+        r = SandboxResult()
+        assert r.stdout == ""
+        assert r.stderr == ""
+        assert r.error is None
+        assert r.variables == {}
+        assert r.sandbox_type == "none"
+        assert r.dropped_vars == []
+
+    def test_repr_includes_type_and_error(self):
+        r = SandboxResult(error="boom", sandbox_type="seatbelt", stdout="abc")
+        s = repr(r)
+        assert "seatbelt" in s
+        assert "boom" in s
+        assert "stdout_len=3" in s
+
+    def test_variables_default_to_empty_dict(self):
+        r = SandboxResult(variables=None)
+        assert r.variables == {}
+
+    def test_dropped_vars_default_to_empty_list(self):
+        r = SandboxResult(dropped_vars=None)
+        assert r.dropped_vars == []

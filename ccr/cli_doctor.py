@@ -1,11 +1,15 @@
 """CCR doctor command — extracted from cli.py to satisfy 800-line limit."""
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shlex
 import sys
 
 import click
+
+logger = logging.getLogger(__name__)
 
 
 def _check_stale_hook_paths(hooks: dict) -> list[str]:
@@ -135,7 +139,7 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
         _from_global = False
     if os.path.isfile(settings_path):
         try:
-            with open(settings_path) as f:
+            with open(settings_path, encoding="utf-8") as f:
                 settings = json.loads(f.read())
             hooks = settings.get("hooks", {})
             scope = " (global)" if _from_global else ""
@@ -257,24 +261,170 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     return ok_items, issues, notices
 
 
+def _fix_stale_hooks(project: str) -> list[str]:
+    """Re-run ccr install to fix stale hook paths."""
+    fixed: list[str] = []
+    try:
+        from ccr.cli import install  # noqa: PLC0415
+        ctx = click.Context(install, info_name="install")
+        ctx.params = {"project": project, "preset": "default"}
+        ctx.invoke(install, project=project, preset="default")
+        fixed.append("Re-ran ccr install to refresh hook paths")
+    except Exception as exc:
+        fixed.append(f"Failed to fix hooks: {exc}")
+    return fixed
+
+
+def _fix_stale_session_marker(ccr_dir: str) -> list[str]:
+    """Remove stale .session_active marker if process is dead."""
+    fixed: list[str] = []
+    marker = os.path.join(ccr_dir, ".session_active")
+    if not os.path.isfile(marker):
+        return fixed
+    try:
+        with open(marker, "r") as f:
+            stored_pid = int(f.read().strip())
+        os.kill(stored_pid, 0)
+    except (ValueError, OSError):
+        os.remove(marker)
+        fixed.append("Removed stale .session_active marker")
+    return fixed
+
+
+def _fix_sqlite_integrity(ccr_dir: str) -> list[str]:
+    """Run PRAGMA integrity_check on memory.db and rebuild FTS if needed."""
+    import sqlite3
+
+    fixed: list[str] = []
+    db_path = os.path.join(ccr_dir, "memory.db")
+    if not os.path.isfile(db_path):
+        return fixed
+
+    try:
+        conn = sqlite3.connect(db_path)
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        if result and result[0] == "ok":
+            fixed.append("memory.db integrity check passed")
+        else:
+            fixed.append(f"memory.db integrity check: {result[0] if result else 'unknown'}")
+        conn.close()
+    except sqlite3.DatabaseError as exc:
+        fixed.append(f"memory.db integrity check failed: {exc}")
+
+    index_db = os.path.join(ccr_dir, "index.db")
+    if os.path.isfile(index_db):
+        try:
+            conn = sqlite3.connect(index_db)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%fts%'",
+            ).fetchall()]
+            for table in tables:
+                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", table):
+                    continue
+                try:
+                    conn.execute(f"INSERT INTO {table}({table}, rank) VALUES('rebuild', 1)")
+                    conn.commit()
+                    fixed.append(f"Rebuilt FTS index: {table}")
+                except sqlite3.OperationalError:
+                    pass
+            conn.close()
+        except sqlite3.DatabaseError as exc:
+            fixed.append(f"index.db FTS rebuild failed: {exc}")
+
+    return fixed
+
+
+def _fix_duplicate_hooks(project: str) -> list[str]:
+    """Deduplicate hook commands in settings.local.json."""
+    import json
+
+    fixed: list[str] = []
+    settings_path = os.path.join(project, ".claude", "settings.local.json")
+    if not os.path.isfile(settings_path):
+        return fixed
+
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return fixed
+
+    hooks = settings.get("hooks", {})
+    deduped = False
+    for event in list(hooks.keys()):
+        cmds = hooks[event]
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for c in cmds:
+            cmd_str = c.get("command", "")
+            if cmd_str not in seen:
+                seen.add(cmd_str)
+                unique.append(c)
+            else:
+                deduped = True
+        hooks[event] = unique
+
+    if deduped:
+        settings["hooks"] = hooks
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        fixed.append("Removed duplicate hook commands")
+
+    return fixed
+
+
 @click.command()
 @click.argument("project", default=".")
-def doctor(project: str) -> None:
-    """Diagnose CCR health and configuration issues."""
+@click.option("--fix", is_flag=True, help="Auto-fix detected issues (stale hooks, corrupt DB, etc.)")
+def doctor(project: str, fix: bool) -> None:
+    """Diagnose CCR health and configuration issues.
+
+    Use --fix to auto-repair: stale hook paths, duplicate hooks,
+    stale session markers, and SQLite integrity/FTS issues.
+    """
     ok_items, issues, notices = _run_doctor_checks(project)
 
-    # Print results
     click.echo("CCR Doctor\n")
     for item in ok_items:
         click.echo(f"  [OK] {item}")
     for item in issues:
         click.echo(f"  [!!] {item}")
     for item in notices:
-        # Notices that already carry a [WARN] prefix are printed as-is (indented only)
         if item.startswith("[WARN]"):
             click.echo(f"  {item}")
         else:
             click.echo(f"  [--] {item}")
     click.echo(f"\n  {len(ok_items)} OK, {len(issues)} issue(s), {len(notices)} notice(s)")
-    if not issues:
-        click.echo("  All checks passed.")
+
+    if not fix:
+        if issues:
+            click.echo("\n  Run 'ccr doctor --fix' to attempt auto-repair.")
+        else:
+            click.echo("  All checks passed.")
+        return
+
+    click.echo("\n=== Auto-fix ===\n")
+    project = os.path.abspath(project)
+    ccr_dir = os.path.join(project, ".ccr")
+    all_fixes: list[str] = []
+
+    has_stale_hooks = any("stale" in i.lower() or "hook path" in i.lower() for i in issues)
+    has_duplicate_hooks = any("duplicate hook" in i.lower() for i in issues)
+    has_stale_marker = any("session_active" in n.lower() for n in notices)
+
+    if has_duplicate_hooks:
+        all_fixes.extend(_fix_duplicate_hooks(project))
+    if has_stale_hooks:
+        all_fixes.extend(_fix_stale_hooks(project))
+    if has_stale_marker:
+        all_fixes.extend(_fix_stale_session_marker(ccr_dir))
+    if os.path.isdir(ccr_dir):
+        all_fixes.extend(_fix_sqlite_integrity(ccr_dir))
+
+    if all_fixes:
+        for f_msg in all_fixes:
+            click.echo(f"  [FIX] {f_msg}")
+        click.echo(f"\n  {len(all_fixes)} fix(es) applied. Run 'ccr doctor' again to verify.")
+    else:
+        click.echo("  No auto-fixable issues found.")

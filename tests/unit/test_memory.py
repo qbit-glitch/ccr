@@ -2455,7 +2455,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] commit text for {cid}"
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2494,7 +2494,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] text"
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2508,7 +2508,7 @@ class TestAdaptiveTraversal:
         """When quick_cosine returns None (no ONNX), BFS fallback works identically."""
         self._setup_links(memory, "C001", ["C002", "C003"])
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", return_value=None), \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine", return_value=None), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results = memory.get_linked_commits("C001", query="test query")
 
@@ -2524,7 +2524,7 @@ class TestAdaptiveTraversal:
         """When query is None/empty, plain BFS is used (no quick_cosine calls)."""
         self._setup_links(memory, "C001", ["C002", "C003"])
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine") as mock_qc, \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine") as mock_qc, \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results_no_query = memory.get_linked_commits("C001")
 
@@ -2593,7 +2593,7 @@ class TestAdaptiveTraversal:
         def mock_find(branch: str, cid: str) -> str:
             return f"[{cid}] text"
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=mock_quick_cosine), \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine", side_effect=mock_quick_cosine), \
              patch.object(memory, "_parse_commit_block", side_effect=mock_parse), \
              patch.object(memory, "_find_commit_by_id", side_effect=mock_find), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
@@ -2627,7 +2627,7 @@ class TestAdaptiveTraversal:
         """If quick_cosine probe raises an exception, BFS fallback is used."""
         self._setup_links(memory, "C001", ["C002"])
 
-        with patch("ccr.core.memory_pkg.memory_links.quick_cosine", side_effect=RuntimeError("ONNX crash")), \
+        with patch("ccr.core.memory_pkg.memory_links_traversal.quick_cosine", side_effect=RuntimeError("ONNX crash")), \
              patch.object(memory, "_load_commit_embeddings", return_value={}):
             results = memory.get_linked_commits("C001", query="test")
 
@@ -2655,3 +2655,293 @@ class TestAdaptiveTraversal:
         assert len(results) == 1
         assert "embedding_score" in results[0]
         assert abs(results[0]["embedding_score"] - 0.0) < 1e-5
+
+
+# ── Round-2 Edge Case Tests ──────────────────────────────────────────
+
+
+class TestMergeIntoLastCommitEdgeCases:
+    """Edge cases for _merge_into_last_commit regex operations."""
+
+    @pytest.fixture
+    def memory(self, tmp_path):
+        mem = MemoryManager(str(tmp_path / ".ccr"), CCRConfig())
+        mem.ensure_structure()
+        return mem
+
+    def _seed_commit(self, memory, commit_id="C001", title="Init"):
+        """Write a minimal commit block to commits.md."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        block = (
+            f"## [{commit_id}] {now} | main | {title}\n"
+            f"**What**: original what\n"
+            f"**Why**: original why\n"
+            f"**Files**: file1.py\n"
+            f"**Next**: do something\n\n---\n\n"
+        )
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(block)
+
+    def test_regex_special_chars_in_title(self, memory):
+        """Titles with regex metacharacters must not break merge."""
+        self._seed_commit(memory, "C001", "Fix (bug) [#123] $var")
+        result = memory._merge_into_last_commit(
+            "main", "C001", "Add re.sub() test",
+            "handled regex chars", "safety", ["test.py"], "verify",
+        )
+        assert result == "C001"
+        content = memory._read_file(memory._get_commits_path("main"))
+        assert "handled regex chars" in content
+
+    def test_backslashes_in_what_field(self, memory):
+        """Backslash sequences in 'what' should not be interpreted as backrefs."""
+        self._seed_commit(memory)
+        result = memory._merge_into_last_commit(
+            "main", "C001", "fix",
+            r"Fixed path C:\Users\foo\bar", "reason", [], "next",
+        )
+        assert result == "C001"
+        content = memory._read_file(memory._get_commits_path("main"))
+        assert "C:\\Users" in content or "C:\\\\Users" in content
+
+    def test_what_field_capped_at_500(self, memory):
+        """What field should be capped at 500 chars after merge."""
+        self._seed_commit(memory)
+        long_what = "x" * 600
+        memory._merge_into_last_commit(
+            "main", "C001", "title", long_what, "why", [], "next",
+        )
+        content = memory._read_file(memory._get_commits_path("main"))
+        what_match = re.search(r"\*\*What\*\*:\s*(.*)", content)
+        assert what_match is not None
+        assert len(what_match.group(1)) <= 510  # original + separator + cap
+
+
+class TestCommitIdEdgeCases:
+    """Edge cases for _get_next_commit_id."""
+
+    @pytest.fixture
+    def memory(self, tmp_path):
+        mem = MemoryManager(str(tmp_path / ".ccr"), CCRConfig())
+        mem.ensure_structure()
+        return mem
+
+    def test_first_commit_on_empty_branch(self, memory):
+        """Empty commits file → C001."""
+        assert memory._get_next_commit_id("main") == "C001"
+
+    def test_increments_after_one_commit(self, memory):
+        """After C001, next should be C002."""
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("## [C001] 2026-01-01 00:00 | main | Init\n")
+        assert memory._get_next_commit_id("main") == "C002"
+
+    def test_gaps_in_commit_ids(self, memory):
+        """With C001 and C005, next should be C006 (max+1, not fill gaps)."""
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("## [C001] ...\n## [C005] ...\n")
+        assert memory._get_next_commit_id("main") == "C006"
+
+    def test_large_commit_numbers(self, memory):
+        """C999 → C1000 (4-digit IDs work)."""
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("## [C999] ...\n")
+        assert memory._get_next_commit_id("main") == "C1000"
+
+    def test_content_without_commit_headers(self, memory):
+        """Non-empty file with no [C###] headers → C001."""
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("Some random text without commit headers\n")
+        assert memory._get_next_commit_id("main") == "C001"
+
+
+class TestAdmissionUtilityEdgeCases:
+    """Edge cases for _utility_heuristic scoring."""
+
+    def test_empty_everything_scores_zero(self):
+        """All empty inputs → 0.0."""
+        score = MemoryManager._utility_heuristic("", "", [], "")
+        assert score == 0.0
+
+    def test_maximal_utility(self):
+        """Rich commit with all signals → high score."""
+        score = MemoryManager._utility_heuristic(
+            "Discovered a pattern in the codebase that refactors nicely " * 5,
+            "Because the old approach had performance issues " * 2,
+            ["a.py", "b.py", "c.py", "d.py", "e.py"],
+            "Next we should validate the benchmarks thoroughly",
+        )
+        assert score >= 0.9
+
+    def test_utility_capped_at_one(self):
+        """Even with all signals maxed, result ≤ 1.0."""
+        score = MemoryManager._utility_heuristic(
+            "Discovered and realized a pattern, learned insight and principle " * 10,
+            "Because " * 100,
+            [f"f{i}.py" for i in range(20)],
+            "Next step is very detailed " * 10,
+        )
+        assert score <= 1.0
+
+    def test_meta_signals_detected(self):
+        """Meta-cognitive keywords should boost utility."""
+        base = MemoryManager._utility_heuristic("added a feature", "", [], "")
+        meta = MemoryManager._utility_heuristic("discovered a pattern insight", "", [], "")
+        assert meta > base
+
+
+class TestContextWindowEdgeCases:
+    """Edge cases for _read_commits_window."""
+
+    @pytest.fixture
+    def memory(self, tmp_path):
+        mem = MemoryManager(str(tmp_path / ".ccr"), CCRConfig())
+        mem.ensure_structure()
+        return mem
+
+    def _seed_commits(self, memory, n=5):
+        path = memory._get_commits_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        blocks = []
+        for i in range(1, n + 1):
+            blocks.append(f"## [C{i:03d}] 2026-01-0{i} 00:00 | main | Commit {i}\n**What**: thing {i}\n\n")
+        with open(path, "w") as f:
+            f.write("".join(blocks))
+
+    def test_offset_past_end_returns_empty(self, memory):
+        """Offset beyond commit count → empty string."""
+        self._seed_commits(memory, 3)
+        result = memory._read_commits_window("main", offset=10, count=5)
+        assert result == ""
+
+    def test_zero_count_returns_empty(self, memory):
+        """count=0 → empty string."""
+        self._seed_commits(memory, 3)
+        result = memory._read_commits_window("main", offset=0, count=0)
+        assert result == ""
+
+    def test_exact_boundary(self, memory):
+        """offset=0, count=N returns exactly N commits."""
+        self._seed_commits(memory, 5)
+        result = memory._read_commits_window("main", offset=0, count=5)
+        assert result.count("## [C") == 5
+
+    def test_empty_branch(self, memory):
+        """No commits file → empty string."""
+        result = memory._read_commits_window("main", offset=0, count=10)
+        assert result == ""
+
+
+class TestBranchNameValidation:
+    """Edge cases for _get_branch_dir path traversal prevention."""
+
+    @pytest.fixture
+    def memory(self, tmp_path):
+        mem = MemoryManager(str(tmp_path / ".ccr"), CCRConfig())
+        mem.ensure_structure()
+        return mem
+
+    def test_valid_branch_name(self, memory):
+        """Standard kebab-case names pass validation."""
+        path = memory._get_branch_dir("feature-auth")
+        assert "feature-auth" in path
+
+    def test_main_bypasses_regex(self, memory):
+        """'main' is always valid regardless of regex."""
+        path = memory._get_branch_dir("main")
+        assert "main" in path
+
+    def test_path_traversal_rejected(self, memory):
+        """Branch names with '../' are rejected."""
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            memory._get_branch_dir("../../../etc")
+
+    def test_uppercase_rejected(self, memory):
+        """Branch names must be lowercase."""
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            memory._get_branch_dir("Feature")
+
+    def test_spaces_rejected(self, memory):
+        """Branch names with spaces are invalid."""
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            memory._get_branch_dir("my branch")
+
+    def test_dots_rejected(self, memory):
+        """Branch names with dots are invalid."""
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            memory._get_branch_dir("feature.fix")
+
+
+# ── Round-5: Rolling Summary Edge Cases ───────────────────────────────
+
+
+class TestRollingSummaryEdgeCases:
+    """Edge cases for _write_rolling_summary cross-process safety."""
+
+    @pytest.fixture
+    def memory(self, tmp_path):
+        mem = MemoryManager(str(tmp_path / ".ccr"), CCRConfig())
+        mem.ensure_structure()
+        return mem
+
+    def test_rolling_summary_writes_to_commits(self, memory):
+        """After commit, rolling summary section exists in commits.md."""
+        memory.commit(
+            "Test commit", "Implemented feature X",
+            "Required for milestone", ["mod.py"], "Continue Y",
+            admission_threshold=1.0,
+        )
+        content = memory._read_file(memory._get_commits_path("main"))
+        assert content is not None
+        # Commit should exist
+        assert "## [C001]" in content
+
+    def test_concurrent_rolling_summary_writes(self, memory):
+        """Multiple threads writing commits don't corrupt data."""
+        import threading
+        errors = []
+
+        def writer(n):
+            try:
+                for i in range(5):
+                    memory.commit(
+                        f"Thread-{n}-{i}", f"Work {n}-{i}", "reason",
+                        [f"t{n}_{i}.py"], "next",
+                        admission_threshold=1.0,
+                    )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, f"Concurrent writes failed: {errors}"
+        # Verify commits.md is not corrupted
+        content = memory._read_file(memory._get_commits_path("main"))
+        assert content is not None
+        assert "## [C" in content
+
+    def test_rolling_summary_with_unicode(self, memory):
+        """Commit with unicode in what/why doesn't corrupt summary."""
+        memory.commit(
+            "Обновление", "Добавлен модуль аутентификации",
+            "Требование безопасности", ["auth.py"], "Тестирование",
+            admission_threshold=1.0,
+        )
+        content = memory._read_file(memory._get_commits_path("main"))
+        assert content is not None
+        assert "Добавлен" in content or "модуль" in content

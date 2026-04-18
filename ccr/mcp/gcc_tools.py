@@ -243,19 +243,19 @@ def gcc_commit(
             result += "\n\n[Warnings: " + " ".join(_warnings) + "]"
 
         branch = mem.get_active_branch()
-        commit_result = GccCommitResult(
+        # F7: extract ERL trigger/action suggestions from patterns
+        trigger_suggestions: list[dict] = []
+        if patterns_learned:
+            trigger_suggestions = _extract_trigger_suggestions(patterns_learned)
+
+        return GccCommitResult(
             commit_id=cid,
             branch=branch,
             title=title,
             admission_decision=admission_decision,
             message=result,
+            trigger_suggestions=trigger_suggestions,
         )
-        # F7: extract ERL trigger/action suggestions from patterns
-        if patterns_learned:
-            trigger_suggestions = _extract_trigger_suggestions(patterns_learned)
-            if trigger_suggestions:
-                commit_result["trigger_suggestions"] = trigger_suggestions
-        return commit_result
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -551,23 +551,23 @@ def gcc_scratchpad(
         if value is None:
             raise ToolError("value is required for mode='set'")
         entry = scratchpad.set(key, value, ttl_seconds=ttl_seconds)
-        return GccScratchpadResult(mode="set", key=key, message=f"Set '{key}' in working memory (updated: {entry.updated_at})")
+        return GccScratchpadResult(mode="set", key=key, cleared=0, message=f"Set '{key}' in working memory (updated: {entry.updated_at})")
 
     elif mode == "get":
         if key:
             entry = scratchpad.get(key)
             if entry is None:
-                return GccScratchpadResult(mode="get", key=key, message=f"Key '{key}' not found in working memory")
+                return GccScratchpadResult(mode="get", key=key, cleared=0, message=f"Key '{key}' not found in working memory")
             text = f"**{entry.key}**: {entry.value}\n(accessed {entry.access_count}x, updated: {entry.updated_at})"
-            return GccScratchpadResult(mode="get", key=key, message=text)
+            return GccScratchpadResult(mode="get", key=key, cleared=0, message=text)
         else:
             entries = scratchpad.list_entries()
             if not entries:
-                return GccScratchpadResult(mode="get", message="Working memory is empty")
+                return GccScratchpadResult(mode="get", key="", cleared=0, message="Working memory is empty")
             lines = [f"Working memory ({len(entries)} entries):"]
             for e in entries:
                 lines.append(f"- **{e.key}**: {e.value} (accessed {e.access_count}x)")
-            return GccScratchpadResult(mode="get", message="\n".join(lines))
+            return GccScratchpadResult(mode="get", key="", cleared=0, message="\n".join(lines))
 
     elif mode == "clear":
         if key:
@@ -577,7 +577,7 @@ def gcc_scratchpad(
             return GccScratchpadResult(mode="clear", key=key, cleared=0, message=f"Key '{key}' not found in working memory")
         else:
             count = scratchpad.clear()
-            return GccScratchpadResult(mode="clear", cleared=count, message=f"Cleared {count} entries from working memory")
+            return GccScratchpadResult(mode="clear", key="", cleared=count, message=f"Cleared {count} entries from working memory")
 
     else:
         raise ToolError(f"Invalid mode '{mode}'. Use 'get', 'set', or 'clear'.")
@@ -653,11 +653,7 @@ def gcc_triples(
         triples = triple_store.search(query, top_k=top_k)
     else:
         # No filter — return recent
-        with triple_store._lock:
-            all_triples = sorted(
-                triple_store._triples, key=lambda t: t.timestamp, reverse=True
-            )
-        triples = all_triples[:top_k]
+        triples = triple_store.get_recent(top_k)
 
     if not triples:
         return GccTriplesResult(count=0, message="No matching triples found.")

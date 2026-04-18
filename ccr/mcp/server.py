@@ -10,9 +10,13 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import json
+import logging
 import os
 import threading
+
+logger = logging.getLogger(__name__)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -46,7 +50,6 @@ _global_failure_lessons_path: str = ""
 _repo_index: RepoIndex | None = None
 _repl: object | None = None  # CCRRepl when initialized (backward-compat single session)
 _repl_sessions: dict[str, object] = {}
-_repl_sessions_lock: threading.Lock = threading.Lock()
 _repl_session_ttl: dict[str, float] = {}
 _schema_path: str = ""
 _global_schema_path: str = ""
@@ -55,6 +58,7 @@ _embeddings_path: str = ""
 _chunk_embeddings_path: str = ""
 _scratchpad: Scratchpad | None = None
 _triple_store: TripleStore | None = None
+_index_db: object | None = None  # IndexDB when SQLite index is active
 
 # Session logger (chat turn persistence)
 _session_store: object | None = None   # SessionStore when initialized
@@ -113,11 +117,43 @@ def _init(project_root: str | None = None) -> None:
     global _embedding_model, _embeddings_path, _chunk_embeddings_path
     global _scratchpad
     global _triple_store
+    global _index_db
     global _session_store, _session_db_path, _current_session_id
 
     _project_root = os.path.abspath(project_root or os.getcwd())
-    _memory = MemoryManager(_project_root, CCRConfig())
+    storage_backend = os.environ.get("CCR_STORAGE_BACKEND", "sqlite")
+    _memory = MemoryManager(_project_root, CCRConfig(storage_backend=storage_backend))
     _memory.ensure_structure()
+
+    # Auto-migrate flat files → SQLite on first access (Phase 7)
+    if storage_backend == "sqlite":
+        ccr_root = os.path.join(_project_root, ".ccr")
+        db_path = os.path.join(ccr_root, "memory.db")
+        try:
+            from ccr.core.storage.migration import needs_migration, auto_migrate
+            if needs_migration(ccr_root):
+                from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+                _backend = SqliteStorageBackend(ccr_root)
+                _backend.close()
+                mig = auto_migrate(ccr_root, db_path)
+                if mig["errors"]:
+                    logger.warning("Auto-migration errors: %s", mig["errors"])
+                else:
+                    logger.info(
+                        "Auto-migrated %d records across phases %s",
+                        mig["total_migrated"], mig["phases_run"],
+                    )
+        except Exception as exc:
+            logger.warning("Auto-migration failed (will use flat files): %s", exc)
+
+    def _cleanup_storage() -> None:
+        if _memory and hasattr(_memory, "_storage"):
+            try:
+                _memory._storage.close()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup_storage)
 
     # Wire optional sub-model (Phase 2): activates GCC LLM rolling summary + ACE synthesis
     sub = _get_sub_client()
@@ -155,25 +191,46 @@ def _init(project_root: str | None = None) -> None:
     _scratchpad = Scratchpad(os.path.join(_project_root, ".ccr", "scratchpad.json"))
 
     # Triple store (Memori-inspired semantic triple extraction)
-    _triple_store = TripleStore(os.path.join(_project_root, ".ccr", "triples.json"))
+    _triple_store = TripleStore(
+        os.path.join(_project_root, ".ccr", "triples.json"),
+        max_buffer_size=_memory.config.triple_max_buffer_size,
+    )
 
     # Session logger — path set here; store initialized lazily on first use
     _session_db_path = os.path.join(_project_root, ".ccr", "sessions.db")
     _session_store = None
     _current_session_id = ""
 
-    # Build repo index — try incremental load first (skip rebuild if mtimes unchanged)
-    _repo_index = None
+    # Initialize IndexDB (SQLite-backed index persistence)
+    _index_db_path = os.path.join(_project_root, ".ccr", "index.db")
     try:
-        cache_json = _memory.load_index()
-        if cache_json:
-            cached = RepoIndex.from_cache(_project_root, cache_json)
+        from ccr.context.index_db import IndexDB
+        _index_db = IndexDB(_index_db_path)
+    except Exception:
+        _index_db = None
+
+    # Build repo index — try SQLite load first, then JSON cache, then full build
+    _repo_index = None
+    if _index_db is not None:
+        try:
+            cached = RepoIndex.from_db(_project_root, _index_db)
             if cached is not None:
                 live_sig = cached._compute_mtime_sig()
                 if live_sig == cached._mtime_sig and cached._mtime_sig:
                     _repo_index = cached
-    except Exception:
-        pass
+        except Exception:
+            pass
+    if _repo_index is None:
+        try:
+            cache_json = _memory.load_index()
+            if cache_json:
+                cached = RepoIndex.from_cache(_project_root, cache_json)
+                if cached is not None:
+                    live_sig = cached._compute_mtime_sig()
+                    if live_sig == cached._mtime_sig and cached._mtime_sig:
+                        _repo_index = cached
+        except Exception:
+            pass
     if _repo_index is None:
         _repo_index = RepoIndex.build(_project_root)
 
@@ -185,7 +242,13 @@ def _init(project_root: str | None = None) -> None:
     if os.path.isfile(_chunk_embeddings_path):
         _repo_index.load_chunk_embeddings(_chunk_embeddings_path)
 
-    # Cache index (only when freshly built — incremental load already has a valid cache)
+    # Save index to IndexDB (always, so FTS5 is populated for search)
+    if _index_db is not None:
+        try:
+            _repo_index.save_to_db(_index_db)
+        except Exception:
+            pass
+    # Save JSON cache (only when freshly built — loaded-from-cache already has valid JSON)
     if not (hasattr(_repo_index, "_mtime_sig") and _repo_index._mtime_sig):
         try:
             _memory.save_index(_repo_index.to_json())
@@ -212,8 +275,9 @@ def health_check() -> str:
     status: dict = {"status": "ok", "project_root": _project_root}
     if _memory is not None:
         try:
-            commits = _memory.get_context(level=1)
-            status["commit_count"] = commits.count("[C0") + commits.count("[C1")
+            branch = _memory.get_active_branch()
+            index = _memory._build_commit_index(branch)
+            status["commit_count"] = len(index)
         except Exception:
             status["commit_count"] = "unknown"
     else:
@@ -338,28 +402,32 @@ def _save_schema(schema: PlaybookSchema, history: list[dict], path: str) -> None
 def _ensure_global_playbook() -> Playbook:
     if _global_playbook is None:
         _init()
-    assert _global_playbook is not None
+    if _global_playbook is None:
+        raise RuntimeError("Global playbook failed to initialize")
     return _global_playbook
 
 
 def _ensure_memory() -> MemoryManager:
     if _memory is None:
         _init()
-    assert _memory is not None
+    if _memory is None:
+        raise RuntimeError("MemoryManager failed to initialize")
     return _memory
 
 
 def _ensure_playbook() -> Playbook:
     if _playbook is None:
         _init()
-    assert _playbook is not None
+    if _playbook is None:
+        raise RuntimeError("Playbook failed to initialize")
     return _playbook
 
 
 def _ensure_index() -> RepoIndex:
     if _repo_index is None:
         _init()
-    assert _repo_index is not None
+    if _repo_index is None:
+        raise RuntimeError("RepoIndex failed to initialize")
     return _repo_index
 
 

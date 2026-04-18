@@ -426,3 +426,275 @@ class TestThreadSafety:
         for t in threads:
             t.join()
         assert errors == []
+
+
+class TestBufferSizeEnforcement:
+    """Tests for triple buffer size cap and eviction."""
+
+    def test_enforce_buffer_size_evicts_over_limit(self, tmp_path):
+        store = TripleStore(str(tmp_path / "triples.json"), max_buffer_size=5)
+        for i in range(10):
+            store.extract_from_commit(
+                f"C{i:03d}", f"Title {i}", f"Added x{i} to y{i}", "reason", []
+            )
+        with store._lock:
+            assert len(store._triples) <= 5
+
+    def test_enforce_buffer_size_noop_under_limit(self, tmp_path):
+        store = TripleStore(str(tmp_path / "triples.json"), max_buffer_size=100)
+        store.extract_from_commit("C001", "Title", "Added foo to bar", "reason", [])
+        with store._lock:
+            count = len(store._triples)
+        assert count >= 1
+        assert count <= 100
+
+    def test_enforce_keeps_highest_value(self, tmp_path):
+        store = TripleStore(str(tmp_path / "triples.json"), max_buffer_size=3)
+        # Add file triples (confidence=1.0) and text triples (confidence<1.0)
+        store.extract_from_commit(
+            "C001", "Title", "Added a to b", "reason",
+            ["file1.py", "file2.py", "file3.py", "file4.py"],
+        )
+        with store._lock:
+            remaining = store._triples
+        # All remaining should be the highest-confidence ones
+        assert len(remaining) == 3
+        assert all(t.confidence >= 0.8 for t in remaining)
+
+
+class TestGetRecent:
+    """Tests for get_recent() public API."""
+
+    def test_get_recent_returns_sorted(self, tmp_path):
+        store = TripleStore(str(tmp_path / "triples.json"), max_buffer_size=100)
+        store.extract_from_commit("C001", "First", "Added a to b", "r", ["f1.py"])
+        store.extract_from_commit("C002", "Second", "Added c to d", "r", ["f2.py"])
+        recent = store.get_recent(top_k=3)
+        assert len(recent) >= 2
+        # Verify descending timestamp order
+        for i in range(len(recent) - 1):
+            assert recent[i].timestamp >= recent[i + 1].timestamp
+
+    def test_get_recent_respects_top_k(self, tmp_path):
+        store = TripleStore(str(tmp_path / "triples.json"), max_buffer_size=100)
+        for i in range(10):
+            store.extract_from_commit(f"C{i:03d}", f"T{i}", f"Added x{i} to y{i}", "r", [])
+        recent = store.get_recent(top_k=3)
+        assert len(recent) <= 3
+
+
+class TestFormatCompactEdgeCases:
+    """Edge cases for Triple.format_compact()."""
+
+    def test_special_chars_in_fields(self):
+        """Arrows and parens in subject/object don't break format."""
+        t = Triple(
+            subject="file (v2)",
+            predicate="replaced_by",
+            object="file->v3",
+            source_commit="C001",
+            confidence=0.9,
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        result = t.format_compact()
+        assert "--replaced_by-->" in result
+        assert "file (v2)" in result
+        assert "file->v3" in result
+
+    def test_empty_subject_object(self):
+        """Empty strings don't crash format_compact."""
+        t = Triple(
+            subject="",
+            predicate="added_to",
+            object="",
+            source_commit="C001",
+            confidence=0.5,
+            timestamp="",
+        )
+        result = t.format_compact()
+        assert "--added_to-->" in result
+
+    def test_unicode_in_triple(self):
+        """Unicode characters in triple fields are preserved."""
+        t = Triple(
+            subject="модуль",
+            predicate="added_to",
+            object="проект",
+            source_commit="C001",
+            confidence=0.8,
+            timestamp="",
+        )
+        result = t.format_compact()
+        assert "модуль" in result
+        assert "проект" in result
+
+
+class TestExtractionPatternEdgeCases:
+    """Edge cases for regex extraction patterns."""
+
+    def test_case_insensitive_verb_start(self, tmp_path):
+        """Both 'Added' and 'added' should extract triples."""
+        store = TripleStore(str(tmp_path / "t.json"))
+        store.extract_from_commit("C001", "T", "added foo to bar", "", [])
+        with store._lock:
+            triples = list(store._triples)
+        predicates = [t.predicate for t in triples]
+        assert "added_to" in predicates
+
+    def test_sentence_with_period_terminator(self, tmp_path):
+        """Extraction should stop at period."""
+        store = TripleStore(str(tmp_path / "t.json"))
+        store.extract_from_commit("C001", "T", "Added auth to server. Done.", "", [])
+        with store._lock:
+            triples = [t for t in store._triples if t.predicate == "added_to"]
+        assert len(triples) >= 1
+        # Object should not include "Done"
+        for t in triples:
+            assert "Done" not in t.object
+
+    def test_no_match_returns_file_triples_only(self, tmp_path):
+        """When text has no matching verbs, only file triples are created."""
+        store = TripleStore(str(tmp_path / "t.json"))
+        store.extract_from_commit("C001", "T", "did nothing special", "", ["main.py"])
+        with store._lock:
+            triples = list(store._triples)
+        # Should have at least the file triple (predicate is "modified_in")
+        file_triples = [t for t in triples if t.predicate == "modified_in"]
+        assert len(file_triples) == 1
+        assert file_triples[0].subject == "main.py"
+
+    def test_multiple_verbs_in_one_text(self, tmp_path):
+        """Text with multiple matching verbs creates multiple triples."""
+        store = TripleStore(str(tmp_path / "t.json"))
+        store.extract_from_commit(
+            "C001", "T",
+            "Added auth to server. Removed debug from utils.",
+            "", [],
+        )
+        with store._lock:
+            predicates = [t.predicate for t in store._triples]
+        assert "added_to" in predicates
+        assert "removed_from" in predicates
+
+    def test_very_long_text_no_redos(self, tmp_path):
+        """Long repetitive text should not cause catastrophic backtracking."""
+        import time
+        store = TripleStore(str(tmp_path / "t.json"))
+        # Pathological input for non-greedy patterns
+        text = "Added " + "a " * 5000 + "to target"
+        start = time.monotonic()
+        store.extract_from_commit("C001", "T", text, "", [])
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"Extraction took {elapsed:.1f}s — possible ReDoS"
+
+
+class TestCleanEntityEdgeCases:
+    """Edge cases for _clean_entity() stop-prefix stripping."""
+
+    def test_strips_whitespace(self):
+        assert _clean_entity("  hello  ") == "hello"
+
+    def test_strips_article_the(self):
+        assert _clean_entity("the module") == "module"
+
+    def test_strips_article_a(self):
+        assert _clean_entity("a function") == "function"
+
+    def test_strips_article_an(self):
+        assert _clean_entity("an object") == "object"
+
+    def test_strips_multiple_prefixes(self):
+        """Chained prefixes are stripped iteratively."""
+        assert _clean_entity("the new module") == "module"
+
+    def test_case_insensitive_prefix(self):
+        assert _clean_entity("The Module") == "Module"
+
+    def test_no_prefix_passthrough(self):
+        assert _clean_entity("server") == "server"
+
+    def test_empty_string(self):
+        assert _clean_entity("") == ""
+
+    def test_only_prefix_word(self):
+        """'the ' alone → stripped to 'the', prefix 'the ' won't match (needs trailing space)."""
+        # After strip(), "the " becomes "the" which doesn't start with "the " (with space)
+        assert _clean_entity("the ") == "the"
+
+    def test_prefix_requires_trailing_space(self):
+        """Prefix stripping requires the space (won't strip 'the' from 'theorem')."""
+        assert _clean_entity("theorem") == "theorem"
+
+
+class TestTripleSerializationEdgeCases:
+    """Edge cases for Triple serialization round-trip."""
+
+    def test_round_trip_preserves_fields(self, tmp_path):
+        """Save and reload preserves all fields."""
+        store = TripleStore(str(tmp_path / "t.json"))
+        store.extract_from_commit("C001", "Title", "Added foo to bar", "why", ["f.py"])
+        with store._lock:
+            original = [t.to_dict() for t in store._triples]
+        # Reload from disk
+        store2 = TripleStore(str(tmp_path / "t.json"))
+        with store2._lock:
+            reloaded = [t.to_dict() for t in store2._triples]
+        assert len(reloaded) == len(original)
+        for orig, rel in zip(original, reloaded):
+            assert orig["subject"] == rel["subject"]
+            assert orig["predicate"] == rel["predicate"]
+
+    def test_corrupted_json_handled(self, tmp_path):
+        """Corrupted JSON file → empty store, no crash."""
+        path = str(tmp_path / "t.json")
+        with open(path, "w") as f:
+            f.write("{invalid json!!!}")
+        store = TripleStore(path)
+        with store._lock:
+            assert len(store._triples) == 0
+
+
+# ── Round-5: Concurrency Edge Cases ──────────────────────────────────
+
+
+class TestTripleConcurrency:
+    """Thread safety for concurrent triple operations."""
+
+    def test_concurrent_extraction(self, tmp_path):
+        """4 threads extracting simultaneously — no errors or corruption."""
+        import threading
+        store = TripleStore(str(tmp_path / "t.json"), max_buffer_size=500)
+        errors = []
+
+        def extractor(thread_id):
+            try:
+                for i in range(20):
+                    store.extract_from_commit(
+                        f"C{thread_id}{i:02d}", f"Title-{thread_id}-{i}",
+                        f"Added module_{thread_id}_{i} to system_{i}",
+                        "reason", [f"file_{thread_id}_{i}.py"],
+                    )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=extractor, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, f"Concurrent extraction failed: {errors}"
+        with store._lock:
+            assert len(store._triples) > 0
+
+    def test_extract_dedup(self, tmp_path):
+        """Same triple from 2 commits — dedup behavior verified."""
+        store = TripleStore(str(tmp_path / "t.json"), max_buffer_size=100)
+        store.extract_from_commit("C001", "T1", "Added auth to server", "r", [])
+        store.extract_from_commit("C002", "T2", "Added auth to server", "r", [])
+        with store._lock:
+            auth_triples = [
+                t for t in store._triples
+                if t.predicate == "added_to" and "auth" in t.subject.lower()
+            ]
+        # Should have at most 2 (one per commit) — dedup removes exact duplicates
+        assert len(auth_triples) <= 2

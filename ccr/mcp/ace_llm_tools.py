@@ -324,16 +324,16 @@ def ace_generate_bullets(
         sub = _srv._get_sub_client()
         if sub is None:
             text = "No sub-model configured. Set CCR_OLLAMA_MODEL or ANTHROPIC_API_KEY to enable ACE pipeline."
-            return AceGenerateBulletsResult(decisions=0, applied=0, message=text)
+            return AceGenerateBulletsResult(decisions=0, applied=0, pending_decisions=[], message=text)
 
         candidates = _ace_generator(context, sub)
         if not candidates:
-            return AceGenerateBulletsResult(decisions=0, applied=0, message="Generator produced no candidates.")
+            return AceGenerateBulletsResult(decisions=0, applied=0, pending_decisions=[], message="Generator produced no candidates.")
 
         filtered = _ace_reflector(candidates, context, sub)
         if not filtered:
             text = f"Reflector filtered all {len(candidates)} candidate(s). None passed quality threshold."
-            return AceGenerateBulletsResult(decisions=0, applied=0, message=text)
+            return AceGenerateBulletsResult(decisions=0, applied=0, pending_decisions=[], message=text)
 
         with _srv._state_lock:
             pb = _srv._ensure_playbook()
@@ -347,7 +347,7 @@ def ace_generate_bullets(
         decisions = _ace_curator(existing_sample, filtered, sub)
 
         if not decisions:
-            return AceGenerateBulletsResult(decisions=0, applied=0, message="Curator produced no decisions.")
+            return AceGenerateBulletsResult(decisions=0, applied=0, pending_decisions=[], message="Curator produced no decisions.")
 
         # Build pending_decisions list for preview / confirm_indices (B4)
         pending_decisions: list[dict] = []
@@ -431,15 +431,12 @@ def ace_generate_bullets(
                 lines.append(f"- [{action}] {bullet}")
 
         text = "\n".join(lines)
-        result: AceGenerateBulletsResult = {
-            "decisions": len(decisions),
-            "applied": applied_count,
-            "message": text,
-        }
-        # Always populate pending_decisions when auto_apply is False or confirm_indices given (B4)
-        if not auto_apply or confirm_indices is not None:
-            result["pending_decisions"] = pending_decisions
-        return result
+        return AceGenerateBulletsResult(
+            decisions=len(decisions),
+            applied=applied_count,
+            pending_decisions=pending_decisions if (not auto_apply or confirm_indices is not None) else [],
+            message=text,
+        )
     except Exception as e:
         raise ToolError(f"{type(e).__name__}: {e}") from e
 

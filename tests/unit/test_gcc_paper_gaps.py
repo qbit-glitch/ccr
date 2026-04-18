@@ -210,6 +210,15 @@ class TestOTASliceInCommits:
         commits_content = mem._read_file(mem._get_commits_path("main"))
         assert "OTA Trace" not in commits_content
 
+    def test_ota_trace_preserves_entry_content_with_dashes(self, mem):
+        """Verify removesuffix (not rstrip) is used — dashes in content must survive."""
+        mem.log_ota("edit", observation="o", thought="t", action="a")
+        # Commit with a 'what' field that ends with dashes
+        mem.commit("Dash-test", "Fixed foo---bar", "reason", ["f.py"], "next")
+        commits_content = mem._read_file(mem._get_commits_path("main"))
+        assert "foo---bar" in commits_content
+        assert "OTA Trace" in commits_content
+
 
 class TestFMergeIntegration:
     """6. F_merge integrates branch summary into main."""

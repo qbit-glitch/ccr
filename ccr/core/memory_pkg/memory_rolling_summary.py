@@ -205,7 +205,7 @@ class RollingSummaryMixin:
     def _write_rolling_summary(self, branch: str, summary: str) -> None:
         """Write the rolling summary into the commits.md file."""
         path = self._get_commits_path(branch)
-        with self._locks[path]:
+        with self._locks[path], self._file_lock(path):
             content = self._read_file_unlocked(path) or ""
             content = re.sub(
                 r"(## Rolling Summary\n).*?(?=\n---|\n# |\Z)",
@@ -215,3 +215,4 @@ class RollingSummaryMixin:
                 flags=re.DOTALL,
             )
             self._write_file_unlocked(path, content)
+        self._invalidate_commit_index(branch)

@@ -46,7 +46,8 @@ class TestREPLBasics:
         repl = CCRRepl()
         result = repl.execute_code("FINAL_VAR('nonexistent')")
         assert result.final_answer is None
-        assert "not found" in result.stdout.lower()
+        # Error routed to logger, not stdout (prevents MCP transport corruption)
+        assert "not found" not in result.stdout.lower()
 
     def test_show_vars_empty(self):
         repl = CCRRepl()
@@ -871,3 +872,265 @@ class TestSearchRepoFileGlob:
             # Both file types should be present (no filtering)
             assert any(p.endswith(".py") for p in result_paths)
             assert any(p.endswith(".yaml") for p in result_paths)
+
+
+# ---------------------------------------------------------------------------
+# Edge cases for repl_security.py primitives
+# ---------------------------------------------------------------------------
+
+class TestBoundedStringIO:
+    """Tests for _BoundedStringIO — output DoS prevention."""
+
+    def test_write_within_limit(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=100)
+        n = buf.write("hello")
+        assert n == 5
+        assert buf.getvalue() == "hello"
+
+    def test_write_truncates_at_limit(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=10)
+        buf.write("12345")
+        n = buf.write("6789012345")  # 10 chars, but only 5 remaining
+        assert n == 5
+        assert buf.getvalue() == "1234567890"
+
+    def test_write_returns_zero_at_capacity(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=5)
+        buf.write("12345")
+        n = buf.write("more")
+        assert n == 0
+        assert buf.getvalue() == "12345"
+
+    def test_multiple_writes_accumulate(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=20)
+        buf.write("aaa")
+        buf.write("bbb")
+        buf.write("ccc")
+        assert buf.getvalue() == "aaabbbccc"
+        assert buf._current_chars == 9
+
+    def test_max_chars_one(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=1)
+        buf.write("ab")
+        assert buf.getvalue() == "a"
+
+    def test_exact_boundary(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=5)
+        n = buf.write("12345")
+        assert n == 5
+        assert buf.getvalue() == "12345"
+        n = buf.write("6")
+        assert n == 0
+
+    def test_empty_write(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO(max_chars=10)
+        n = buf.write("")
+        assert n == 0
+        assert buf.getvalue() == ""
+
+    def test_large_default_limit(self):
+        from ccr.rlm.repl_security import _BoundedStringIO
+        buf = _BoundedStringIO()
+        assert buf._max_chars == 10_000_000
+
+
+class TestRestrictedObject:
+    """Tests for _RestrictedObject — blocks __subclasses__ traversal."""
+
+    def test_is_a_class(self):
+        from ccr.rlm.repl_security import _RestrictedObject
+        assert isinstance(_RestrictedObject, type)
+
+    def test_can_instantiate(self):
+        from ccr.rlm.repl_security import _RestrictedObject
+        obj = _RestrictedObject()
+        assert obj is not None
+
+    def test_used_as_object_replacement_in_builtins(self):
+        from ccr.rlm.repl_security import _SAFE_BUILTINS, _RestrictedObject
+        assert _SAFE_BUILTINS["object"] is _RestrictedObject
+
+    def test_does_not_expose_real_object_subclasses(self):
+        """_RestrictedObject should not have all of object's subclasses."""
+        from ccr.rlm.repl_security import _RestrictedObject
+        # _RestrictedObject.__subclasses__() should be empty or minimal,
+        # unlike object.__subclasses__() which returns hundreds of classes
+        subs = _RestrictedObject.__subclasses__()
+        assert len(subs) < 5  # real object has hundreds
+
+
+class TestValidateAstEdgeCases:
+    """Edge cases for _validate_ast — AST-level security."""
+
+    def test_empty_code(self):
+        from ccr.rlm.repl_security import _validate_ast
+        # Should not raise
+        _validate_ast("")
+
+    def test_comment_only(self):
+        from ccr.rlm.repl_security import _validate_ast
+        _validate_ast("# just a comment")
+
+    def test_whitespace_only(self):
+        from ccr.rlm.repl_security import _validate_ast
+        _validate_ast("   \n\n   ")
+
+    def test_syntax_error_returns_none(self):
+        from ccr.rlm.repl_security import _validate_ast
+        # Syntax errors should not raise (let exec handle them)
+        _validate_ast("def foo(:")  # invalid syntax
+
+    def test_nested_class_dangerous_func(self):
+        from ccr.rlm.repl_security import _validate_ast
+        code = """
+class Outer:
+    class Inner:
+        def __init_subclass__(cls):
+            pass
+"""
+        with pytest.raises(PermissionError, match="__init_subclass__"):
+            _validate_ast(code)
+
+    def test_allowed_dunder_passes(self):
+        from ccr.rlm.repl_security import _validate_ast
+        # __len__ is in the allowlist
+        _validate_ast("x = obj.__len__()")
+
+    def test_unknown_dunder_blocked(self):
+        from ccr.rlm.repl_security import _validate_ast
+        # __secret_method__ is not in allowlist or dangerous list
+        with pytest.raises(PermissionError, match="__secret_method__"):
+            _validate_ast("x = obj.__secret_method__()")
+
+
+class TestSafeImportEdgeCases:
+    """Edge cases for _safe_import."""
+
+    def test_empty_module_name(self):
+        from ccr.rlm.repl_security import _safe_import
+        with pytest.raises(ImportError, match="blocked"):
+            _safe_import("")
+
+    def test_submodule_of_allowed(self):
+        from ccr.rlm.repl_security import _safe_import
+        # collections.abc should be allowed (top_level = "collections")
+        mod = _safe_import("collections.abc")
+        assert mod is not None
+
+    def test_blocked_module_with_dots(self):
+        from ccr.rlm.repl_security import _safe_import
+        with pytest.raises(ImportError, match="blocked"):
+            _safe_import("os.path")
+
+
+class TestRestrictedOpenEdgeCases:
+    """Edge cases for _make_restricted_open."""
+
+    def test_empty_allowed_dirs(self):
+        from ccr.rlm.repl_security import _make_restricted_open
+        restricted = _make_restricted_open([])
+        with pytest.raises(PermissionError, match="access denied"):
+            restricted("/tmp/anything.txt")
+
+    def test_symlink_resolved(self):
+        from ccr.rlm.repl_security import _make_restricted_open
+        with tempfile.TemporaryDirectory() as d:
+            # Create a file and a symlink to it
+            target = os.path.join(d, "real.txt")
+            with open(target, "w") as f:
+                f.write("content")
+            link = os.path.join(d, "link.txt")
+            os.symlink(target, link)
+            restricted = _make_restricted_open([d])
+            # Symlink within allowed dir should work
+            with restricted(link) as f:
+                assert f.read() == "content"
+
+    def test_path_traversal_blocked(self):
+        from ccr.rlm.repl_security import _make_restricted_open
+        with tempfile.TemporaryDirectory() as d:
+            restricted = _make_restricted_open([d])
+            # Attempt to traverse out of allowed dir
+            with pytest.raises(PermissionError):
+                restricted(os.path.join(d, "..", "..", "etc", "passwd"))
+
+
+class TestNoGlobalImportMutation:
+    """Verify builtins.__import__ is NOT mutated during REPL execution."""
+
+    def test_builtins_import_unchanged_after_execution(self):
+        original = _builtins_module.__import__
+        repl = CCRRepl()
+        repl.execute_code("x = 1 + 2")
+        assert _builtins_module.__import__ is original
+
+    def test_blocked_import_does_not_leak_global_patch(self):
+        original = _builtins_module.__import__
+        repl = CCRRepl()
+        repl.execute_code("try:\n    import subprocess\nexcept ImportError:\n    pass")
+        assert _builtins_module.__import__ is original
+
+
+# ── Round-5: _final_var stdout leak prevention ────────────────────────
+
+
+class TestFinalVarStdoutLeak:
+    """Verify _final_var does not write to stdout (MCP transport safety)."""
+
+    def test_direct_call_no_stdout(self):
+        """Direct _final_var call produces no stdout output."""
+        import io
+        import sys
+        repl = CCRRepl()
+        old_stdout = sys.stdout
+        capture = io.StringIO()
+        sys.stdout = capture
+        try:
+            repl._final_var("nonexistent")
+        finally:
+            sys.stdout = old_stdout
+        assert capture.getvalue() == "", "stdout should be empty — error goes to logger"
+
+    def test_error_in_stderr_not_stdout_via_execute(self):
+        """Via execute_code, error does NOT appear in stdout."""
+        repl = CCRRepl()
+        result = repl.execute_code("FINAL_VAR('nonexistent')")
+        assert "not found" not in result.stdout.lower()
+
+
+class TestFinalVarObjectEdgeCases:
+    """Edge cases for _final_var with non-standard objects."""
+
+    def test_non_serializable_object(self):
+        """_final_var handles non-dict/list objects via str() fallback."""
+        repl = CCRRepl()
+        # set() is available in builtins but not JSON-serializable
+        repl.execute_code("obj = set([1, 2, 3])")
+        result = repl.execute_code("FINAL_VAR('obj')")
+        # Should return str(obj) since set is not dict/list
+        assert result.final_answer is not None
+        # str representation of a set
+        assert "1" in result.final_answer
+
+    def test_tuple_uses_str_not_json(self):
+        """_final_var with tuple — not dict/list so uses str()."""
+        repl = CCRRepl()
+        repl.execute_code("t = (1, 'hello', 3.14)")
+        result = repl.execute_code("FINAL_VAR('t')")
+        assert result.final_answer is not None
+        assert "hello" in result.final_answer
+
+    def test_very_large_variable(self):
+        """_final_var handles very large strings without crash."""
+        repl = CCRRepl()
+        repl.execute_code("big = 'x' * 1_000_000")
+        result = repl.execute_code("FINAL_VAR('big')")
+        assert result.final_answer is not None
+        assert len(result.final_answer) == 1_000_000

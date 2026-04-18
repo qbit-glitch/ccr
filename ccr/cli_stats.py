@@ -43,54 +43,92 @@ def stats(project: str, multiplier: float, last: int) -> None:
                     continue  # Skip corrupt lines
     sessions = sessions[-last:]  # Most recent N sessions
 
-    # --- Load commit count from GCC ---
-    try:
-        from ccr.core.memory import MemoryManager
-        from ccr.core.types import CCRConfig
-        mem = MemoryManager(project, CCRConfig())
-        branch = mem.get_active_branch()
-        commit_index = mem._build_commit_index(branch)
-        commit_count = len(commit_index)
-        summary_path = os.path.join(mem.ccr_root, "branches", branch, "commits.md")
-        summary_len = 0
-        if os.path.isfile(summary_path):
-            with open(summary_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            import re
-            m = re.search(r"## Rolling Summary\s*\n(.*?)\n---", content, re.DOTALL)
-            if m:
-                summary_len = len(m.group(1).strip())
-    except Exception:
-        commit_count = 0
-        branch = "main"
-        summary_len = 0
+    # --- Load commit count, links, triples, patterns ---
+    branch = "main"
+    commit_count = 0
+    summary_len = 0
+    link_count = 0
+    triple_count = 0
+    pattern_count = 0
+    bullet_count = 0
+    playbook_tokens = 0
+    discussion_count = 0
+    backend_type = "files"
 
-    # --- Load playbook ---
-    try:
-        playbook_path = os.path.join(ccr_dir, "playbook.txt")
-        playbook_text = ""
-        if os.path.isfile(playbook_path):
-            with open(playbook_path, "r", encoding="utf-8") as f:
-                playbook_text = f.read()
-        playbook_tokens = max(1, len(playbook_text) // 4)
-        bullet_count = playbook_text.count("] helpful=")
-    except Exception:
-        playbook_tokens = 0
-        bullet_count = 0
+    db_path = os.path.join(ccr_dir, "memory.db")
+    if os.path.isfile(db_path):
+        try:
+            from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+            backend = SqliteStorageBackend(ccr_dir)
+            backend_type = "sqlite"
+            commit_count = backend.commit_count(branch)
+            rs = backend.rolling_summary_get(branch)
+            summary_len = len(rs) if rs else 0
+            triple_count = backend.triple_count()
+            all_links = backend.link_get_all()
+            link_count = sum(
+                sum(len(entries) for entries in type_map.values())
+                for type_map in all_links.values()
+            )
+            pats = backend.pattern_load_all()
+            pattern_count = len(pats.get("patterns", {}))
+            bullets = backend.bullet_list(scope="project")
+            bullet_count = len(bullets)
+            playbook_tokens = max(1, sum(len(b.get("content", "")) for b in bullets) // 4)
+            discussion_count = len(backend.discussion_list(branch))
+            backend.close()
+        except Exception:
+            backend_type = "files"
 
-    click.echo("\n=== CCR Stats Dashboard ===\n")
+    if backend_type == "files":
+        try:
+            from ccr.core.memory import MemoryManager
+            from ccr.core.types import CCRConfig
+            mem = MemoryManager(project, CCRConfig())
+            branch = mem.get_active_branch()
+            commit_index = mem._build_commit_index(branch)
+            commit_count = len(commit_index)
+            summary_path = os.path.join(mem.ccr_root, "branches", branch, "commits.md")
+            if os.path.isfile(summary_path):
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                import re
+                m = re.search(r"## Rolling Summary\s*\n(.*?)\n---", content, re.DOTALL)
+                if m:
+                    summary_len = len(m.group(1).strip())
+        except Exception:
+            pass
+        try:
+            playbook_path = os.path.join(ccr_dir, "playbook.txt")
+            if os.path.isfile(playbook_path):
+                with open(playbook_path, "r", encoding="utf-8") as f:
+                    playbook_text = f.read()
+                playbook_tokens = max(1, len(playbook_text) // 4)
+                bullet_count = playbook_text.count("] helpful=")
+        except Exception:
+            pass
+
+    click.echo(f"\n=== CCR Stats Dashboard === [backend: {backend_type}]\n")
 
     click.echo(f"Project memory ({branch})")
     click.echo(f"  Commits:          {commit_count}")
     if summary_len:
         pct = summary_len * 100 // 1500
         click.echo(f"  Rolling summary:  {summary_len}/1500 chars ({pct}%)")
-        if summary_len >= 1350:  # ≥90%
+        if summary_len >= 1350:
             click.echo("  [!!] Summary near capacity — call gcc_consolidate() in your next session")
-        elif summary_len >= 1200:  # ≥80%
+        elif summary_len >= 1200:
             click.echo("  [--] Summary at 80%+ — consider calling gcc_consolidate() soon")
     if bullet_count:
         click.echo(f"  Playbook:         {playbook_tokens:,} tokens ({bullet_count} bullets)")
+    if triple_count:
+        click.echo(f"  Triples:          {triple_count}")
+    if link_count:
+        click.echo(f"  Links:            {link_count}")
+    if pattern_count:
+        click.echo(f"  Patterns:         {pattern_count}")
+    if discussion_count:
+        click.echo(f"  Discussions:      {discussion_count}")
 
     click.echo()
 

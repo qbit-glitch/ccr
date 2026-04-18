@@ -1097,3 +1097,93 @@ class TestLoadAllCommitEmbeddings:
             result = stub._load_all_commit_embeddings()
 
         assert "C004" in result
+
+
+# ---------------------------------------------------------------------------
+# Link graph pruning tests
+# ---------------------------------------------------------------------------
+
+class TestPruneLinkGraph:
+    """Tests for link graph size cap and eviction."""
+
+    def test_prune_evicts_oldest_nodes(self, memory):
+        """Graph with more nodes than max_nodes should evict oldest."""
+        data = {"version": 1, "links": {}}
+        for i in range(10):
+            cid = f"C{i:03d}"
+            data["links"][cid] = {
+                "entity": [{"target": f"C{(i+1)%10:03d}", "score": 0.5}],
+            }
+        memory.config.link_graph_max_nodes = 5
+        memory._prune_link_graph(data)
+        assert len(data["links"]) == 5
+        # Oldest (C000-C004) should be evicted; newest (C005-C009) kept
+        for i in range(5):
+            assert f"C{i:03d}" not in data["links"]
+        for i in range(5, 10):
+            assert f"C{i:03d}" in data["links"]
+
+    def test_prune_noop_under_limit(self, memory):
+        """Graph under max_nodes should not be modified."""
+        data = {"version": 1, "links": {
+            "C001": {"entity": [{"target": "C002", "score": 0.5}]},
+            "C002": {"entity": [{"target": "C001", "score": 0.5}]},
+        }}
+        memory.config.link_graph_max_nodes = 500
+        memory._prune_link_graph(data)
+        assert len(data["links"]) == 2
+
+    def test_prune_cleans_dangling_edges(self, memory):
+        """Edges pointing to evicted nodes must be removed."""
+        data = {"version": 1, "links": {
+            "C001": {"entity": [{"target": "C005", "score": 0.5}]},
+            "C002": {"semantic": [{"target": "C005", "score": 0.3}]},
+            "C005": {"entity": [
+                {"target": "C001", "score": 0.5},
+                {"target": "C002", "score": 0.4},
+            ]},
+        }}
+        memory.config.link_graph_max_nodes = 1
+        memory._prune_link_graph(data)
+        # Only C005 survives (highest numeric ID)
+        assert len(data["links"]) == 1
+        assert "C005" in data["links"]
+        # C005's edges to C001 and C002 should be cleaned
+        entity_links = data["links"]["C005"].get("entity", [])
+        assert all(e["target"] not in ("C001", "C002") for e in entity_links)
+
+
+# ---------------------------------------------------------------------------
+# LINK_TYPES constant and re-export tests
+# ---------------------------------------------------------------------------
+
+class TestLinkTypesConstant:
+    """Tests for the module-level LINK_TYPES constant and backward compat."""
+
+    def test_link_types_is_tuple(self):
+        from ccr.core.memory_pkg.memory_links_compute import LINK_TYPES
+        assert isinstance(LINK_TYPES, tuple)
+
+    def test_link_types_has_four_types(self):
+        from ccr.core.memory_pkg.memory_links_compute import LINK_TYPES
+        assert len(LINK_TYPES) == 4
+        assert "entity" in LINK_TYPES
+        assert "causal" in LINK_TYPES
+        assert "supersession" in LINK_TYPES
+        assert "semantic" in LINK_TYPES
+
+    def test_class_attribute_matches_module_constant(self):
+        """LinkComputeMixin._LINK_TYPES must equal module-level LINK_TYPES."""
+        from ccr.core.memory_pkg.memory_links_compute import LINK_TYPES, LinkComputeMixin
+        assert LinkComputeMixin._LINK_TYPES is LINK_TYPES
+
+    def test_re_export_from_memory_links(self):
+        """LINK_TYPES must be importable from memory_links (backward compat)."""
+        from ccr.core.memory_pkg.memory_links import LINK_TYPES
+        assert LINK_TYPES == ("entity", "causal", "supersession", "semantic")
+
+    def test_traversal_mixin_uses_same_constant(self):
+        """LinkTraversalMixin should use the same LINK_TYPES."""
+        from ccr.core.memory_pkg.memory_links_compute import LINK_TYPES as compute_types
+        from ccr.core.memory_pkg.memory_links_traversal import LINK_TYPES as traversal_types
+        assert compute_types is traversal_types

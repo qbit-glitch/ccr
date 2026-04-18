@@ -157,6 +157,7 @@ def gcc_patterns(
         auto_promote: If True, automatically promote all promotion candidates to the
             ACE playbook via ace_apply_delta ADD ops. Errors are silently ignored.
     """
+    min_occurrences = max(1, min_occurrences)
     with _srv._state_lock:
         mem = _srv._ensure_memory()
     result = mem.get_patterns(

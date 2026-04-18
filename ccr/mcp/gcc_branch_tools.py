@@ -117,85 +117,85 @@ def gcc_evolve_memory(
 
     with _srv._state_lock:
         mem = _srv._ensure_memory()
-    mem.sub_client = sub
+        mem.sub_client = sub
 
-    # A6a: Snapshot for rollback support
-    snapshot = dict(mem._evolved_summaries) if rollback else None
+        # A6a: Snapshot for rollback support
+        snapshot = dict(mem._evolved_summaries) if rollback else None
 
-    branch = mem.get_active_branch()
-    evolutions_performed: list[str] = []
-    diff_lines: list[str] = []
+        branch = mem.get_active_branch()
+        evolutions_performed: list[str] = []
+        diff_lines: list[str] = []
 
-    try:
-        from ccr.core.types import CommitLink  # noqa: PLC0415
-        links_data = mem._load_links()
+        try:
+            from ccr.core.types import CommitLink  # noqa: PLC0415
+            links_data = mem._load_links()
 
-        def _evolve_commit_with_links(cid: str) -> int:
-            """Evolve one commit's linked peers. Returns count of newly evolved entries."""
-            node = links_data.get("links", {}).get(cid, {})
-            candidate_links: list[CommitLink] = []
-            for lt in ("semantic", "supersession"):
-                for entry in node.get(lt, []):
-                    score = entry.get("score", 0.0)
-                    if score > 0.5:
-                        candidate_links.append(CommitLink(
-                            target=entry["target"],
-                            link_type=lt,
-                            score=score,
-                        ))
-            if not candidate_links:
-                return 0
-            before = set(mem._evolved_summaries.keys())
-            # A6c: Record before state for diff
-            before_states: dict[str, str] = {}
-            for link in candidate_links:
-                tid = link.target if hasattr(link, "target") else link.get("target", "")
-                existing = mem.get_evolved_what(tid)
-                before_states[tid] = existing or ""
-            mem._trigger_memory_evolution(cid, candidate_links)
-            after = set(mem._evolved_summaries.keys())
-            new_keys = after - before
-            # Build diff entries
-            for tid in new_keys:
-                after_what = mem.get_evolved_what(tid) or ""
-                before_what = before_states.get(tid, "")
-                diff_lines.append(f"[{tid}]: '{before_what[:60]}' → '{after_what[:60]}'")
-            return len(new_keys)
+            def _evolve_commit_with_links(cid: str) -> int:
+                """Evolve one commit's linked peers. Returns count of newly evolved entries."""
+                node = links_data.get("links", {}).get(cid, {})
+                candidate_links: list[CommitLink] = []
+                for lt in ("semantic", "supersession"):
+                    for entry in node.get(lt, []):
+                        score = entry.get("score", 0.0)
+                        if score > 0.5:
+                            candidate_links.append(CommitLink(
+                                target=entry["target"],
+                                link_type=lt,
+                                score=score,
+                            ))
+                if not candidate_links:
+                    return 0
+                before = set(mem._evolved_summaries.keys())
+                # A6c: Record before state for diff
+                before_states: dict[str, str] = {}
+                for link in candidate_links:
+                    tid = link.target if hasattr(link, "target") else link.get("target", "")
+                    existing = mem.get_evolved_what(tid)
+                    before_states[tid] = existing or ""
+                mem._trigger_memory_evolution(cid, candidate_links)
+                after = set(mem._evolved_summaries.keys())
+                new_keys = after - before
+                # Build diff entries
+                for tid in new_keys:
+                    after_what = mem.get_evolved_what(tid) or ""
+                    before_what = before_states.get(tid, "")
+                    diff_lines.append(f"[{tid}]: '{before_what[:60]}' → '{after_what[:60]}'")
+                return len(new_keys)
 
-        if commit_id:
-            n = _evolve_commit_with_links(commit_id)
-            if n > 0:
-                evolutions_performed.append(f"{commit_id}: {n} new evolution(s)")
-            else:
-                evolutions_performed.append(
-                    f"{commit_id}: no new evolutions "
-                    "(no eligible links or sub-model produced no changes)"
-                )
-        else:
-            # Scan last 10 commits
-            recent = mem._parse_recent_commit_data(branch, k=10)
-            for commit in recent:
-                cid = commit.get("id", "")
-                if not cid:
-                    continue
-                n = _evolve_commit_with_links(cid)
+            if commit_id:
+                n = _evolve_commit_with_links(commit_id)
                 if n > 0:
-                    evolutions_performed.append(f"{cid}: {n} new evolution(s)")
+                    evolutions_performed.append(f"{commit_id}: {n} new evolution(s)")
+                else:
+                    evolutions_performed.append(
+                        f"{commit_id}: no new evolutions "
+                        "(no eligible links or sub-model produced no changes)"
+                    )
+            else:
+                # Scan last 10 commits
+                recent = mem._parse_recent_commit_data(branch, k=10)
+                for commit in recent:
+                    cid = commit.get("id", "")
+                    if not cid:
+                        continue
+                    n = _evolve_commit_with_links(cid)
+                    if n > 0:
+                        evolutions_performed.append(f"{cid}: {n} new evolution(s)")
 
-    except Exception as e:
-        if rollback and snapshot is not None:
-            mem._evolved_summaries = snapshot
-            try:
-                mem._save_evolved_summaries()
-            except Exception:
-                pass
-        raise ToolError(f"Error during memory evolution: {type(e).__name__}: {e}") from e
+        except Exception as e:
+            if rollback and snapshot is not None:
+                mem._evolved_summaries = snapshot
+                try:
+                    mem._save_evolved_summaries()
+                except Exception:
+                    pass
+            raise ToolError(f"Error during memory evolution: {type(e).__name__}: {e}") from e
 
-    if not evolutions_performed or all("no new evolutions" in e for e in evolutions_performed):
-        text = "No evolutions performed. Ensure commits have semantic/supersession links with score > 0.5."
-        return GccEvolveMemoryResult(evolutions=0, message=text)
-    count = sum(1 for e in evolutions_performed if "no new evolutions" not in e)
-    text = "A-MEM memory evolution complete:\n" + "\n".join(f"  - {e}" for e in evolutions_performed)
-    if diff_lines:
-        text += "\n\n## Diffs\n" + "\n".join(f"  {d}" for d in diff_lines)
-    return GccEvolveMemoryResult(evolutions=count, message=text)
+        if not evolutions_performed or all("no new evolutions" in e for e in evolutions_performed):
+            text = "No evolutions performed. Ensure commits have semantic/supersession links with score > 0.5."
+            return GccEvolveMemoryResult(evolutions=0, message=text)
+        count = sum(1 for e in evolutions_performed if "no new evolutions" not in e)
+        text = "A-MEM memory evolution complete:\n" + "\n".join(f"  - {e}" for e in evolutions_performed)
+        if diff_lines:
+            text += "\n\n## Diffs\n" + "\n".join(f"  {d}" for d in diff_lines)
+        return GccEvolveMemoryResult(evolutions=count, message=text)

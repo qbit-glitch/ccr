@@ -8,6 +8,7 @@ import pytest
 
 from ccr.ace.playbook import (
     Bullet,
+    DEFAULT_SECTIONS,
     DeltaOperation,
     FailureLesson,
     Playbook,
@@ -2716,3 +2717,110 @@ class TestMergePreservesWeightedCounters:
         import math
         assert math.isclose(keeper.weighted_helpful, 3.0, rel_tol=1e-9)
         assert math.isclose(keeper.weighted_harmful, 1.0, rel_tol=1e-9)
+
+
+class TestSelfMergeGuard:
+    """Fix 2: Self-merge (bullet_id == merge_target) must be a no-op."""
+
+    def test_self_merge_is_noop(self):
+        pb = Playbook("")
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS",
+                           content="self-merge test bullet"),
+        ])
+        bullet_id = pb._bullets[0].id
+        original_helpful = pb._bullets[0].helpful
+        original_harmful = pb._bullets[0].harmful
+        original_content = pb._bullets[0].content
+
+        pb.apply_delta([
+            DeltaOperation(op_type="MERGE", section="", content="merged",
+                           bullet_id=bullet_id, merge_target=bullet_id)
+        ])
+
+        bullet = pb.get_bullet(bullet_id)
+        assert bullet is not None, "Bullet was deleted by self-merge"
+        assert bullet.helpful == original_helpful
+        assert bullet.harmful == original_harmful
+        assert bullet.content == original_content
+        assert len(pb._bullets) == 1
+
+
+# ── Backend Roundtrip ──────────────────────────────────────────────
+
+
+class TestPlaybookBackendRoundtrip:
+    def test_from_backend_roundtrip(self, tmp_path):
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+
+        ccr = tmp_path / ".ccr"
+        ccr.mkdir()
+        backend = SqliteStorageBackend(str(ccr))
+
+        pb = Playbook("## STRATEGIES & INSIGHTS\n[str-00001] helpful=3 harmful=1 :: Test strategy")
+        pb.save_to_backend(backend)
+
+        pb2 = Playbook.from_backend(backend)
+        assert len(pb2.bullets) == 1
+        assert pb2.bullets[0].helpful == 3
+        assert pb2.bullets[0].content == "Test strategy"
+        assert pb2.sections == pb.sections
+        backend.close()
+
+    def test_save_deletes_removed_bullets(self, tmp_path):
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+
+        ccr = tmp_path / ".ccr"
+        ccr.mkdir()
+        backend = SqliteStorageBackend(str(ccr))
+
+        pb = Playbook(
+            "## STRATEGIES & INSIGHTS\n"
+            "[str-00001] helpful=0 harmful=0 :: Keep me\n"
+            "[str-00002] helpful=0 harmful=0 :: Remove me\n"
+        )
+        pb.save_to_backend(backend)
+        assert len(backend.bullet_list()) == 2
+
+        pb2 = Playbook.from_backend(backend)
+        pb2._bullets = [b for b in pb2._bullets if b.id != "str-00002"]
+        pb2._id_index.pop("str-00002", None)
+        pb2.save_to_backend(backend)
+        assert len(backend.bullet_list()) == 1
+        assert backend.bullet_get("str-00002") is None
+        backend.close()
+
+    def test_from_backend_empty(self, tmp_path):
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+
+        ccr = tmp_path / ".ccr"
+        ccr.mkdir()
+        backend = SqliteStorageBackend(str(ccr))
+
+        pb = Playbook.from_backend(backend)
+        assert len(pb.bullets) == 0
+        assert pb.sections == list(DEFAULT_SECTIONS)
+        backend.close()
+
+    def test_from_backend_with_failure_lessons(self, tmp_path):
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+
+        ccr = tmp_path / ".ccr"
+        ccr.mkdir()
+        backend = SqliteStorageBackend(str(ccr))
+
+        backend.bullet_insert({
+            "id": "str-00001", "section": "STRATEGIES & INSIGHTS",
+            "content": "Test", "created_at": "2026-04-17T00:00:00+00:00",
+        })
+        backend.failure_lessons_insert("str-00001", {
+            "failure_point": "broke here",
+            "flawed_reasoning": "wrong assumption",
+            "counterfactual": "should have done X",
+            "prevention_principle": "always do X",
+        })
+
+        pb = Playbook.from_backend(backend)
+        assert len(pb.bullets[0].failure_lessons) == 1
+        assert pb.bullets[0].failure_lessons[0].failure_point == "broke here"
+        backend.close()

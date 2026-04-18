@@ -89,8 +89,9 @@ def _clean_entity(text: str) -> str:
 class TripleStore:
     """Zero-LLM triple store with regex extraction and word Jaccard search."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_buffer_size: int = 500):
         self._path = path
+        self._max_buffer_size = max_buffer_size
         self._lock = threading.Lock()
         self._triples: list[Triple] = []
         self._triple_keys: set[tuple[str, str, str]] = set()
@@ -172,6 +173,7 @@ class TripleStore:
                     self._triple_keys.add((triple.subject, triple.predicate, triple.object))
                     new_triples.append(triple)
             if new_triples:
+                self._enforce_buffer_size()
                 self._save()
 
         return new_triples
@@ -179,6 +181,30 @@ class TripleStore:
     def _is_duplicate(self, new: Triple) -> bool:
         """O(1) check: triple already exists (same subject+predicate+object)."""
         return (new.subject, new.predicate, new.object) in self._triple_keys
+
+    def _enforce_buffer_size(self) -> None:
+        """Evict lowest-value triples when buffer exceeds max size.
+
+        Must be called under self._lock. Sorts by (confidence ASC, timestamp ASC)
+        and evicts from the front (lowest value first).
+        """
+        if len(self._triples) <= self._max_buffer_size:
+            return
+        sorted_triples = sorted(
+            self._triples, key=lambda t: (t.confidence, t.timestamp)
+        )
+        evict_count = len(sorted_triples) - self._max_buffer_size
+        evicted = sorted_triples[:evict_count]
+        self._triples = sorted_triples[evict_count:]
+        for t in evicted:
+            self._triple_keys.discard((t.subject, t.predicate, t.object))
+
+    def get_recent(self, top_k: int = 10) -> list[Triple]:
+        """Return most recent triples sorted by timestamp descending."""
+        with self._lock:
+            return sorted(
+                self._triples, key=lambda t: t.timestamp, reverse=True
+            )[:top_k]
 
     def search(self, query: str, top_k: int = 10) -> list[Triple]:
         """Search triples by word Jaccard similarity against query."""

@@ -344,6 +344,7 @@ def rlm_finalize(
             result_json = _json.dumps(extracted)
             return RlmFinalizeResult(
                 variable_name=",".join(variables),
+                variables=extracted,
                 message=result_json,
             )
 
@@ -372,7 +373,7 @@ def rlm_finalize(
         if keep_session:
             answer = answer + " Session preserved — call rlm_finalize again or rlm_execute to continue."
 
-        return RlmFinalizeResult(variable_name=variable_name, message=answer)
+        return RlmFinalizeResult(variable_name=variable_name, variables={}, message=answer)
     except ValueError:
         raise  # User input validation — let MCP propagate
     except ToolError:

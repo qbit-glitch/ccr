@@ -85,7 +85,7 @@ class FileIOMixin:
         if os.path.isfile(gitignore_path):
             content = self._read_file(gitignore_path) or ""
         if ".ccr/" not in content and ".ccr" not in content:
-            with open(gitignore_path, "a") as f:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
                 f.write("\n# CCR context directory\n.ccr/\n")
 
     # --- File I/O (thread-safe + cross-process wrappers) ---
@@ -104,7 +104,7 @@ class FileIOMixin:
             return
         lock_path = path + ".lock"
         os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-        lock_fd = open(lock_path, "w")
+        lock_fd = open(lock_path, "w", encoding="utf-8")
         try:
             _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_EX)
             yield

@@ -66,6 +66,36 @@ def index_build(
     try:
         # Incremental mode: skip rebuild if mtime signature unchanged
         if incremental and not force:
+            # Try SQLite-backed incremental build first
+            if _srv._index_db is not None:
+                try:
+                    idx, changed = RepoIndex.incremental_build(
+                        _srv._project_root, _srv._index_db,
+                        extensions=exts,
+                        max_file_size_kb=max(1, max_file_size_kb),
+                    )
+                    if changed == 0:
+                        with _srv._state_lock:
+                            _srv._repo_index = idx
+                        return IndexBuildResult(
+                            files_indexed=len(idx.files),
+                            message=(
+                                f"Index up to date ({len(idx.files)} files,"
+                                " no rebuild needed). [SQLite-backed]"
+                            ),
+                        )
+                    with _srv._state_lock:
+                        _srv._repo_index = idx
+                    # Save JSON cache too for backward compat
+                    try:
+                        mem = _srv._ensure_memory()
+                        mem.save_index(_srv._repo_index.to_json())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass  # Fall through to legacy incremental
+
+            # Legacy JSON cache incremental check
             cache_json = None
             try:
                 mem = _srv._ensure_memory()
@@ -98,7 +128,12 @@ def index_build(
                 progress_interval=progress_interval,
             )
 
-            # Cache
+            # Save to IndexDB + JSON cache
+            if _srv._index_db is not None:
+                try:
+                    _srv._repo_index.save_to_db(_srv._index_db)
+                except Exception:
+                    pass
             mem = _srv._ensure_memory()
             try:
                 mem.save_index(_srv._repo_index.to_json())
@@ -210,6 +245,9 @@ def index_search(
     elif resolved_mode == "semantic":
         if _srv._embedding_model is not None and idx._embeddings:
             results = idx.semantic_search(query, _srv._embedding_model, top_k=top_k, file_glob=file_glob)
+        elif _srv._index_db is not None and _srv._index_db.fts_available:
+            results = idx.fts5_search(query, _srv._index_db, top_k=top_k)
+            suffix = " (FTS5 fallback)"
         else:
             results = idx.bm25_search(query, top_k=top_k, file_glob=file_glob)
             suffix = " (BM25 fallback)"
@@ -316,11 +354,20 @@ def index_status() -> IndexStatusResult:
             live_sig = idx._compute_mtime_sig()
             is_stale = (live_sig != idx._mtime_sig) or not idx._mtime_sig
 
+        # IndexDB stats
+        db_info = ""
+        if _srv._index_db is not None:
+            db_files = _srv._index_db.file_count()
+            db_chunks = _srv._index_db.chunk_count()
+            fts = "yes" if _srv._index_db.fts_available else "no"
+            db_info = f" SQLite index: {db_files} files, {db_chunks} chunks, FTS5={fts}."
+
         status = "stale" if is_stale else "up to date"
         msg = (
             f"Index {status}. {file_count} files indexed"
             + (f", built at {built_at}" if built_at else "")
             + (f". {chunk_count} chunk embeddings." if chunk_embeddings_available else ".")
+            + db_info
             + ("" if not is_stale else " Run index_build to refresh.")
         )
         return IndexStatusResult(

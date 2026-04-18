@@ -91,6 +91,7 @@ def _apply_rollback(pb, schema, history, save_fn, sp, max_hist: int = 20) -> Ace
     if schema.parent_version is None:
         return AceEvolveSchemaResult(
             version=schema.version,
+            health=0.0,
             message="Cannot rollback: no parent schema version exists.",
         )
     parent = None
@@ -101,6 +102,7 @@ def _apply_rollback(pb, schema, history, save_fn, sp, max_hist: int = 20) -> Ace
     if parent is None:
         return AceEvolveSchemaResult(
             version=schema.version,
+            health=0.0,
             message=f"Cannot rollback: parent version {schema.parent_version} not found in history.",
         )
     # Apply parent schema to playbook
@@ -246,6 +248,7 @@ def ace_evolve_schema(
                 if idx < 0 or idx >= len(proposals):
                     return AceEvolveSchemaResult(
                         version=schema.version,
+                        health=0.0,
                         message=f"Invalid proposal index {apply_proposal}. Available: {len(proposals)}.",
                     )
                 proposal = proposals[idx]

@@ -55,6 +55,12 @@ class InitMixin:
         self._schema_overrides: dict[str, Any] = {}
         self._commit_index: dict[str, dict[str, str]] = {}
 
+        from ccr.core.storage import get_backend
+        global_ccr = os.path.expanduser("~/.ccr")
+        self._storage = get_backend(
+            self.config.storage_backend, self.ccr_root, global_ccr,
+        )
+
     def set_sub_client(self, client) -> None:
         """Set the sub-model client for LLM-regenerated rolling summaries."""
         self.sub_client = client
@@ -89,12 +95,15 @@ class InitMixin:
             REGISTRY_TEMPLATE,
         )
 
-        created = False
         main_branch_dir = os.path.join(self.branches_dir, "main")
+        metadata_path = self._get_metadata_path()
+
+        # SQLite backend may create .ccr/ before ensure_structure runs,
+        # so check metadata.yaml as the canonical "was initialized" signal
+        created = not os.path.isfile(metadata_path)
 
         if not os.path.isdir(self.ccr_root):
             os.makedirs(self.ccr_root, exist_ok=True)
-            created = True
 
         os.makedirs(main_branch_dir, exist_ok=True)
 

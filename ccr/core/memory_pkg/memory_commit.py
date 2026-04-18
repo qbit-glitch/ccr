@@ -197,7 +197,7 @@ class CommitMixin:
         # Reference OTA log slice in commit (per GCC paper)
         ota_slice = self._get_ota_slice_since_last_commit(branch)
         if ota_slice:
-            entry = entry.rstrip("---\n\n") + f"**OTA Trace**: {ota_slice}\n\n---\n\n"
+            entry = entry.removesuffix("---\n\n") + f"**OTA Trace**: {ota_slice}\n\n---\n\n"
 
         self._prepend_commit(branch, entry)
 

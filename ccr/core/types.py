@@ -468,12 +468,16 @@ class CCRConfig:
     pattern_dedup_threshold: float = 0.7     # word Jaccard for dedup
     pattern_promotion_count: int = 3          # commits before suggesting ACE promotion
     pattern_max_buffer_size: int = 200        # max patterns in buffer
+    triple_max_buffer_size: int = 500         # max triples in store
+    link_graph_max_nodes: int = 500           # max commit nodes in link graph
     # Phase 2: Auto-extract transferable patterns via sub-model (CER §3.2, opt-in)
     auto_extract_patterns: bool = False  # must opt in — adds latency to every commit
     # Session Logger: persist Q&A turns to SQLite for replay/debug/training-data
     session_logging_enabled: bool = True
     session_db_path: str = ""          # defaults to .ccr/sessions.db when empty
     session_fts_enabled: bool = True   # FTS5 full-text search across turns
+    # Storage backend: "sqlite" (default, v4) or "files" (legacy flat-file)
+    storage_backend: str = "sqlite"
 
 
 @dataclass

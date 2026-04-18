@@ -22,6 +22,7 @@ import ccr.mcp.server as _srv
 # Module-level idempotency key store (B3)
 # ---------------------------------------------------------------------------
 
+_IDEMPOTENCY_CAP = 10_000
 _applied_idempotency_keys: set[str] = set()
 
 
@@ -200,6 +201,8 @@ def ace_apply_delta(
         atomic: If True, roll back all changes on any exception during apply.
         author: Optional author identifier recorded in the history log.
     """
+    if not operations:
+        raise ValueError("operations list cannot be empty")
     try:
         with _srv._state_lock:
             pb, save_fn = _srv._resolve_playbook(scope)
@@ -229,10 +232,14 @@ def ace_apply_delta(
                     lines.append(f"  WARN: {len(failed_ids)} operation(s) would fail (missing bullet_id): {failed_ids}")
                 lines.append(f"  Estimated bullet count after: {estimated_new_count} (currently {len(pb.bullets)})")
                 lines.append("No changes made. Remove dry_run=True to apply.")
-                result: AceApplyDeltaResult = {"applied": 0, "scope": scope, "message": "\n".join(lines)}
-                if failed_ids:
-                    result["failed_ids"] = failed_ids
-                return result
+                return AceApplyDeltaResult(
+                    applied=0,
+                    scope=scope,
+                    message="\n".join(lines),
+                    failed_ids=failed_ids,
+                    delta_history_path="",
+                    author=author,
+                )
 
             # Atomic snapshot before apply (B2)
             snapshot: str | None = None
@@ -302,14 +309,14 @@ def ace_apply_delta(
         except Exception:
             pass  # Never fail the apply operation
 
-        result: AceApplyDeltaResult = {"applied": applied, "scope": scope, "message": text}
-        if failed_ids:
-            result["failed_ids"] = failed_ids
-        if history_path:
-            result["delta_history_path"] = history_path
-        if author:
-            result["author"] = author
-        return result
+        return AceApplyDeltaResult(
+            applied=applied,
+            scope=scope,
+            message=text,
+            failed_ids=failed_ids,
+            delta_history_path=history_path or "",
+            author=author,
+        )
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -354,6 +361,7 @@ def ace_update_counters(
         return AceUpdateCountersResult(
             updated=0,
             scope=scope,
+            missing_ids=[],
             message=f"Already applied (idempotency_key: {idempotency_key!r}). Skipped.",
         )
 
@@ -382,6 +390,8 @@ def ace_update_counters(
         # Mark idempotency key as used after successful update (B3)
         if idempotency_key:
             _applied_idempotency_keys.add(idempotency_key)
+            if len(_applied_idempotency_keys) > _IDEMPOTENCY_CAP:
+                _applied_idempotency_keys.clear()
 
         # Propagate quality feedback to source patterns (EvolveR-inspired)
         quality_propagated = 0
@@ -422,10 +432,12 @@ def ace_update_counters(
         if validation_warnings:
             parts.append("Validation warnings: " + "; ".join(validation_warnings))
         text = " ".join(parts)
-        result: AceUpdateCountersResult = {"updated": updated, "scope": scope, "message": text}
-        if missing:
-            result["missing_ids"] = missing
-        return result
+        return AceUpdateCountersResult(
+            updated=updated,
+            scope=scope,
+            missing_ids=missing,
+            message=text,
+        )
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:
@@ -507,14 +519,21 @@ def ace_find_similar(
             ]
 
         if not pairs:
-            return AceFindSimilarResult(pairs_found=0, scope=scope, message="No cross-tier similar bullet pairs found.")
+            return AceFindSimilarResult(pairs_found=0, scope=scope, pairs=[], message="No cross-tier similar bullet pairs found.")
         lines = ["Cross-tier similarities (global vs project):"]
+        cross_pairs_list: list[dict] = []
         for a, b, sim in pairs[:10]:
             lines.append(f"[{a.id}] (global) vs [{b.id}] (project) (similarity={sim:.2f})")
             lines.append(f"  G: {a.content[:100]}")
             lines.append(f"  P: {b.content[:100]}")
+            cross_pairs_list.append({
+                "a_id": a.id, "b_id": b.id,
+                "similarity": round(sim, 3),
+                "a_content": a.content[:120],
+                "b_content": b.content[:120],
+            })
         text = "\n".join(lines)
-        return AceFindSimilarResult(pairs_found=len(pairs), scope=scope, message=text)
+        return AceFindSimilarResult(pairs_found=len(pairs), scope=scope, pairs=cross_pairs_list, message=text)
 
     pb, save_fn = _srv._resolve_playbook(scope)
     pairs = pb.find_similar_pairs(threshold)
@@ -533,7 +552,15 @@ def ace_find_similar(
     if auto_merge_above is not None:
         with _srv._state_lock:
             pb, save_fn = _srv._resolve_playbook(scope)
-            for a, b, sim in pairs:
+            # Recompute pairs under lock to avoid TOCTOU with stale bullet refs
+            merge_pairs = pb.find_similar_pairs(threshold)
+            if section:
+                sec_lower_m = section.lower()
+                merge_pairs = [
+                    (a, b, sim) for a, b, sim in merge_pairs
+                    if sec_lower_m in a.section.lower() or sec_lower_m in b.section.lower()
+                ]
+            for a, b, sim in merge_pairs:
                 if sim >= auto_merge_above:
                     try:
                         merged_content = (
@@ -560,7 +587,7 @@ def ace_find_similar(
 
     if not pairs:
         text = f"No similar bullet pairs found in {scope} playbook."
-        return AceFindSimilarResult(pairs_found=0, scope=scope, message=text)
+        return AceFindSimilarResult(pairs_found=0, scope=scope, pairs=[], message=text)
     lines = []
     for a, b, sim in pairs[:10]:
         lines.append(f"[{a.id}] vs [{b.id}] (similarity={sim:.2f})")
@@ -681,15 +708,13 @@ def ace_prune(scope: str = "project", archive: bool = True) -> AcePruneResult:
         if _schema_warn:
             text += _schema_warn
 
-        result: AcePruneResult = {
-            "removed": total,
-            "evolved": len(evolved),
-            "scope": scope,
-            "message": text,
-        }
-        if removed_ids:
-            result["removed_ids"] = removed_ids
-        return result
+        return AcePruneResult(
+            removed=total,
+            evolved=len(evolved),
+            scope=scope,
+            removed_ids=removed_ids,
+            message=text,
+        )
     except ValueError:
         raise  # User input validation — let MCP propagate
     except Exception as e:

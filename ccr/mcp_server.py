@@ -121,7 +121,7 @@ for _name in (
     "_project_root", "_memory", "_playbook", "_playbook_path",
     "_failure_lessons_path", "_global_playbook", "_global_playbook_path",
     "_global_failure_lessons_path", "_repo_index", "_repl",
-    "_repl_sessions", "_repl_sessions_lock", "_repl_session_ttl",
+    "_repl_sessions", "_repl_session_ttl",
     "_schema_path", "_global_schema_path", "_embedding_model",
     "_embeddings_path", "_chunk_embeddings_path", "_scratchpad",
     "_triple_store", "_state_lock",

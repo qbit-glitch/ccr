@@ -21,7 +21,7 @@ def _load_config(config_path: str | None, overrides: dict):
 
     base = {}
     if config_path and os.path.isfile(config_path):
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             base = yaml.safe_load(f) or {}
 
     # Build config from defaults + file + overrides
@@ -177,6 +177,16 @@ def init(project: str) -> None:
     mem = MemoryManager(project)
     created = mem.ensure_structure()
     _register_project(project)
+
+    # Create SQLite tables for fresh projects
+    ccr_dir = os.path.join(project, ".ccr")
+    try:
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+        backend = SqliteStorageBackend(ccr_dir)
+        backend.close()
+    except Exception:
+        pass
+
     if created:
         click.echo(f"Initialized .ccr/ in {project}")
     else:
@@ -683,6 +693,12 @@ def _register_project(project_root: str) -> None:
         json.dump(projects_list, f, indent=2)
         f.write("\n")
 
+
+# Register export/import commands
+from ccr.cli_export import export as export_cmd  # noqa: E402
+from ccr.cli_import import import_cmd  # noqa: E402
+cli.add_command(export_cmd)
+cli.add_command(import_cmd)
 
 # Register preset commands from cli_presets.py
 try:
