@@ -108,6 +108,20 @@ class Phase3aMixin:
 
     def commit_search_text(self, branch: str, term: str, max_results: int = 5) -> list[dict]:
         conn = self.memory_conn
+        # FTS5 path — fast + ranked
+        if getattr(self, "_fts_available", False):
+            try:
+                rows = conn.execute(
+                    """SELECT c.* FROM commits c
+                       JOIN commits_fts f ON f.rowid = c.rowid
+                       WHERE c.branch = ? AND commits_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (branch, term, max_results),
+                ).fetchall()
+                if rows:
+                    return [self._row_to_commit_dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                pass  # Malformed FTS query → fall through to LIKE
         like_term = f"%{_escape_like(term)}%"
         rows = conn.execute(
             """SELECT * FROM commits WHERE branch = ?
@@ -119,6 +133,38 @@ class Phase3aMixin:
             (branch, like_term, like_term, like_term, like_term, like_term, max_results),
         ).fetchall()
         return [self._row_to_commit_dict(r) for r in rows]
+
+    def commit_search_with_snippet(
+        self, branch: str, term: str, max_results: int = 5,
+    ) -> list[dict]:
+        """FTS5-aware commit search returning snippets + ranks.
+
+        Returns [] when FTS5 is unavailable or the query fails.
+        Callers must fall back to commit_search_text in that case.
+        """
+        if not getattr(self, "_fts_available", False):
+            return []
+        conn = self.memory_conn
+        try:
+            rows = conn.execute(
+                """SELECT c.*,
+                          snippet(commits_fts, -1, '[', ']', '...', 12) AS snippet_text,
+                          rank
+                   FROM commits c
+                   JOIN commits_fts f ON f.rowid = c.rowid
+                   WHERE c.branch = ? AND commits_fts MATCH ?
+                   ORDER BY rank LIMIT ?""",
+                (branch, term, max_results),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        out = []
+        for r in rows:
+            d = self._row_to_commit_dict(r)
+            d["snippet"] = r["snippet_text"]
+            d["rank"] = r["rank"]
+            out.append(d)
+        return out
 
     def commit_count(self, branch: str) -> int:
         conn = self.memory_conn

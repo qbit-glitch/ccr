@@ -21,6 +21,7 @@ import os
 import sqlite3
 import threading
 
+from ccr.core.storage._sqlite_fts5 import install_fts5
 from ccr.core.storage._sqlite_phase1 import Phase1Mixin
 from ccr.core.storage._sqlite_phase2 import Phase2Mixin
 from ccr.core.storage._sqlite_phase3a import Phase3aMixin
@@ -379,6 +380,20 @@ class SqliteStorageBackend(
         self._ensure_phase3b_tables()
         self._ensure_phase3c_tables()
 
+        # Phase 2: install FTS5 virtual tables + triggers (graceful if FTS5 missing)
+        self._fts_available: bool = install_fts5(self.memory_conn)
+
+        # Phase 2.4: backfill FTS5 indexes from existing rows for pre-Phase-2 DBs.
+        # Use PRAGMA user_version as a one-way schema guard:
+        #   0 -> pre-Phase-2 (needs backfill), 1 -> Phase 2 backfill complete.
+        if self._fts_available:
+            conn = self.memory_conn
+            current_version = self._memory_mgr.get_user_version()
+            if current_version < 1:
+                from ._sqlite_fts5 import backfill_fts5
+                backfill_fts5(conn)
+                self._memory_mgr.set_user_version(1)
+
     def _ensure_phase1_tables(self) -> None:
         self.memory_conn.executescript(_PHASE1_TABLES)
 
@@ -406,6 +421,11 @@ class SqliteStorageBackend(
     @property
     def backend_type(self) -> str:
         return "sqlite"
+
+    @property
+    def fts_available(self) -> bool:
+        """True iff FTS5 virtual tables + triggers were installed at init."""
+        return self._fts_available
 
     @property
     def memory_conn(self) -> sqlite3.Connection:

@@ -40,3 +40,7 @@ class FileStorageBackend(
     @property
     def backend_type(self) -> str:
         return "files"
+
+    @property
+    def fts_available(self) -> bool:
+        return False

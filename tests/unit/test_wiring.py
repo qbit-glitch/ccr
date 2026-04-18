@@ -350,3 +350,26 @@ class TestCacheConsistency:
         mem._commit_index["main"] = {"test": "data"}
         mem._write_rolling_summary("main", "new summary")
         assert "main" not in mem._commit_index
+
+
+# ── Search wiring (Task 2.3) ──────────────────────────────────
+
+
+class TestSearchWiring:
+    def test_pattern_search_text_both_backends(self, mem):
+        # Uses high-level API to add a pattern then search via storage
+        # Ensure both files + sqlite implement pattern_search_text
+        data = {"version": 1, "patterns": {
+            "p-001": {"text": "auth pattern", "occurrence_count": 1,
+                      "success_count": 0, "failure_count": 0, "quality_score": 0.5,
+                      "first_seen": "2026-04-18", "last_seen": "2026-04-18",
+                      "promoted": False, "commit_ids": []}
+        }}
+        mem._storage.pattern_save_all(data)
+        hits = mem._storage.pattern_search_text("auth", max_results=5)
+        assert len(hits) == 1
+
+    def test_discussion_search_text_both_backends(self, mem):
+        mem.add_discussion("test topic", "my hypothesis", "", "decided", "because", "", "")
+        hits = mem._storage.discussion_search_text("main", "topic", max_results=5)
+        assert len(hits) >= 1

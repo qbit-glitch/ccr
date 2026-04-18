@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from ccr.core.storage._sqlite_utils import _escape_like, _utcnow
 
@@ -37,6 +38,30 @@ class Phase3cMixin:
         topic: str | None = None, date_range: list[str] | None = None,
     ) -> list[dict]:
         conn = self.memory_conn
+        # FTS5 path — only when `search` is the sole text filter so that the
+        # MATCH query benefits from the inverted index. Additional filters
+        # (topic / date_range) are still AND-combined on the base table.
+        if search and getattr(self, "_fts_available", False):
+            try:
+                sql_fts = (
+                    "SELECT d.* FROM discussions d "
+                    "JOIN discussions_fts f ON f.rowid = d.rowid "
+                    "WHERE d.branch = ? AND discussions_fts MATCH ?"
+                )
+                fts_params: list = [branch, search]
+                if topic:
+                    sql_fts += " AND d.topic LIKE ? ESCAPE '\\'"
+                    fts_params.append(f"%{_escape_like(topic)}%")
+                if date_range and len(date_range) >= 2:
+                    sql_fts += " AND d.timestamp >= ? AND d.timestamp <= ?"
+                    fts_params.extend([date_range[0], date_range[1]])
+                sql_fts += " ORDER BY rank"
+                rows = conn.execute(sql_fts, fts_params).fetchall()
+                if rows:
+                    return [self._row_to_discussion_dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                pass  # Malformed FTS query → fall through to LIKE
+
         sql = "SELECT * FROM discussions WHERE branch = ?"
         params: list = [branch]
 
@@ -54,20 +79,50 @@ class Phase3cMixin:
 
         sql += " ORDER BY id DESC"
         rows = conn.execute(sql, params).fetchall()
-        return [
-            {
-                "id": r["id"],
-                "timestamp": r["timestamp"],
-                "topic": r["topic"],
-                "hypothesis": r["hypothesis"],
-                "alternatives": r["alternatives"],
-                "decision": r["decision"],
-                "rationale": r["rationale"],
-                "uncertainty": r["uncertainty"],
-                "linked_commit": r["linked_commit"],
-            }
-            for r in rows
-        ]
+        return [self._row_to_discussion_dict(r) for r in rows]
+
+    def discussion_search_text(
+        self, branch: str, term: str, max_results: int = 10,
+    ) -> list[dict]:
+        """Return discussions on `branch` matching `term`. FTS5 when available."""
+        conn = self.memory_conn
+        if getattr(self, "_fts_available", False):
+            try:
+                rows = conn.execute(
+                    """SELECT d.* FROM discussions d
+                       JOIN discussions_fts f ON f.rowid = d.rowid
+                       WHERE d.branch = ? AND discussions_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (branch, term, max_results),
+                ).fetchall()
+                if rows:
+                    return [self._row_to_discussion_dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                pass  # Malformed FTS query → fall through to LIKE
+        pat = f"%{_escape_like(term)}%"
+        rows = conn.execute(
+            """SELECT * FROM discussions WHERE branch = ?
+               AND (topic LIKE ? ESCAPE '\\' OR hypothesis LIKE ? ESCAPE '\\'
+                    OR alternatives LIKE ? ESCAPE '\\' OR decision LIKE ? ESCAPE '\\'
+                    OR rationale LIKE ? ESCAPE '\\' OR uncertainty LIKE ? ESCAPE '\\')
+               ORDER BY id DESC LIMIT ?""",
+            (branch, pat, pat, pat, pat, pat, pat, max_results),
+        ).fetchall()
+        return [self._row_to_discussion_dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_discussion_dict(r) -> dict:
+        return {
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "topic": r["topic"],
+            "hypothesis": r["hypothesis"],
+            "alternatives": r["alternatives"],
+            "decision": r["decision"],
+            "rationale": r["rationale"],
+            "uncertainty": r["uncertainty"],
+            "linked_commit": r["linked_commit"],
+        }
 
     def discussion_get_next_id(self, branch: str) -> str:
         conn = self.memory_conn

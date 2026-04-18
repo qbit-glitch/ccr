@@ -130,6 +130,23 @@ class FilePhase3cMixin:
                 pass
         return f"D{max_num + 1:03d}"
 
+    def discussion_search_text(
+        self, branch: str, term: str, max_results: int = 10,
+    ) -> list[dict]:
+        """Substring-match discussions by any text field. Case-insensitive."""
+        records = self._parse_discussions(branch)
+        tl = term.lower()
+        hits = [
+            r for r in records
+            if tl in r.get("topic", "").lower()
+            or tl in r.get("hypothesis", "").lower()
+            or tl in r.get("alternatives", "").lower()
+            or tl in r.get("decision", "").lower()
+            or tl in r.get("rationale", "").lower()
+            or tl in r.get("uncertainty", "").lower()
+        ]
+        return hits[:max_results]
+
     # ── Phase 3c: Session Summaries ───────────────────────────────
 
     def _summaries_path(self, branch: str) -> str:

@@ -143,6 +143,12 @@ class FilePhase3aMixin:
                     break
         return results
 
+    def commit_search_with_snippet(
+        self, branch: str, term: str, max_results: int = 5,
+    ) -> list[dict]:
+        """File backend has no FTS5 — always returns []."""
+        return []
+
     def commit_count(self, branch: str) -> int:
         path = self._commits_path(branch)
         if not os.path.isfile(path):

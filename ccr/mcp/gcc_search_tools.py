@@ -430,13 +430,44 @@ def gcc_search(
         searched.append("commits")
         try:
             branch = mem.get_active_branch()
-            commits_text = mem._search_commits(branch, query)
-            if commits_text and commits_text.strip():
-                # Count results (## [C###] headers)
-                count = len(re.findall(r"## \[C\d{3,}\]", commits_text))
-                if count:
-                    total += count
-                    sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{commits_text.strip()}")
+            # Phase 2.5: FTS5-aware snippet path (SQLite backend with FTS5)
+            snippet_hits: list[dict] = []
+            if getattr(mem._storage, "fts_available", False):
+                try:
+                    raw = mem._storage.commit_search_with_snippet(
+                        branch, query, max_results=limit,
+                    )
+                    if isinstance(raw, list):
+                        snippet_hits = raw
+                except Exception as _exc:
+                    _log_search_error("commits", query, _exc)
+                    snippet_hits = []
+            if snippet_hits:
+                count = len(snippet_hits)
+                total += count
+                lines = []
+                for h in snippet_hits:
+                    cid = h.get("id", "?")
+                    title = h.get("title", "") or ""
+                    snip = h.get("snippet", "") or ""
+                    rank = h.get("rank")
+                    rank_str = f"{rank:.3f}" if isinstance(rank, float) else str(rank)
+                    lines.append(
+                        f"### [{cid}] {title}\n"
+                        f"- **Snippet**: {snip}\n"
+                        f"- **Rank**: {rank_str}"
+                    )
+                body = "\n\n".join(lines)
+                sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{body}")
+            else:
+                # Fall through to existing 3-phase keyword/semantic/BM25 chain
+                commits_text = mem._search_commits(branch, query)
+                if commits_text and commits_text.strip():
+                    # Count results (## [C###] headers)
+                    count = len(re.findall(r"## \[C\d{3,}\]", commits_text))
+                    if count:
+                        total += count
+                        sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{commits_text.strip()}")
         except Exception as _exc:
             _log_search_error("commits", query, _exc)
 

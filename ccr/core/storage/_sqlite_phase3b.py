@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from typing import Any
 
 from ccr.core.storage._sqlite_utils import (
@@ -228,6 +229,44 @@ class Phase3bMixin:
         ).fetchone()
         return int(row["value"]) if row else 1
 
+    def pattern_search_text(self, term: str, max_results: int = 10) -> list[dict]:
+        """Find patterns whose text matches `term`.
+
+        FTS5-preferred with LIKE fallback. Returned dict shape matches the
+        values in `pattern_load_all()["patterns"]`: includes id, text,
+        commit_ids (list), promoted (bool), and all scalar columns.
+        """
+        conn = self.memory_conn
+        rows: list = []
+        if getattr(self, "_fts_available", False):
+            try:
+                rows = conn.execute(
+                    """SELECT p.* FROM patterns p
+                       JOIN patterns_fts f ON f.rowid = p.rowid
+                       WHERE patterns_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (term, max_results),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []  # Malformed FTS query → fall through to LIKE
+        if not rows:
+            like = f"%{_escape_like(term)}%"
+            rows = conn.execute(
+                "SELECT * FROM patterns WHERE text LIKE ? ESCAPE '\\' LIMIT ?",
+                (like, max_results),
+            ).fetchall()
+        results: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["commit_ids"] = json.loads(d.pop("commit_ids_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                d["commit_ids"] = []
+                d.pop("commit_ids_json", None)
+            d["promoted"] = bool(d.get("promoted", 0))
+            results.append(d)
+        return results
+
     # ── Triples ────────────────────────────────────────────────
 
     def triple_insert_batch(self, triples: list[dict]) -> int:
@@ -277,6 +316,20 @@ class Phase3bMixin:
 
     def triple_search(self, query: str, top_k: int = 10) -> list[dict]:
         conn = self.memory_conn
+        # FTS5 path — fast + ranked (triples.rowid column is `id`)
+        if getattr(self, "_fts_available", False):
+            try:
+                rows = conn.execute(
+                    """SELECT t.* FROM triples t
+                       JOIN triples_fts f ON f.rowid = t.id
+                       WHERE triples_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (query, top_k),
+                ).fetchall()
+                if rows:
+                    return [dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                pass  # Malformed FTS query → fall through to LIKE
         like = f"%{_escape_like(query)}%"
         rows = conn.execute(
             """SELECT * FROM triples

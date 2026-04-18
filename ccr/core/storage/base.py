@@ -200,6 +200,12 @@ class StorageBackend(ABC):
     def commit_search_text(self, branch: str, term: str, max_results: int = 5) -> list[dict]:
         """Search commits by substring match across text fields."""
 
+    def commit_search_with_snippet(
+        self, branch: str, term: str, max_results: int = 5,
+    ) -> list[dict]:
+        """FTS5-aware commit search with snippets. Returns [] if unavailable."""
+        raise NotImplementedError
+
     @abstractmethod
     def commit_count(self, branch: str) -> int:
         """Return total commit count on a branch."""
@@ -276,6 +282,14 @@ class StorageBackend(ABC):
     def pattern_get_next_id(self) -> int:
         """Return the next available pattern ID number."""
 
+    @abstractmethod
+    def pattern_search_text(self, term: str, max_results: int = 10) -> list[dict]:
+        """Search patterns by substring / FTS5 match against the text field.
+
+        Returned dicts share the shape of `pattern_load_all()["patterns"]` values:
+        id, text, commit_ids (list), promoted (bool), and scalar columns.
+        """
+
     # ── Phase 3b: Triples ──────────────────────────────────────────
 
     @abstractmethod
@@ -337,6 +351,12 @@ class StorageBackend(ABC):
     @abstractmethod
     def discussion_get_next_id(self, branch: str) -> str:
         """Return next available discussion ID (e.g. 'D001')."""
+
+    @abstractmethod
+    def discussion_search_text(
+        self, branch: str, term: str, max_results: int = 10,
+    ) -> list[dict]:
+        """Return discussions on `branch` matching `term` (substring / FTS5)."""
 
     # ── Phase 3c: Session Summaries ───────────────────────────────
 

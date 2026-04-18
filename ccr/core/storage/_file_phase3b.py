@@ -156,6 +156,18 @@ class FilePhase3bMixin:
         data = self._load_patterns_json()
         return data.get("next_id", 1)
 
+    def pattern_search_text(self, term: str, max_results: int = 10) -> list[dict]:
+        """Substring-match patterns by text. Case-insensitive."""
+        term_lower = term.lower()
+        patterns = self._load_patterns_json().get("patterns", {})
+        hits: list[dict] = []
+        for pid, p in patterns.items():
+            if term_lower in p.get("text", "").lower():
+                entry = dict(p)
+                entry.setdefault("id", pid)
+                hits.append(entry)
+        return hits[:max_results]
+
     # ── Triples (Phase 3b) ────────────────────────────────────
 
     def _triples_path(self) -> str:
