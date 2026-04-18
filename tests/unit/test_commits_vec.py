@@ -43,3 +43,32 @@ class TestCommitsVecSchema:
         ).fetchone()[0]
         assert "float[384]" in sql
         backend.close()
+
+
+class TestVectorUpsert:
+    def test_upsert_round_trip(self, tmp_path):
+        backend = SqliteStorageBackend(str(tmp_path / "ccr"))
+        vec = [0.1] * 384
+        backend.commit_upsert_vector("C001", vec)
+        row = backend.memory_conn.execute(
+            "SELECT id FROM commits_vec WHERE id = ?", ("C001",)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "C001"
+        backend.close()
+
+    def test_upsert_rejects_wrong_dim(self, tmp_path):
+        backend = SqliteStorageBackend(str(tmp_path / "ccr"))
+        with pytest.raises(ValueError, match="dim"):
+            backend.commit_upsert_vector("C002", [0.1] * 10)
+        backend.close()
+
+    def test_upsert_is_idempotent(self, tmp_path):
+        backend = SqliteStorageBackend(str(tmp_path / "ccr"))
+        backend.commit_upsert_vector("C003", [0.2] * 384)
+        backend.commit_upsert_vector("C003", [0.3] * 384)
+        count = backend.memory_conn.execute(
+            "SELECT COUNT(*) FROM commits_vec WHERE id = ?", ("C003",)
+        ).fetchone()[0]
+        assert count == 1
+        backend.close()

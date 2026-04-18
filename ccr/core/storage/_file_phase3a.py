@@ -149,6 +149,10 @@ class FilePhase3aMixin:
         """File backend has no FTS5 — always returns []."""
         return []
 
+    def commit_upsert_vector(self, commit_id: str, vector: list[float]) -> None:
+        """File backend keeps using gzip JSON via MemoryManager._embed_commit."""
+        return None
+
     def commit_count(self, branch: str) -> int:
         path = self._commits_path(branch)
         if not os.path.isfile(path):

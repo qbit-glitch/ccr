@@ -251,6 +251,12 @@ class CommitMixin:
             new_vec = self._embed_commit(
                 commit_id, f"{title} {what} {why} {next_step}"
             )
+            # Phase 4: upsert into memory.db commits_vec when backend supports it.
+            if new_vec is not None:
+                try:
+                    self._storage.commit_upsert_vector(commit_id, new_vec.tolist())
+                except Exception:
+                    pass  # vector indexing is supplementary
             commit_links = self._compute_links(
                 branch, commit_id, title, what, why, files_changed, next_step,
                 new_vec=new_vec,

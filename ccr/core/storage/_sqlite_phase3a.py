@@ -12,6 +12,7 @@ from ccr.core.storage._sqlite_utils import (
     _escape_like,
     _utcnow,
 )
+from ccr.core.storage._sqlite_vec import _serialize as _serialize_vec
 
 
 class Phase3aMixin:
@@ -105,6 +106,26 @@ class Phase3aMixin:
         changed = conn.execute("SELECT changes()").fetchone()[0]
         conn.commit()
         return changed > 0
+
+    def commit_upsert_vector(self, commit_id: str, vector: list[float]) -> None:
+        """Insert or replace a 384-dim L2-normalized embedding for a commit.
+
+        Silently no-ops when sqlite-vec is unavailable so the caller can remain
+        backend-agnostic. Dimension mismatches still raise ValueError.
+
+        vec0 does not honour INSERT OR REPLACE semantics, so we DELETE-then-INSERT
+        inside a single transaction.
+        """
+        if not getattr(self, "_vec_available", False):
+            return
+        blob = _serialize_vec(vector)  # raises ValueError on wrong dim
+        conn = self.memory_conn
+        with conn:
+            conn.execute("DELETE FROM commits_vec WHERE id = ?", (commit_id,))
+            conn.execute(
+                "INSERT INTO commits_vec (id, embedding) VALUES (?, ?)",
+                (commit_id, blob),
+            )
 
     def commit_search_text(self, branch: str, term: str, max_results: int = 5) -> list[dict]:
         conn = self.memory_conn
