@@ -126,3 +126,71 @@ class TestSemanticSearch:
         with pytest.raises(ValueError, match="dim"):
             backend.commit_semantic_search("main", [0.1] * 10, top_k=5)
         backend.close()
+
+
+class TestBackfill:
+    def test_gzip_json_source_imported_on_upgrade(self, tmp_path):
+        """Pre-Phase-4 DB with commit_embeddings.json.gz gets backfilled."""
+        import gzip
+        import json
+        import sqlite3
+
+        ccr_root = tmp_path / "ccr"
+        ccr_root.mkdir()
+        legacy_vecs = {"C001": [0.5] * 384, "C002": [0.1] * 384}
+        gz_path = ccr_root / "commit_embeddings.json.gz"
+        with gzip.open(gz_path, "wt", encoding="utf-8") as f:
+            json.dump(legacy_vecs, f)
+
+        db = sqlite3.connect(str(ccr_root / "memory.db"))
+        db.execute("PRAGMA user_version = 1")
+        db.commit()
+        db.close()
+
+        backend = SqliteStorageBackend(str(ccr_root))
+        ids = {
+            r[0]
+            for r in backend.memory_conn.execute(
+                "SELECT id FROM commits_vec"
+            ).fetchall()
+        }
+        assert ids == {"C001", "C002"}
+        assert backend._memory_mgr.get_user_version() == 2
+        backend.close()
+
+    def test_legacy_embeddings_db_imported_on_upgrade(self, tmp_path):
+        """Pre-Phase-4 DB with .ccr/embeddings.db sidecar gets backfilled."""
+        try:
+            import sqlite_vec  # noqa: F401
+        except ImportError:
+            pytest.skip("sqlite-vec required for legacy side-car import")
+        from ccr.context.vec_store import get_vec_store
+
+        ccr_root = tmp_path / "ccr"
+        ccr_root.mkdir()
+
+        legacy = get_vec_store(str(ccr_root / "embeddings.db"))
+        assert legacy is not None
+        legacy.upsert("C101", [0.2] * 384, namespace="commit")
+        legacy.close()
+
+        backend = SqliteStorageBackend(str(ccr_root))
+        row = backend.memory_conn.execute(
+            "SELECT id FROM commits_vec WHERE id = ?", ("C101",)
+        ).fetchone()
+        assert row is not None and row[0] == "C101"
+        backend.close()
+
+    def test_backfill_idempotent(self, tmp_path):
+        """Re-opening migrated DB doesn't re-run backfill."""
+        backend = SqliteStorageBackend(str(tmp_path / "ccr"))
+        backend.commit_upsert_vector("C001", [0.1] * 384)
+        assert backend._memory_mgr.get_user_version() == 2
+        backend.close()
+
+        backend2 = SqliteStorageBackend(str(tmp_path / "ccr"))
+        rows = backend2.memory_conn.execute(
+            "SELECT COUNT(*) FROM commits_vec"
+        ).fetchone()[0]
+        assert rows == 1  # unchanged
+        backend2.close()
