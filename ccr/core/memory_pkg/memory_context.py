@@ -349,20 +349,37 @@ class ContextMixin:
                     import numpy as np
 
                     query_vec = model.embed_query(term)
-                    all_embeddings = self._load_all_commit_embeddings()
-                    if all_embeddings:
-                        ids = list(all_embeddings.keys())
-                        vecs = np.stack([all_embeddings[cid] for cid in ids])
-                        scores = vecs @ query_vec
-                        ranked = sorted(zip(ids, scores), key=lambda x: -x[1])
-                        for cid, score in ranked:
-                            if score < 0.3 or cid in exact_ids:
+
+                    # Phase 4: prefer backend KNN when sqlite-vec is wired.
+                    if getattr(self._storage, "vec_available", False):
+                        hits = self._storage.commit_semantic_search(
+                            branch, query_vec.tolist(), remaining + len(exact_ids),
+                        )
+                        for h in hits:
+                            cid = h["id"]
+                            if cid in exact_ids:
                                 continue
-                            block = self._find_commit_by_id(branch, cid)
+                            block = (h.get("raw_block") or "").strip()
                             if block:
-                                semantic_matches.append(block.strip())
+                                semantic_matches.append(block)
                             if len(semantic_matches) >= remaining:
                                 break
+                    else:
+                        # Legacy path: ONNX-cosine-in-Python over gzip JSON cache.
+                        all_embeddings = self._load_all_commit_embeddings()
+                        if all_embeddings:
+                            ids = list(all_embeddings.keys())
+                            vecs = np.stack([all_embeddings[cid] for cid in ids])
+                            scores = vecs @ query_vec
+                            ranked = sorted(zip(ids, scores), key=lambda x: -x[1])
+                            for cid, score in ranked:
+                                if score < 0.3 or cid in exact_ids:
+                                    continue
+                                block = self._find_commit_by_id(branch, cid)
+                                if block:
+                                    semantic_matches.append(block.strip())
+                                if len(semantic_matches) >= remaining:
+                                    break
                 except Exception:
                     pass
 

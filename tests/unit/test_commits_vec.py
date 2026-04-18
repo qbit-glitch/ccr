@@ -194,3 +194,50 @@ class TestBackfill:
         ).fetchone()[0]
         assert rows == 1  # unchanged
         backend2.close()
+
+
+class TestSemanticWiring:
+    def test_search_commits_uses_backend_knn_when_vec_available(
+        self, tmp_path, monkeypatch
+    ):
+        """_search_commits prefers backend.commit_semantic_search over in-Python cosine."""
+        import numpy as np
+
+        from ccr.core.memory import MemoryManager
+        from ccr.core.storage._sqlite_utils import _utcnow
+        from ccr.core.types import CCRConfig
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        cfg = CCRConfig(storage_backend="sqlite")
+        mem = MemoryManager(str(project_root), config=cfg)
+        assert mem._storage.vec_available is True
+
+        for cid, title in (("C001", "authentication refactor"), ("C002", "loader tweak")):
+            mem._storage.memory_conn.execute(
+                """INSERT INTO commits (id, branch, timestamp, title, what, why,
+                   files_json, next_step, patterns_json, score, author, ci_json,
+                   experiment_json, ota_trace, raw_block, created_at)
+                   VALUES (?, 'main', ?, ?, ?, '', '[]', '', NULL, NULL, '',
+                           NULL, NULL, NULL, ?, ?)""",
+                (cid, _utcnow(), title, title,
+                 f"## [{cid}] {title}\n**What**: {title}\n**Why**: test\n", _utcnow()),
+            )
+        mem._storage.memory_conn.commit()
+
+        v_auth = np.array([1.0] + [0.0] * 383, dtype=np.float32)
+        v_loader = np.array([0.0, 1.0] + [0.0] * 382, dtype=np.float32)
+        mem._storage.commit_upsert_vector("C001", v_auth.tolist())
+        mem._storage.commit_upsert_vector("C002", v_loader.tolist())
+
+        class FakeModel:
+            def embed_query(self, text):
+                return v_auth
+
+        import ccr.core.memory_pkg.memory_context as mod_ctx
+        monkeypatch.setattr(mod_ctx, "get_embedding_model", lambda: FakeModel())
+
+        # Query term that will NOT text-match either commit to force semantic path
+        result = mem._search_commits("main", "xyzqqq_no_text_match")
+        assert "C001" in result
+        mem._storage.close()
