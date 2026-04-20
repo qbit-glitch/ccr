@@ -106,13 +106,19 @@ def test_migrate_phase_5a_no_flat_file_is_noop(tmp_path: Path) -> None:
         backend.close()
 
 
-def test_migrate_phase_5a_atomic_on_crash(tmp_project: Path, monkeypatch) -> None:
+def test_migrate_phase_5a_atomic_on_crash(tmp_path: Path, monkeypatch) -> None:
     """If backfill throws mid-way, user_version stays at 2 and a re-run redoes it cleanly."""
-    ccr_root = str(tmp_project / ".ccr")
-    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
-    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
+    ccr_root_dir = tmp_path / ".ccr"
+    ccr_root_dir.mkdir()
+    ccr_root = str(ccr_root_dir)
+    playbook_path = str(ccr_root_dir / "playbook.txt")
+    failure_lessons_path = str(ccr_root_dir / "failure_lessons.json")
 
+    # Construct backend first (no flat playbook yet) so init's auto-migration is
+    # a no-op. Then write the playbook, rewind user_version to 2, and exercise
+    # the helper manually to verify atomicity.
     backend = SqliteStorageBackend(ccr_root)
+    (ccr_root_dir / "playbook.txt").write_text(FIXTURE_PLAYBOOK)
     backend._memory_mgr.set_user_version(2)
     try:
         # Monkey-patch Playbook._parse to throw on first invocation
@@ -157,9 +163,13 @@ def test_migrate_phase_5a_global_scope(tmp_path: Path) -> None:
     """Global scope: backfills global_playbook.txt into global.db, bumps global.db user_version 0→1."""
     global_root = tmp_path / "home_ccr"
     global_root.mkdir()
-    (global_root / "global_playbook.txt").write_text(FIXTURE_PLAYBOOK)
 
+    # Construct backend first (no global_playbook.txt yet) so init's auto-migration
+    # is a no-op for the global scope. Then write the playbook and roll the
+    # version back to 0 so we can exercise the helper directly.
     backend = SqliteStorageBackend(str(global_root), global_ccr_root=str(global_root))
+    (global_root / "global_playbook.txt").write_text(FIXTURE_PLAYBOOK)
+    backend._global_mgr.set_user_version(0)
     try:
         assert backend._global_mgr.get_user_version() == 0
         result = migrate_phase_5a(
@@ -176,5 +186,32 @@ def test_migrate_phase_5a_global_scope(tmp_path: Path) -> None:
         bullets = backend.bullet_list(scope="global")
         assert {b["id"] for b in bullets} == {"str-00001", "str-00002", "mis-00001"}
         assert backend._global_mgr.get_user_version() == 1
+    finally:
+        backend.close()
+
+
+def test_sqlite_backend_auto_runs_phase5a_on_init(tmp_path: Path) -> None:
+    """Opening SqliteStorageBackend triggers phase 5a when memory.db is at v<3."""
+    ccr_root = tmp_path / ".ccr"
+    ccr_root.mkdir()
+    ccr_root_str = str(ccr_root)
+
+    # Build an empty backend first (no playbook.txt yet) — version auto-advances
+    # to 3 because no flat file exists. Roll version back to simulate a Phase-4
+    # baseline DB from before Phase 5a shipped.
+    backend = SqliteStorageBackend(ccr_root_str)
+    backend._memory_mgr.set_user_version(2)
+    assert backend.bullet_list(scope="project") == []
+    backend.close()
+
+    # Drop the flat playbook.txt now, then re-open — auto-migration should run.
+    (ccr_root / "playbook.txt").write_text(FIXTURE_PLAYBOOK)
+
+    backend = SqliteStorageBackend(ccr_root_str)
+    try:
+        assert backend._memory_mgr.get_user_version() == 3
+        bullets = backend.bullet_list(scope="project")
+        assert len(bullets) == 3
+        assert {b["id"] for b in bullets} == {"str-00001", "str-00002", "mis-00001"}
     finally:
         backend.close()

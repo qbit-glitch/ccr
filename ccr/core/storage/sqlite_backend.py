@@ -426,6 +426,43 @@ class SqliteStorageBackend(
                     backfill_vec(self.memory_conn, ccr_root)
                     self._memory_mgr.set_user_version(2)
 
+        # ── Phase 5a: playbook flat-file → SQLite backfill (memory.db) ──────
+        # Pass `self` (no recursion — helper no longer constructs a backend).
+        try:
+            if self._memory_mgr.get_user_version() < 3:
+                from ccr.core.storage._migration_phase5a import migrate_phase_5a
+                playbook_path = os.path.join(self.ccr_root, "playbook.txt")
+                failure_lessons_path = os.path.join(self.ccr_root, "failure_lessons.json")
+                migrate_phase_5a(
+                    backend=self,
+                    playbook_path=playbook_path,
+                    failure_lessons_path=failure_lessons_path,
+                    scope="project",
+                )
+        except Exception as exc:
+            logger.warning("Phase 5a project migration failed: %s", exc)
+
+        # ── Phase 5a: global.db playbook backfill ───────────────────────────
+        if self._global_mgr is not None and self.global_ccr_root:
+            try:
+                global_version = self._global_mgr.get_user_version()
+                if global_version < 1:
+                    from ccr.core.storage._migration_phase5a import migrate_phase_5a
+                    global_playbook_path = os.path.join(
+                        self.global_ccr_root, "global_playbook.txt"
+                    )
+                    global_fl_path = os.path.join(
+                        self.global_ccr_root, "global_failure_lessons.json"
+                    )
+                    migrate_phase_5a(
+                        backend=self,
+                        playbook_path=global_playbook_path,
+                        failure_lessons_path=global_fl_path,
+                        scope="global",
+                    )
+            except Exception as exc:
+                logger.warning("Phase 5a global migration failed: %s", exc)
+
     def _ensure_phase1_tables(self) -> None:
         self.memory_conn.executescript(_PHASE1_TABLES)
 

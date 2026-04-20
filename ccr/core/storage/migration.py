@@ -29,6 +29,7 @@ from ccr.core.storage._migration_phase3 import (
     migrate_phase_3b,
     migrate_phase_3c,
 )
+from ccr.core.storage._migration_phase5a import migrate_phase_5a
 from ccr.core.storage._migration_utils import _backup_file, _write_sentinel
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ __all__ = [
     "migrate_phase_3a",
     "migrate_phase_3b",
     "migrate_phase_3c",
+    "migrate_phase_5a",
     "_backup_file",
     "_write_sentinel",
 ]
@@ -92,6 +94,28 @@ def auto_migrate(ccr_root: str, db_path: str) -> dict[str, Any]:
     result["phases_run"].append("3c")
     result["total_migrated"] += p3c["migrated"]
     result["errors"].extend(p3c["errors"])
+
+    # ── Phase 5a: playbook flat-file → SQLite ──────────────────────────────
+    # Construct a backend locally, pass it in, close it in finally.
+    try:
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+        playbook_path = os.path.join(ccr_root, "playbook.txt")
+        failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+        backend = SqliteStorageBackend(ccr_root)
+        try:
+            p5a = migrate_phase_5a(
+                backend=backend,
+                playbook_path=playbook_path,
+                failure_lessons_path=failure_lessons_path,
+                scope="project",
+            )
+            if not p5a.get("skipped"):
+                result["phases_run"].append("5a")
+                result["total_migrated"] += p5a["migrated"]
+        finally:
+            backend.close()
+    except Exception as exc:
+        result["errors"].append(f"phase5a: {exc}")
 
     if not result["errors"]:
         _write_sentinel(ccr_root)
