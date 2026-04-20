@@ -407,3 +407,78 @@ def test_save_to_backend_is_atomic(tmp_path: Path, monkeypatch) -> None:
         )
     finally:
         backend.close()
+
+
+def test_global_playbook_shared_across_projects_via_sqlite(
+    tmp_path: Path, monkeypatch, srv_reset
+) -> None:
+    """Adding a global bullet in project A is visible in project B via ~/.ccr/global.db.
+
+    Task 5a.4: symmetric to the project-scope round-trip test, but proves that
+    the SQLite-preferring wiring of ``_load_global_playbook`` /
+    ``_save_global_playbook`` enables cross-project sharing through
+    ``~/.ccr/global.db``. HOME is redirected to a tmp dir so the real user dir
+    is not polluted (``os.path.expanduser`` honors ``$HOME`` on macOS/Linux).
+    """
+    monkeypatch.setenv("CCR_STORAGE_BACKEND", "sqlite")
+
+    # Redirect ~/.ccr/ to a tmp dir so we don't pollute the real user dir
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    project_a = tmp_path / "proj_a"
+    project_b = tmp_path / "proj_b"
+    for p in (project_a, project_b):
+        (p / ".ccr").mkdir(parents=True)
+
+    import ccr.mcp.server as srv
+
+    # Session 1: open project A, add a global bullet
+    srv._init(str(project_a))
+    gpb = srv._ensure_global_playbook()
+    from ccr.ace.playbook import DeltaOperation
+    op = DeltaOperation(
+        op_type="ADD",
+        section="STRATEGIES & INSIGHTS",
+        content="Cross-project marker from proj_a",
+    )
+    gpb.apply_delta([op])
+    srv._save_global_playbook()
+
+    # Verify the bullet actually landed in global.db (not only the flat file).
+    from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+    verify_backend = SqliteStorageBackend(
+        str(fake_home / ".ccr"), global_ccr_root=str(fake_home / ".ccr"),
+    )
+    try:
+        rows = verify_backend.bullet_list(scope="global")
+        assert any("proj_a" in r["content"] for r in rows), (
+            "Session 1 _save_global_playbook must persist to global.db"
+        )
+    finally:
+        verify_backend.close()
+
+    if srv._memory and hasattr(srv._memory, "_storage"):
+        srv._memory._storage.close()
+
+    # Delete the flat-file global_playbook.txt so Session 2's _load_global_playbook
+    # MUST route through global.db (SQLite). If the wiring is missing, Session 2
+    # loads an empty playbook and this test fails.
+    flat_path = fake_home / ".ccr" / "global_playbook.txt"
+    if flat_path.exists():
+        flat_path.unlink()
+
+    # Reset module globals (simulating a new Claude Code session on proj_b)
+    srv._memory = None
+    srv._playbook = None
+    srv._global_playbook = None
+
+    # Session 2: open project B
+    srv._init(str(project_b))
+    gpb_b = srv._ensure_global_playbook()
+
+    assert any("proj_a" in b.content for b in gpb_b.bullets), (
+        "Global bullet from proj_a should be visible in proj_b session via global.db"
+    )
+    # Cleanup handled by srv_reset fixture

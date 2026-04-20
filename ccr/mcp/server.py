@@ -385,7 +385,27 @@ def _save_playbook() -> None:
 
 
 def _load_global_playbook() -> Playbook:
-    """Load global playbook from ~/.ccr/ or create empty."""
+    """Load global playbook. Prefer SQLite backend when available; else flat file.
+
+    Task 5a.4: routes through ``~/.ccr/global.db`` via
+    ``Playbook.from_backend(..., scope="global")`` when the active backend is
+    ``SqliteStorageBackend``. On any SQLite error, falls back to the flat-file
+    path (best-effort read recovery, mirrors ``_load_playbook``).
+    """
+    if _memory is not None:
+        storage = getattr(_memory, "_storage", None)
+        if storage is not None:
+            from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+            if isinstance(storage, SqliteStorageBackend):
+                try:
+                    return Playbook.from_backend(storage, scope="global")
+                except Exception as exc:
+                    logger.warning(
+                        "SQLite global-playbook load failed, falling back to flat file: %s",
+                        exc,
+                    )
+
+    # Flat-file path (default backend or SQLite error fallback)
     if os.path.isfile(_global_playbook_path):
         with open(_global_playbook_path, "r", encoding="utf-8") as f:
             pb = Playbook(f.read())
@@ -397,11 +417,38 @@ def _load_global_playbook() -> Playbook:
 
 
 def _save_global_playbook() -> None:
-    """Persist global playbook to ~/.ccr/ (H5: atomic writes)."""
-    if _global_playbook is not None:
-        _atomic_write(_global_playbook_path, _global_playbook.serialize())
-        if _global_failure_lessons_path:
-            _global_playbook.save_failure_lessons(_global_failure_lessons_path)
+    """Persist global playbook. Prefer SQLite backend when available; else flat file.
+
+    Task 5a.4 + review-fix I1 parity: on SQLite backend, save failures RE-RAISE
+    instead of falling through to flat-file writes. Falling through would
+    overwrite ``~/.ccr/global_playbook.txt`` with possibly-stale in-memory
+    content, masking a divergence where another session already wrote newer
+    state to ``global.db``. Reads still fall back to flat file (best-effort
+    recovery), but writes must not hide errors.
+    """
+    if _global_playbook is None:
+        return
+
+    # SQLite path: re-raise on failure (do NOT silently overwrite flat file)
+    if _memory is not None:
+        storage = getattr(_memory, "_storage", None)
+        if storage is not None:
+            from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+            if isinstance(storage, SqliteStorageBackend):
+                try:
+                    _global_playbook.save_to_backend(storage, scope="global")
+                    return
+                except Exception as exc:
+                    logger.error(
+                        "SQLite global-playbook save failed — not falling through to "
+                        "flat file to avoid stale overwrite: %s", exc,
+                    )
+                    raise
+
+    # Flat-file path (default backend only)
+    _atomic_write(_global_playbook_path, _global_playbook.serialize())
+    if _global_failure_lessons_path:
+        _global_playbook.save_failure_lessons(_global_failure_lessons_path)
 
 
 def _load_schema(path: str) -> PlaybookSchema:
