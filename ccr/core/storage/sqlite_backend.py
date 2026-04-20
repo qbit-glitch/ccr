@@ -21,6 +21,7 @@ import os
 import sqlite3
 import threading
 
+from ccr.core.storage._migration_phase5a import migrate_phase_5a
 from ccr.core.storage._sqlite_fts5 import install_fts5
 from ccr.core.storage._sqlite_vec import install_vec
 from ccr.core.storage._sqlite_phase1 import Phase1Mixin
@@ -430,7 +431,6 @@ class SqliteStorageBackend(
         # Pass `self` (no recursion — helper no longer constructs a backend).
         try:
             if self._memory_mgr.get_user_version() < 3:
-                from ccr.core.storage._migration_phase5a import migrate_phase_5a
                 playbook_path = os.path.join(self.ccr_root, "playbook.txt")
                 failure_lessons_path = os.path.join(self.ccr_root, "failure_lessons.json")
                 migrate_phase_5a(
@@ -447,7 +447,6 @@ class SqliteStorageBackend(
             try:
                 global_version = self._global_mgr.get_user_version()
                 if global_version < 1:
-                    from ccr.core.storage._migration_phase5a import migrate_phase_5a
                     global_playbook_path = os.path.join(
                         self.global_ccr_root, "global_playbook.txt"
                     )

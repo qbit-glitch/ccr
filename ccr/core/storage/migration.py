@@ -95,27 +95,8 @@ def auto_migrate(ccr_root: str, db_path: str) -> dict[str, Any]:
     result["total_migrated"] += p3c["migrated"]
     result["errors"].extend(p3c["errors"])
 
-    # ── Phase 5a: playbook flat-file → SQLite ──────────────────────────────
-    # Construct a backend locally, pass it in, close it in finally.
-    try:
-        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
-        playbook_path = os.path.join(ccr_root, "playbook.txt")
-        failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
-        backend = SqliteStorageBackend(ccr_root)
-        try:
-            p5a = migrate_phase_5a(
-                backend=backend,
-                playbook_path=playbook_path,
-                failure_lessons_path=failure_lessons_path,
-                scope="project",
-            )
-            if not p5a.get("skipped"):
-                result["phases_run"].append("5a")
-                result["total_migrated"] += p5a["migrated"]
-        finally:
-            backend.close()
-    except Exception as exc:
-        result["errors"].append(f"phase5a: {exc}")
+    # Note: Phase 5a runs automatically inside SqliteStorageBackend.__init__ for both
+    # project (memory.db) and global (global.db) scopes. No explicit registration here.
 
     if not result["errors"]:
         _write_sentinel(ccr_root)
