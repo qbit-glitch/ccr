@@ -482,3 +482,39 @@ class TestMigrationHelpers:
     def test_backup_missing_file(self, tmp_path):
         from ccr.core.storage.migration import _backup_file
         assert _backup_file(str(tmp_path / "nope.json")) is None
+
+
+def test_phase5a_playbook_roundtrip_parity_both_backends(tmp_path):
+    """Playbook round-trip through from_backend/save_to_backend behaves identically on both backends."""
+    from ccr.ace.playbook import Playbook, DeltaOperation
+    from ccr.core.storage.file_backend import FileStorageBackend
+    from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+
+    ccr_file = tmp_path / "file_ccr"
+    ccr_sqlite = tmp_path / "sqlite_ccr"
+    ccr_file.mkdir()
+    ccr_sqlite.mkdir()
+
+    backends = [
+        ("file", FileStorageBackend(str(ccr_file))),
+        ("sqlite", SqliteStorageBackend(str(ccr_sqlite))),
+    ]
+
+    try:
+        for label, backend in backends:
+            pb = Playbook()
+            pb.apply_delta([
+                DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content=f"{label} bullet 1"),
+                DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content=f"{label} bullet 2"),
+            ])
+            pb.save_to_backend(backend, scope="project")
+            reloaded = Playbook.from_backend(backend, scope="project")
+
+            assert len(reloaded.bullets) == 2
+            assert {b.content for b in reloaded.bullets} == {f"{label} bullet 1", f"{label} bullet 2"}
+    finally:
+        for _, backend in backends:
+            try:
+                backend.close()
+            except Exception:
+                pass
