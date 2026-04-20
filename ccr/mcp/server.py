@@ -325,25 +325,54 @@ def _atomic_write(path: str, content: str) -> None:
 
 
 def _load_playbook() -> Playbook:
-    """Load playbook from disk or create empty. Also loads failure lessons."""
+    """Load playbook. Prefer SQLite backend when available; else flat file."""
+    # SQLite path: hydrate from memory.db playbook_bullets/sections/failure_lessons
+    if _memory is not None:
+        storage = getattr(_memory, "_storage", None)
+        if storage is not None:
+            from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+            if isinstance(storage, SqliteStorageBackend):
+                try:
+                    return Playbook.from_backend(storage, scope="project")
+                except Exception as exc:
+                    logger.warning(
+                        "SQLite playbook load failed, falling back to flat file: %s", exc,
+                    )
+
+    # Flat-file path (default backend or SQLite error fallback)
     if os.path.isfile(_playbook_path):
         with open(_playbook_path, "r", encoding="utf-8") as f:
             pb = Playbook(f.read())
     else:
         pb = Playbook()
-    # Load structured failure lessons from companion JSON
     if _failure_lessons_path:
         pb.load_failure_lessons(_failure_lessons_path)
     return pb
 
 
 def _save_playbook() -> None:
-    """Persist playbook and failure lessons to disk (H5: atomic writes)."""
-    if _playbook is not None:
-        _atomic_write(_playbook_path, _playbook.serialize())
-        # Save failure lessons to companion JSON
-        if _failure_lessons_path:
-            _playbook.save_failure_lessons(_failure_lessons_path)
+    """Persist playbook. Prefer SQLite backend when available; else flat file."""
+    if _playbook is None:
+        return
+
+    # SQLite path
+    if _memory is not None:
+        storage = getattr(_memory, "_storage", None)
+        if storage is not None:
+            from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+            if isinstance(storage, SqliteStorageBackend):
+                try:
+                    _playbook.save_to_backend(storage, scope="project")
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "SQLite playbook save failed, falling back to flat file: %s", exc,
+                    )
+
+    # Flat-file path (default backend or SQLite error fallback)
+    _atomic_write(_playbook_path, _playbook.serialize())
+    if _failure_lessons_path:
+        _playbook.save_failure_lessons(_failure_lessons_path)
 
 
 def _load_global_playbook() -> Playbook:

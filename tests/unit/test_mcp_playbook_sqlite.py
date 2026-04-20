@@ -190,6 +190,50 @@ def test_migrate_phase_5a_global_scope(tmp_path: Path) -> None:
         backend.close()
 
 
+def test_load_save_playbook_roundtrip_via_sqlite(tmp_project: Path, monkeypatch) -> None:
+    """_save_playbook writes to SQLite when backend is SqliteStorageBackend; _load_playbook reads from it."""
+    monkeypatch.setenv("CCR_STORAGE_BACKEND", "sqlite")
+
+    import ccr.mcp.server as srv
+    # Fresh _init on the tmp project root
+    srv._init(str(tmp_project))
+
+    try:
+        pb = srv._ensure_playbook()
+        initial_ids = {b.id for b in pb.bullets}
+        assert initial_ids == {"str-00001", "str-00002", "mis-00001"}
+
+        # Mutate: add a new bullet via apply_delta (goes through _save_playbook)
+        from ccr.ace.playbook import DeltaOperation
+        op = DeltaOperation(
+            op_type="ADD",
+            section="STRATEGIES & INSIGHTS",
+            content="Phase 5a round-trip marker",
+        )
+        pb.apply_delta([op])
+        srv._save_playbook()
+
+        # Directly query SQLite — the new bullet must be visible
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+        backend = SqliteStorageBackend(str(tmp_project / ".ccr"))
+        try:
+            bullets = backend.bullet_list(scope="project")
+            assert any("round-trip marker" in b["content"] for b in bullets)
+        finally:
+            backend.close()
+
+        # Re-run _load_playbook and confirm the bullet survives
+        reloaded = srv._load_playbook()
+        assert any("round-trip marker" in b.content for b in reloaded.bullets)
+    finally:
+        # Cleanup to avoid leaking state into other tests
+        if srv._memory and hasattr(srv._memory, "_storage"):
+            try:
+                srv._memory._storage.close()
+            except Exception:
+                pass
+
+
 def test_sqlite_backend_auto_runs_phase5a_on_init(tmp_path: Path) -> None:
     """Opening SqliteStorageBackend triggers phase 5a when memory.db is at v<3."""
     ccr_root = tmp_path / ".ccr"
