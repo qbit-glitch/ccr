@@ -13,7 +13,7 @@
 ## Scope & Affected Files
 
 ### Create
-- `ccr/core/storage/_migration_phase5a.py` — `migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope)` helper (one-shot flat-file → SQLite backfill, user_version guarded, atomic per-DB)
+- `ccr/core/storage/_migration_phase5a.py` — `migrate_phase_5a(backend, playbook_path, failure_lessons_path, scope)` helper (one-shot flat-file → SQLite backfill, user_version guarded, atomic per-DB). Takes a constructed `SqliteStorageBackend` (caller owns lifecycle) so it can be safely called from `SqliteStorageBackend.__init__` without recursion.
 - `tests/unit/test_mcp_playbook_sqlite.py` — dedicated MCP-layer tests (load/save round-trip + scope routing + backfill idempotency + cross-project smoke)
 
 ### Modify
@@ -88,30 +88,24 @@ def tmp_project(tmp_path: Path) -> Path:
 
 def test_migrate_phase_5a_backfills_flat_playbook_into_sqlite(tmp_project: Path) -> None:
     ccr_root = str(tmp_project / ".ccr")
-    db_path = os.path.join(ccr_root, "memory.db")
-    playbook_path = os.path.join(ccr_root, "playbook.txt")
-    failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
+    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
 
-    # Prime memory.db at user_version=2 (post-Phase-4) so migration triggers 2→3
     backend = SqliteStorageBackend(ccr_root)
     backend._memory_mgr.set_user_version(2)
-    backend.close()
-
-    result = migrate_phase_5a(
-        ccr_root=ccr_root,
-        db_path=db_path,
-        playbook_path=playbook_path,
-        failure_lessons_path=failure_lessons_path,
-        scope="project",
-    )
-
-    assert result["migrated"] == 3  # 3 bullets in FIXTURE_PLAYBOOK
-    assert result["version_before"] == 2
-    assert result["version_after"] == 3
-
-    # Verify bullets landed in SQLite via re-open
-    backend = SqliteStorageBackend(ccr_root)
     try:
+        result = migrate_phase_5a(
+            backend=backend,
+            playbook_path=playbook_path,
+            failure_lessons_path=failure_lessons_path,
+            scope="project",
+        )
+
+        assert result["migrated"] == 3
+        assert result["version_before"] == 2
+        assert result["version_after"] == 3
+        assert result["scope"] == "project"
+
         bullets = backend.bullet_list(scope="project")
         assert {b["id"] for b in bullets} == {"str-00001", "str-00002", "mis-00001"}
         assert backend._memory_mgr.get_user_version() == 3
@@ -122,77 +116,75 @@ def test_migrate_phase_5a_backfills_flat_playbook_into_sqlite(tmp_project: Path)
 def test_migrate_phase_5a_is_idempotent(tmp_project: Path) -> None:
     """Second run is a no-op — user_version already >= 3."""
     ccr_root = str(tmp_project / ".ccr")
-    db_path = os.path.join(ccr_root, "memory.db")
-    playbook_path = os.path.join(ccr_root, "playbook.txt")
-    failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
+    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
 
     backend = SqliteStorageBackend(ccr_root)
     backend._memory_mgr.set_user_version(2)
-    backend.close()
-
-    migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-    second = migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-
-    assert second["migrated"] == 0
-    assert second["skipped"] is True
+    try:
+        migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                        failure_lessons_path=failure_lessons_path, scope="project")
+        second = migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                                 failure_lessons_path=failure_lessons_path, scope="project")
+        assert second["migrated"] == 0
+        assert second["skipped"] is True
+    finally:
+        backend.close()
 
 
 def test_migrate_phase_5a_no_flat_file_is_noop(tmp_path: Path) -> None:
     """When playbook.txt doesn't exist, migrate cleanly with no bullets."""
     ccr_root = str(tmp_path / ".ccr")
     Path(ccr_root).mkdir()
-    db_path = os.path.join(ccr_root, "memory.db")
-    playbook_path = os.path.join(ccr_root, "playbook.txt")  # missing
-    failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+    playbook_path = str(tmp_path / ".ccr" / "playbook.txt")  # missing
+    failure_lessons_path = str(tmp_path / ".ccr" / "failure_lessons.json")
 
     backend = SqliteStorageBackend(ccr_root)
     backend._memory_mgr.set_user_version(2)
-    backend.close()
-
-    result = migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-    assert result["migrated"] == 0
-    assert result["version_after"] == 3  # still bumps version to mark migration done
+    try:
+        result = migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                                 failure_lessons_path=failure_lessons_path, scope="project")
+        assert result["migrated"] == 0
+        assert result["version_after"] == 3  # still bumps version to mark migration done
+    finally:
+        backend.close()
 
 
 def test_migrate_phase_5a_atomic_on_crash(tmp_project: Path, monkeypatch) -> None:
     """If backfill throws mid-way, user_version stays at 2 and a re-run redoes it cleanly."""
     ccr_root = str(tmp_project / ".ccr")
-    db_path = os.path.join(ccr_root, "memory.db")
-    playbook_path = os.path.join(ccr_root, "playbook.txt")
-    failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
+    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
 
     backend = SqliteStorageBackend(ccr_root)
     backend._memory_mgr.set_user_version(2)
-    backend.close()
-
-    # Monkey-patch Playbook._parse to throw on second bullet
-    import ccr.ace.playbook as pbmod
-    original = pbmod.Playbook._parse
-    call_count = {"n": 0}
-
-    def flaky_parse(self, text):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise RuntimeError("simulated crash")
-        return original(self, text)
-
-    monkeypatch.setattr(pbmod.Playbook, "_parse", flaky_parse)
-
-    with pytest.raises(RuntimeError):
-        migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-
-    # DB should still be at v2 — no partial rows
-    backend = SqliteStorageBackend(ccr_root)
     try:
+        import ccr.ace.playbook as pbmod
+        original = pbmod.Playbook._parse
+        call_count = {"n": 0}
+
+        def flaky_parse(self, text):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated crash")
+            return original(self, text)
+
+        monkeypatch.setattr(pbmod.Playbook, "_parse", flaky_parse)
+
+        with pytest.raises(RuntimeError):
+            migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                            failure_lessons_path=failure_lessons_path, scope="project")
+
+        # Same backend is still usable — DB is at v2, no partial rows.
         assert backend._memory_mgr.get_user_version() == 2
         assert backend.bullet_list(scope="project") == []
+
+        monkeypatch.setattr(pbmod.Playbook, "_parse", original)
+        result = migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                                 failure_lessons_path=failure_lessons_path, scope="project")
+        assert result["migrated"] == 3
     finally:
         backend.close()
-
-    # Undo monkeypatch and re-run — should succeed
-    monkeypatch.setattr(pbmod.Playbook, "_parse", original)
-    result = migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-    assert result["migrated"] == 3
 ```
 
 ### - [ ] Step 2: Run the test to verify it fails
@@ -215,15 +207,13 @@ unpopulated (atomic — same pattern as Phase 4 sqlite-vec backfill).
 """
 from __future__ import annotations
 
-import json
-import logging
 import os
-import sqlite3
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from ccr.ace.playbook import Playbook
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from ccr.core.storage.sqlite_backend import SqliteStorageBackend
 
 # Target user_version per scope — memory.db (project) was at 2 after Phase 4;
 # global.db has never been migrated (starts at 0).
@@ -232,8 +222,7 @@ _TARGET_VERSION_GLOBAL = 1
 
 
 def migrate_phase_5a(
-    ccr_root: str,
-    db_path: str,
+    backend: "SqliteStorageBackend",
     playbook_path: str,
     failure_lessons_path: str,
     scope: str = "project",
@@ -244,9 +233,13 @@ def migrate_phase_5a(
     `{"migrated": 0, "skipped": True}`. Atomic: backfill + version bump happen
     inside a single `with conn:` transaction.
 
+    Caller owns the `backend` lifecycle — this function does NOT close it.
+    This keeps the helper safe to call from `SqliteStorageBackend.__init__`
+    (passing `self`) without infinite recursion.
+
     Args:
-        ccr_root: The .ccr/ directory (project) or ~/.ccr/ (global).
-        db_path: Full path to memory.db (project) or global.db (global).
+        backend: A fully-constructed `SqliteStorageBackend`. For `scope="global"`
+            the backend must have been initialized with a `global_ccr_root`.
         playbook_path: Full path to the flat playbook.txt or global_playbook.txt.
         failure_lessons_path: Full path to failure_lessons.json (project) or
             global_failure_lessons.json (global). May not exist.
@@ -266,83 +259,68 @@ def migrate_phase_5a(
         _TARGET_VERSION_PROJECT if scope == "project" else _TARGET_VERSION_GLOBAL
     )
 
-    # Local import to avoid cycle — sqlite_backend imports from migration
-    from ccr.core.storage.sqlite_backend import SqliteStorageBackend
-
-    # For global scope, the backend's ccr_root IS the global root — caller passes
-    # global_ccr_root (e.g. "~/.ccr") as `ccr_root`. We don't want the backend to
-    # also create a project memory.db in that dir, so only construct with
-    # global_ccr_root when scope == "global".
     if scope == "project":
-        backend = SqliteStorageBackend(ccr_root)
         mgr = backend._memory_mgr
         conn = backend.memory_conn
     else:
-        # For global-scope migration, we open the global.db directly via a
-        # dedicated backend pointing at that root. SqliteStorageBackend(ccr_root)
-        # creates a memory.db at `{ccr_root}/memory.db` — in global case that
-        # path IS {global_ccr}/memory.db which is fine (unused by the playbook
-        # tables — they live on memory_conn's DB which the test body targets).
-        # Simpler: instantiate with global_ccr_root=ccr_root so _global_mgr is
-        # set; the "playbook_bullets" insert will route to the global_conn.
-        backend = SqliteStorageBackend(ccr_root, global_ccr_root=ccr_root)
+        if backend._global_mgr is None or backend.global_conn is None:
+            raise ValueError(
+                "scope='global' requires backend initialized with global_ccr_root"
+            )
         mgr = backend._global_mgr
         conn = backend.global_conn
 
-    try:
-        current_version = mgr.get_user_version()
-        if current_version >= target_version:
-            return {
-                "migrated": 0,
-                "version_before": current_version,
-                "version_after": current_version,
-                "skipped": True,
-                "scope": scope,
-            }
-
-        # If no flat file, just bump version and exit (fresh install path)
-        if not os.path.isfile(playbook_path):
-            with conn:
-                mgr.set_user_version(target_version)
-            return {
-                "migrated": 0,
-                "version_before": current_version,
-                "version_after": target_version,
-                "skipped": False,
-                "scope": scope,
-            }
-
-        # Parse flat playbook.txt into a Playbook instance
-        with open(playbook_path, "r", encoding="utf-8") as f:
-            pb = Playbook(f.read())
-
-        # Load failure lessons from companion JSON if present
-        if os.path.isfile(failure_lessons_path):
-            pb.load_failure_lessons(failure_lessons_path)
-
-        migrated_count = len(pb.bullets)
-
-        # Atomic: save_to_backend + user_version bump in one txn
-        with conn:
-            pb.save_to_backend(backend, scope=scope)
-            mgr.set_user_version(target_version)
-
+    current_version = mgr.get_user_version()
+    if current_version >= target_version:
         return {
-            "migrated": migrated_count,
+            "migrated": 0,
+            "version_before": current_version,
+            "version_after": current_version,
+            "skipped": True,
+            "scope": scope,
+        }
+
+    # If no flat file, just bump version and exit (fresh install path)
+    if not os.path.isfile(playbook_path):
+        with conn:
+            mgr.set_user_version(target_version)
+        return {
+            "migrated": 0,
             "version_before": current_version,
             "version_after": target_version,
             "skipped": False,
             "scope": scope,
         }
-    finally:
-        backend.close()
+
+    # Parse flat playbook.txt into a Playbook instance
+    with open(playbook_path, "r", encoding="utf-8") as f:
+        pb = Playbook(f.read())
+
+    # Load failure lessons from companion JSON if present
+    if os.path.isfile(failure_lessons_path):
+        pb.load_failure_lessons(failure_lessons_path)
+
+    migrated_count = len(pb.bullets)
+
+    # Atomic: save_to_backend + user_version bump in one txn
+    with conn:
+        pb.save_to_backend(backend, scope=scope)
+        mgr.set_user_version(target_version)
+
+    return {
+        "migrated": migrated_count,
+        "version_before": current_version,
+        "version_after": target_version,
+        "skipped": False,
+        "scope": scope,
+    }
 ```
 
 ### - [ ] Step 4: Run the test to verify it passes
 
 Run: `.venv/bin/python -m pytest tests/unit/test_mcp_playbook_sqlite.py -xvs -k "migrate_phase_5a"`
 
-Expected: 4 passed (all four `test_migrate_phase_5a_*` tests).
+Expected: 5 passed (all five `test_migrate_phase_5a_*` tests, including the global-scope test).
 
 ### - [ ] Step 5: Commit
 
@@ -399,14 +377,14 @@ Add this block (adjust line numbers if the surrounding code has drifted; the sem
 
 ```python
         # ── Phase 5a: playbook flat-file → SQLite backfill (memory.db) ──────
+        # Pass `self` (no recursion — helper no longer constructs a backend).
         try:
             if self._memory_mgr.get_user_version() < 3:
                 from ccr.core.storage._migration_phase5a import migrate_phase_5a
                 playbook_path = os.path.join(self.ccr_root, "playbook.txt")
                 failure_lessons_path = os.path.join(self.ccr_root, "failure_lessons.json")
                 migrate_phase_5a(
-                    ccr_root=self.ccr_root,
-                    db_path=self._db_path,
+                    backend=self,
                     playbook_path=playbook_path,
                     failure_lessons_path=failure_lessons_path,
                     scope="project",
@@ -427,8 +405,7 @@ Add this block (adjust line numbers if the surrounding code has drifted; the sem
                         self.global_ccr_root, "global_failure_lessons.json"
                     )
                     migrate_phase_5a(
-                        ccr_root=self.global_ccr_root,
-                        db_path=os.path.join(self.global_ccr_root, "global.db"),
+                        backend=self,
                         playbook_path=global_playbook_path,
                         failure_lessons_path=global_fl_path,
                         scope="global",
@@ -445,20 +422,25 @@ Open `ccr/core/storage/migration.py`. After the Phase 3c block in `auto_migrate(
 
 ```python
     # ── Phase 5a: playbook flat-file → SQLite ──────────────────────────────
+    # Construct a backend locally, pass it in, close it in finally.
     try:
         from ccr.core.storage._migration_phase5a import migrate_phase_5a
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
         playbook_path = os.path.join(ccr_root, "playbook.txt")
         failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
-        p5a = migrate_phase_5a(
-            ccr_root=ccr_root,
-            db_path=db_path,
-            playbook_path=playbook_path,
-            failure_lessons_path=failure_lessons_path,
-            scope="project",
-        )
-        if not p5a.get("skipped"):
-            result["phases_run"].append("5a")
-            result["total_migrated"] += p5a["migrated"]
+        backend = SqliteStorageBackend(ccr_root)
+        try:
+            p5a = migrate_phase_5a(
+                backend=backend,
+                playbook_path=playbook_path,
+                failure_lessons_path=failure_lessons_path,
+                scope="project",
+            )
+            if not p5a.get("skipped"):
+                result["phases_run"].append("5a")
+                result["total_migrated"] += p5a["migrated"]
+        finally:
+            backend.close()
     except Exception as exc:
         result["errors"].append(f"phase5a: {exc}")
 ```
@@ -865,11 +847,9 @@ git commit -m "test(storage): add Phase 5a dual-backend playbook round-trip pari
 def test_phase5a_skips_backfill_when_sqlite_already_populated(tmp_project: Path) -> None:
     """If SQLite already has bullets (user_version >= 3), migrate is a no-op even if flat file still exists."""
     ccr_root = str(tmp_project / ".ccr")
-    db_path = os.path.join(ccr_root, "memory.db")
-    playbook_path = os.path.join(ccr_root, "playbook.txt")
-    failure_lessons_path = os.path.join(ccr_root, "failure_lessons.json")
+    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
+    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
 
-    # Seed SQLite with a different set of bullets, then bump version to 3
     backend = SqliteStorageBackend(ccr_root)
     try:
         backend._memory_mgr.set_user_version(2)
@@ -880,17 +860,13 @@ def test_phase5a_skips_backfill_when_sqlite_already_populated(tmp_project: Path)
         ])
         pb.save_to_backend(backend, scope="project")
         backend._memory_mgr.set_user_version(3)
-    finally:
-        backend.close()
 
-    # Run migration — should skip (version already at target)
-    result = migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope="project")
-    assert result["skipped"] is True
-    assert result["migrated"] == 0
+        # Run migration on the same backend — should skip (version already at target).
+        result = migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                                 failure_lessons_path=failure_lessons_path, scope="project")
+        assert result["skipped"] is True
+        assert result["migrated"] == 0
 
-    # Verify the SQLite-only content survives; flat-file bullets were NOT injected
-    backend = SqliteStorageBackend(ccr_root)
-    try:
         bullets = backend.bullet_list(scope="project")
         contents = {b["content"] for b in bullets}
         assert "sqlite-only content" in contents
@@ -1072,7 +1048,7 @@ After all tasks complete, verify:
 
 2. **Placeholder scan** — ✔ No TBD / TODO / "similar to" / "add error handling" — every step shows the exact code.
 
-3. **Type consistency** — ✔ `Playbook.from_backend(backend, scope)` matches signature in `ccr/ace/playbook.py:60`. `Playbook.save_to_backend(backend, scope)` matches `ccr/ace/playbook.py:108`. `SqliteStorageBackend` / `FileStorageBackend` class names match imports. `migrate_phase_5a(ccr_root, db_path, playbook_path, failure_lessons_path, scope)` consistent across Tasks 5a.1 / 5a.2 / 5a.6. `_global_mgr` attr name matches `ccr/core/storage/sqlite_backend.py:388`.
+3. **Type consistency** — ✔ `Playbook.from_backend(backend, scope)` matches signature in `ccr/ace/playbook.py:60`. `Playbook.save_to_backend(backend, scope)` matches `ccr/ace/playbook.py:108`. `SqliteStorageBackend` / `FileStorageBackend` class names match imports. `migrate_phase_5a(backend, playbook_path, failure_lessons_path, scope)` consistent across Tasks 5a.1 / 5a.2 / 5a.6. `_global_mgr` attr name matches `ccr/core/storage/sqlite_backend.py:388`.
 
 4. **Known risks documented**:
    - `SqliteStorageBackend` constructor attributes referenced in Task 5a.2 Step 3 (`self.ccr_root`, `self.db_path`, `self._global_ccr_root`) — the implementer must verify these exact names via grep before writing the migration block. If the real names differ, substitute them.
