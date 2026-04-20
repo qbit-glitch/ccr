@@ -106,34 +106,143 @@ class Playbook(AnalyticsMixin, SchemaMixin, MutationsMixin):
         return pb
 
     def save_to_backend(self, backend: Any, scope: str = "project") -> None:
-        """Save the current Playbook state back to a StorageBackend."""
-        now = datetime.now(timezone.utc).isoformat()
-        backend.playbook_sections_set(self._sections, scope)
+        """Save the current Playbook state back to a StorageBackend.
 
-        existing_ids = {b["id"] for b in backend.bullet_list(scope=scope)}
+        Phase 5a review fixes:
+          C1 — persists failure_lessons (was previously silent-dropped; from_backend
+               loaded them but save never wrote, causing asymmetric round-trip).
+          C2 — wraps the full body in a single outer txn on the scoped SQLite
+               connection, calling `_nc` (no-commit) variants of the playbook
+               primitives so a mid-save exception rolls the whole change back.
+               The file backend falls back to per-call commits (its primitives
+               have their own per-file atomic writes, so partial rollback is
+               not achievable but also not a concurrent-reader problem — file
+               writes are already atomic via rename).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Detect SQLite backend by duck-typing on the _nc helpers we added.
+        # Inside a `with conn:` block, all mutations either commit on clean
+        # exit or roll back on exception, so concurrent readers never see
+        # partial state. File-backend path keeps the pre-existing per-call
+        # commits (its primitives are already atomic at the file level).
+        has_nc = hasattr(backend, "_bullet_insert_nc")
+        conn = None
+        if has_nc and hasattr(backend, "_get_scoped_conn"):
+            try:
+                conn = backend._get_scoped_conn(scope)
+            except Exception:
+                conn = None
+
+        existing_bullets = backend.bullet_list(scope=scope)
+        existing_ids = {b["id"] for b in existing_bullets}
         current_ids = {b.id for b in self._bullets}
 
-        for bid in existing_ids - current_ids:
-            backend.bullet_delete(bid, scope)
+        # Load lessons once up-front so we can dedup and compute evolution deltas.
+        # failure_lessons_all returns dict[bullet_id -> list[lesson_dict]].
+        existing_lessons = backend.failure_lessons_all(scope)
 
-        for bullet in self._bullets:
-            bd = {
-                "id": bullet.id, "section": bullet.section,
-                "content": bullet.content, "helpful": bullet.helpful,
-                "harmful": bullet.harmful, "scope": bullet.scope,
-                "when_to_apply": bullet.when_to_apply,
-                "trigger_text": bullet.trigger, "action": bullet.action,
-                "weighted_helpful": bullet.weighted_helpful,
-                "weighted_harmful": bullet.weighted_harmful,
-                "personal_decay_rate": bullet.personal_decay_rate,
-                "grpo_advantage": bullet.grpo_advantage,
-                "last_updated": bullet.last_updated,
-                "created_at": bullet.last_updated or now,
-            }
-            if bullet.id in existing_ids:
-                backend.bullet_update(bullet.id, bd, scope)
+        def _commit_body(c: Any) -> None:
+            # Sections
+            if has_nc and c is not None:
+                backend._playbook_sections_set_nc(c, self._sections)
             else:
-                backend.bullet_insert(bd, scope)
+                backend.playbook_sections_set(self._sections, scope)
+
+            # Deletes (bullets removed from memory). Cascade via FK should clean
+            # failure_lessons; no explicit lesson delete needed.
+            for bid in existing_ids - current_ids:
+                if has_nc and c is not None:
+                    backend._bullet_delete_nc(c, bid)
+                else:
+                    backend.bullet_delete(bid, scope)
+
+            # Upserts
+            for bullet in self._bullets:
+                bd = {
+                    "id": bullet.id, "section": bullet.section,
+                    "content": bullet.content, "helpful": bullet.helpful,
+                    "harmful": bullet.harmful, "scope": bullet.scope,
+                    "when_to_apply": bullet.when_to_apply,
+                    "trigger_text": bullet.trigger, "action": bullet.action,
+                    "weighted_helpful": bullet.weighted_helpful,
+                    "weighted_harmful": bullet.weighted_harmful,
+                    "personal_decay_rate": bullet.personal_decay_rate,
+                    "grpo_advantage": bullet.grpo_advantage,
+                    "last_updated": bullet.last_updated,
+                    "created_at": bullet.last_updated or now,
+                }
+                if bullet.id in existing_ids:
+                    if has_nc and c is not None:
+                        backend._bullet_update_nc(c, bullet.id, bd)
+                    else:
+                        backend.bullet_update(bullet.id, bd, scope)
+                else:
+                    if has_nc and c is not None:
+                        backend._bullet_insert_nc(c, bd)
+                    else:
+                        backend.bullet_insert(bd, scope)
+
+            # Failure lessons: insert NEW lessons (dedup by (failure_point, timestamp)).
+            # Also propagate evolved=True for any existing lesson now marked evolved
+            # in-memory that wasn't marked evolved in the DB. We use the existing
+            # per-bullet `failure_lessons_mark_evolved` API (it marks ALL unevolved
+            # lessons for a bullet). If the in-memory copy has any evolved lesson
+            # that corresponds to an unevolved DB row, mark all evolved for that
+            # bullet. Coarser than ideal (API takes only bullet_id), but matches
+            # the existing contract and keeps the migration minimal.
+            for bullet in self._bullets:
+                if not bullet.failure_lessons:
+                    continue
+                db_lessons = existing_lessons.get(bullet.id, [])
+                db_keys = {
+                    (l.get("failure_point", ""), l.get("timestamp", ""))
+                    for l in db_lessons
+                }
+                mem_any_evolved = False
+                mem_evolved_keys: set[tuple[str, str]] = set()
+                for mem_lesson in bullet.failure_lessons:
+                    lesson_dict = (
+                        mem_lesson.to_dict()
+                        if hasattr(mem_lesson, "to_dict") else dict(mem_lesson)
+                    )
+                    key = (
+                        lesson_dict.get("failure_point", ""),
+                        lesson_dict.get("timestamp", ""),
+                    )
+                    if lesson_dict.get("evolved"):
+                        mem_any_evolved = True
+                        mem_evolved_keys.add(key)
+                    if key not in db_keys:
+                        if has_nc and c is not None:
+                            backend._failure_lessons_insert_nc(c, bullet.id, lesson_dict)
+                        else:
+                            backend.failure_lessons_insert(bullet.id, lesson_dict, scope)
+
+                # Propagate evolution: if any in-memory lesson is evolved AND any
+                # existing DB lesson is NOT yet evolved, mark the bullet's unevolved
+                # DB lessons as evolved. (The existing API is per-bullet, not per-
+                # lesson; accept this coarser granularity.)
+                if mem_any_evolved and any(
+                    not bool(l.get("evolved", False)) for l in db_lessons
+                ):
+                    if has_nc and c is not None and hasattr(
+                        backend, "_failure_lessons_mark_evolved_nc"
+                    ):
+                        backend._failure_lessons_mark_evolved_nc(c, bullet.id)
+                    elif hasattr(backend, "failure_lessons_mark_evolved"):
+                        backend.failure_lessons_mark_evolved(bullet.id, scope)
+
+        if has_nc and conn is not None:
+            # Single outer transaction. On exception Python rolls back the
+            # whole body, so concurrent readers never see partial state.
+            with conn:
+                _commit_body(conn)
+        else:
+            # File backend path (or SQLite fallback if _get_scoped_conn failed):
+            # per-call commits; primitives are atomic at the file/row level but
+            # not collectively atomic across the whole save.
+            _commit_body(None)
 
     def _parse(self, text: str) -> None:
         """Parse playbook text into structured bullets."""

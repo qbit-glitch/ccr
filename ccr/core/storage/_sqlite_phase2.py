@@ -35,6 +35,17 @@ class Phase2Mixin:
 
     def bullet_insert(self, bullet: dict, scope: str = "project") -> None:
         conn = self._get_scoped_conn(scope)
+        self._bullet_insert_nc(conn, bullet)
+        conn.commit()
+
+    def _bullet_insert_nc(self, conn: Any, bullet: dict) -> None:
+        """No-commit variant of bullet_insert; call inside an outer txn.
+
+        Phase 5a review C2 fix: save_to_backend wraps multiple primitives in a
+        single transaction. Inner commits would fragment that txn (an exception
+        after the commit cannot roll the inserted row back). _nc variants let
+        save_to_backend run as one atomic unit.
+        """
         conn.execute(
             """INSERT INTO playbook_bullets
                (id, section, content, helpful, harmful, scope, when_to_apply,
@@ -51,10 +62,15 @@ class Phase2Mixin:
                 bullet.get("last_updated"), bullet.get("created_at", _utcnow()),
             ),
         )
-        conn.commit()
 
     def bullet_update(self, bullet_id: str, updates: dict, scope: str = "project") -> bool:
         conn = self._get_scoped_conn(scope)
+        changed = self._bullet_update_nc(conn, bullet_id, updates)
+        conn.commit()
+        return changed
+
+    def _bullet_update_nc(self, conn: Any, bullet_id: str, updates: dict) -> bool:
+        """No-commit variant of bullet_update; call inside an outer txn."""
         if not updates:
             return False
         set_parts = []
@@ -72,14 +88,18 @@ class Phase2Mixin:
             values,
         )
         changed = conn.execute("SELECT changes()").fetchone()[0]
-        conn.commit()
         return changed > 0
 
     def bullet_delete(self, bullet_id: str, scope: str = "project") -> bool:
         conn = self._get_scoped_conn(scope)
+        changed = self._bullet_delete_nc(conn, bullet_id)
+        conn.commit()
+        return changed
+
+    def _bullet_delete_nc(self, conn: Any, bullet_id: str) -> bool:
+        """No-commit variant of bullet_delete; call inside an outer txn."""
         conn.execute("DELETE FROM playbook_bullets WHERE id = ?", (bullet_id,))
         changed = conn.execute("SELECT changes()").fetchone()[0]
-        conn.commit()
         return changed > 0
 
     def bullet_update_counters(self, bullet_tags: list[dict], scope: str = "project") -> int:
@@ -148,13 +168,17 @@ class Phase2Mixin:
 
     def playbook_sections_set(self, sections: list[str], scope: str = "project") -> None:
         conn = self._get_scoped_conn(scope)
+        self._playbook_sections_set_nc(conn, sections)
+        conn.commit()
+
+    def _playbook_sections_set_nc(self, conn: Any, sections: list[str]) -> None:
+        """No-commit variant of playbook_sections_set; call inside an outer txn."""
         conn.execute("DELETE FROM playbook_sections")
         for i, name in enumerate(sections):
             conn.execute(
                 "INSERT INTO playbook_sections (position, name) VALUES (?, ?)",
                 (i, name),
             )
-        conn.commit()
 
     # ── Failure Lessons ────────────────────────────────────────
 
@@ -167,6 +191,11 @@ class Phase2Mixin:
 
     def failure_lessons_insert(self, bullet_id: str, lesson: dict, scope: str = "project") -> None:
         conn = self._get_scoped_conn(scope)
+        self._failure_lessons_insert_nc(conn, bullet_id, lesson)
+        conn.commit()
+
+    def _failure_lessons_insert_nc(self, conn: Any, bullet_id: str, lesson: dict) -> None:
+        """No-commit variant of failure_lessons_insert; call inside an outer txn."""
         conn.execute(
             """INSERT INTO failure_lessons
                (bullet_id, failure_point, flawed_reasoning, counterfactual,
@@ -183,16 +212,20 @@ class Phase2Mixin:
                 int(lesson.get("evolved", False)),
             ),
         )
-        conn.commit()
 
     def failure_lessons_mark_evolved(self, bullet_id: str, scope: str = "project") -> int:
         conn = self._get_scoped_conn(scope)
+        changed = self._failure_lessons_mark_evolved_nc(conn, bullet_id)
+        conn.commit()
+        return changed
+
+    def _failure_lessons_mark_evolved_nc(self, conn: Any, bullet_id: str) -> int:
+        """No-commit variant of failure_lessons_mark_evolved; call inside an outer txn."""
         conn.execute(
             "UPDATE failure_lessons SET evolved = 1 WHERE bullet_id = ? AND evolved = 0",
             (bullet_id,),
         )
         changed = conn.execute("SELECT changes()").fetchone()[0]
-        conn.commit()
         return changed
 
     def failure_lessons_all(self, scope: str = "project") -> dict[str, list[dict]]:

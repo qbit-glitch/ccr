@@ -351,11 +351,18 @@ def _load_playbook() -> Playbook:
 
 
 def _save_playbook() -> None:
-    """Persist playbook. Prefer SQLite backend when available; else flat file."""
+    """Persist playbook. Prefer SQLite backend when available; else flat file.
+
+    Review-fix I1: on SQLite backend, save failures RE-RAISE instead of falling
+    through to flat-file writes. Falling through overwrites playbook.txt with
+    possibly-stale in-memory content, masking a divergence where another process
+    already wrote newer state to memory.db. Reads still fall back to flat file
+    (best-effort recovery), but writes must not hide errors.
+    """
     if _playbook is None:
         return
 
-    # SQLite path
+    # SQLite path: re-raise on failure (do NOT silently overwrite flat file)
     if _memory is not None:
         storage = getattr(_memory, "_storage", None)
         if storage is not None:
@@ -365,11 +372,13 @@ def _save_playbook() -> None:
                     _playbook.save_to_backend(storage, scope="project")
                     return
                 except Exception as exc:
-                    logger.warning(
-                        "SQLite playbook save failed, falling back to flat file: %s", exc,
+                    logger.error(
+                        "SQLite playbook save failed — not falling through to "
+                        "flat file to avoid stale overwrite: %s", exc,
                     )
+                    raise
 
-    # Flat-file path (default backend or SQLite error fallback)
+    # Flat-file path (default backend only)
     _atomic_write(_playbook_path, _playbook.serialize())
     if _failure_lessons_path:
         _playbook.save_failure_lessons(_failure_lessons_path)

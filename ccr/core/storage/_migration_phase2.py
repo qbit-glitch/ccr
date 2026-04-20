@@ -151,6 +151,21 @@ def _migrate_failure_lessons_json(ccr_root: str, conn: sqlite3.Connection) -> in
         )
 
         for lesson in lessons:
+            # Dedup guard: Phase 5a auto-migration inside SqliteStorageBackend.__init__
+            # may have already inserted this lesson via save_to_backend. Skip
+            # duplicates identified by semantic content (bullet_id, failure_point,
+            # flawed_reasoning) — timestamp may differ between the two migration
+            # paths. Review-fix follow-up on C1.
+            fp = lesson.get("failure_point", "")
+            fr = lesson.get("flawed_reasoning", "")
+            existing = conn.execute(
+                """SELECT 1 FROM failure_lessons
+                   WHERE bullet_id = ? AND failure_point = ? AND flawed_reasoning = ?
+                   LIMIT 1""",
+                (bid, fp, fr),
+            ).fetchone()
+            if existing is not None:
+                continue
             conn.execute(
                 """INSERT INTO failure_lessons
                    (bullet_id, failure_point, flawed_reasoning, counterfactual,
@@ -158,8 +173,8 @@ def _migrate_failure_lessons_json(ccr_root: str, conn: sqlite3.Connection) -> in
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     bid,
-                    lesson.get("failure_point", ""),
-                    lesson.get("flawed_reasoning", ""),
+                    fp,
+                    fr,
                     lesson.get("counterfactual", ""),
                     lesson.get("prevention_principle", ""),
                     lesson.get("task_context", ""),
