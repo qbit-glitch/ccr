@@ -68,7 +68,7 @@ tests/unit/         # ~1993 tests
   in `__init__.py` and `server.py`. Actual tool-function count = 34.)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
-- **Two-tier playbook**: Global (~/.ccr/) + project (.ccr/); `scope="global"|"project"` on ACE tools
+- **Two-tier playbook**: Global (~/.ccr/global.db) + project (.ccr/memory.db) via SQLite; `scope="global"|"project"` on ACE tools. WAL locking makes concurrent Claude Code sessions on different projects safe for global-scope writes.
 - **Temporal decay**: effective_score = raw * 0.95^days
 - **Pattern buffer**: Dedup at 0.7 Jaccard; 200-cap; 3+ occurrences suggests ACE promotion
 - **Schema evolution**: Rule-based proposals; version history + rollback
