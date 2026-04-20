@@ -482,3 +482,37 @@ def test_global_playbook_shared_across_projects_via_sqlite(
         "Global bullet from proj_a should be visible in proj_b session via global.db"
     )
     # Cleanup handled by srv_reset fixture
+
+
+def test_phase5a_skips_backfill_when_sqlite_already_populated(tmp_project: Path) -> None:
+    """If SQLite already has bullets (user_version >= 3), migrate is a no-op even if flat file still exists."""
+    ccr_root = str(tmp_project / ".ccr")
+    playbook_path = str(tmp_project / ".ccr" / "playbook.txt")
+    failure_lessons_path = str(tmp_project / ".ccr" / "failure_lessons.json")
+
+    backend = SqliteStorageBackend(ccr_root)
+    try:
+        backend._memory_mgr.set_user_version(2)
+        from ccr.ace.playbook import Playbook, DeltaOperation
+        pb = Playbook()
+        pb.apply_delta([
+            DeltaOperation(op_type="ADD", section="STRATEGIES & INSIGHTS", content="sqlite-only content"),
+        ])
+        pb.save_to_backend(backend, scope="project")
+        backend._memory_mgr.set_user_version(3)
+
+        # Run migration on the same backend — should skip (version already at target).
+        # Note: tmp_project fixture pre-populates playbook.txt with FIXTURE_PLAYBOOK
+        # (containing str-00001), so the assertion below is load-bearing: it proves
+        # the skip is due to the version guard, NOT a missing flat file.
+        result = migrate_phase_5a(backend=backend, playbook_path=playbook_path,
+                                 failure_lessons_path=failure_lessons_path, scope="project")
+        assert result["skipped"] is True
+        assert result["migrated"] == 0
+
+        bullets = backend.bullet_list(scope="project")
+        contents = {b["content"] for b in bullets}
+        assert "sqlite-only content" in contents
+        assert not any("str-00001" in c for c in contents), "flat-file bullets should not be re-injected"
+    finally:
+        backend.close()
