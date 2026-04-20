@@ -484,6 +484,51 @@ def test_global_playbook_shared_across_projects_via_sqlite(
     # Cleanup handled by srv_reset fixture
 
 
+def test_ace_apply_delta_persists_via_sqlite_and_survives_reinit(
+    tmp_project: Path, monkeypatch, srv_reset
+) -> None:
+    """ace_apply_delta writes bullets to SQLite; re-init reads them back."""
+    monkeypatch.setenv("CCR_STORAGE_BACKEND", "sqlite")
+
+    srv = srv_reset
+    from ccr.mcp.ace_tools import ace_apply_delta
+
+    srv._init(str(tmp_project))
+    try:
+        result = ace_apply_delta(
+            operations=[
+                {"type": "ADD", "section": "STRATEGIES & INSIGHTS", "content": "MCP smoke bullet"},
+            ],
+            scope="project",
+        )
+        # AceApplyDeltaResult is a TypedDict; access fields via dict syntax.
+        assert result["applied"] == 1
+
+        # Directly query SQLite
+        from ccr.core.storage.sqlite_backend import SqliteStorageBackend
+        backend = SqliteStorageBackend(str(tmp_project / ".ccr"))
+        try:
+            bullets = backend.bullet_list(scope="project")
+            assert any("MCP smoke bullet" in b["content"] for b in bullets)
+        finally:
+            backend.close()
+    finally:
+        if srv._memory and hasattr(srv._memory, "_storage"):
+            srv._memory._storage.close()
+
+    # Reset globals and re-init — bullet should still be loaded
+    srv._memory = None
+    srv._playbook = None
+    srv._global_playbook = None
+    srv._init(str(tmp_project))
+    try:
+        pb = srv._ensure_playbook()
+        assert any("MCP smoke bullet" in b.content for b in pb.bullets)
+    finally:
+        if srv._memory and hasattr(srv._memory, "_storage"):
+            srv._memory._storage.close()
+
+
 def test_phase5a_skips_backfill_when_sqlite_already_populated(tmp_project: Path) -> None:
     """If SQLite already has bullets (user_version >= 3), migrate is a no-op even if flat file still exists."""
     ccr_root = str(tmp_project / ".ccr")
