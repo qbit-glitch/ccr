@@ -83,14 +83,18 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     else:
         issues.append(f"Python {py_ver} — requires 3.11+")
 
-    # 1b. Claude Code CLI
-    import shutil as _shutil
-    if _shutil.which("claude"):
-        ok_items.append("Claude Code CLI found")
+    # 1b. Detect installed agents
+    from ccr.adapters import detect_installed, get_adapters
+    installed_agents = detect_installed()
+    all_adapters = get_adapters()
+    if installed_agents:
+        names = ", ".join(a.display_name for a in installed_agents)
+        ok_items.append(f"Agents detected: {names}")
     else:
-        issues.append(
-            "Claude Code CLI not found — install: npm install -g @anthropic-ai/claude-code\n"
-            "         (CCR hooks require claude to be available in PATH)"
+        agent_names = ", ".join(a.display_name for a in all_adapters)
+        notices.append(
+            f"No supported agents detected. Supported: {agent_names}. "
+            "Install at least one agent for CCR to integrate with."
         )
 
     # 2. .ccr/ directory
@@ -129,69 +133,33 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     except ImportError:
         notices.append("Vector store not installed (optional) — pip install 'ccr-memory[vector]'")
 
-    # 7a. Claude Code hooks — check project-local AND global (~/.claude/)
-    claude_hooks_found = False
-    local_settings = os.path.join(project, ".claude", "settings.local.json")
-    global_claude_settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-
-    for settings_path, scope_label in ((local_settings, ""), (global_claude_settings, " (global)")):
-        if not os.path.isfile(settings_path):
-            continue
-        try:
-            with open(settings_path, encoding="utf-8") as f:
-                settings = json.loads(f.read())
-            hooks = settings.get("hooks", {})
-            if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                ok_items.append(f"Claude Code hooks configured{scope_label}")
-                claude_hooks_found = True
-            # Check for duplicate hook commands
-            for event, cmds in hooks.items():
-                commands = [c.get("command", "") for c in cmds if isinstance(c, dict)]
-                if len(commands) != len(set(commands)):
-                    issues.append(
-                        f"Duplicate hook command in {event} — run: ccr uninstall && ccr install"
-                    )
-            # Check for stale hook paths
-            stale_items = _check_stale_hook_paths(hooks)
-            if stale_items:
-                for stale_msg in stale_items:
-                    issues.append(stale_msg)
-            else:
-                if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                    ok_items.append("Claude Code hook paths valid")
-        except (json.JSONDecodeError, OSError):
-            issues.append(f"Claude settings file exists but unreadable: {settings_path}")
-
-    if not claude_hooks_found:
-        notices.append("No Claude Code hooks found — run 'ccr install' (per-project) or 'ccr install-global'")
-
-    # 7b. Kimi Code CLI hooks — check global ~/.kimi/config.toml
-    kimi_hooks_found = False
-    kimi_config = os.path.expanduser("~/.kimi/config.toml")
-    if os.path.isfile(kimi_config):
-        try:
-            with open(kimi_config, "r", encoding="utf-8") as f:
-                content = f.read()
-            # Count CCR hook blocks
-            ccr_hook_count = len(re.findall(r"\[\[hooks\]\]", content)) if "ccr" in content.lower() else 0
-            if ccr_hook_count > 0 and "ccr" in content.lower():
-                ok_items.append("Kimi Code CLI hooks configured (global)")
-                kimi_hooks_found = True
-            elif "[[hooks]]" in content:
-                notices.append("Kimi has hooks but no CCR hooks — run 'ccr install-global'")
-        except (OSError, UnicodeDecodeError):
-            notices.append("Kimi config exists but unreadable")
-    else:
-        notices.append("No Kimi Code CLI config found — install Kimi CLI first")
+    # 7. Adapter status checks — per-agent CCR configuration
+    any_hooks_found = False
+    for adapter in all_adapters:
+        status = adapter.status()
+        if not status.installed:
+            continue  # Skip agents not installed
+        if status.ccr_enabled:
+            level_name = {5: "MCP+Hooks", 4: "MCP", 3: "FileWatcher", 2: "SDK", 1: "Manual"}.get(
+                status.integration_level, "Unknown"
+            )
+            ok_items.append(f"{adapter.display_name}: CCR enabled ({level_name})")
+            if status.hooks_configured:
+                any_hooks_found = True
+        else:
+            notices.append(
+                f"{adapter.display_name} installed but CCR not configured — "
+                f"run 'ccr install-global --agents {adapter.name}'"
+            )
 
     # Session logging summary
-    if claude_hooks_found or kimi_hooks_found:
+    if any_hooks_found:
         ok_items.append("Session logging enabled (Q&A turns saved to sessions.db)")
     else:
-        issues.append(
-            "No auto-commit hooks found — run 'ccr install-global' to enable automatic memory\n"
-            "         across all projects for both Claude Code and Kimi Code CLI"
-        )
+        if installed_agents:
+            issues.append(
+                "No auto-commit hooks found — run 'ccr install-global' to enable automatic memory"
+            )
 
     # 8. Hook error log
     hook_errors_log = os.path.join(ccr_dir, ".hook_errors.log")

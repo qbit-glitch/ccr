@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Claude Code hook: fires on Stop (session end).
+"""Hook: fires on session end (Stop).
 
 Reads accumulated session state and auto-commits if meaningful
 progress was detected. Replaces the bare-bones on_session_end.py.
 
-Also reconciles any Q&A turns present in the Claude Code transcript
+Also reconciles any Q&A turns present in the agent transcript
 but not yet logged via session_log_turn (transcript-based fallback).
 
-Prints a brief confirmation to stdout so Claude Code sees the commit.
+Provider-agnostic: reads CanonicalEvent payload from stdin with
+fallback to agent-native transcript format.
 """
 
 import json
@@ -34,12 +35,20 @@ def _log_hook_error(error_text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _read_stdin_payload() -> dict:
-    """Read and parse the JSON payload from stdin (non-fatal)."""
+    """Read and parse the JSON payload from stdin (non-fatal).
+
+    Tries canonical payload first, then falls back to agent-native format.
+    """
     try:
         if not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
-                return json.loads(raw)
+                data = json.loads(raw)
+                # Canonical payload: {event: "stop", transcript_path: "...", session_id: "..."}
+                if data.get("event") in ("stop", "session_end"):
+                    return data
+                # Agent-native (Claude): may contain transcript_path, session_id, etc.
+                return data
     except Exception:
         pass
     return {}

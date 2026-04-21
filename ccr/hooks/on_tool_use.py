@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Claude Code hook: fires on PostToolUse.
+"""Hook: fires after tool use (PostToolUse).
 
 Silently accumulates session state by detecting file writes,
 test runs, and other meaningful tool operations. Appends to
 .ccr/.session_state.json for later auto-commit by on_stop.py.
 
-Outputs nothing to stdout (silent accumulator).
+Provider-agnostic: reads CanonicalEvent payload from stdin,
+with fallback to Claude Code's native PostToolUse JSON format.
 """
 
 import json
@@ -28,20 +29,22 @@ def _log_hook_error(error_text: str) -> None:
 
 
 def _read_tool_data_from_stdin() -> tuple[str, dict]:
-    """Read tool_name and tool_input from Claude Code's PostToolUse stdin JSON.
+    """Read tool_name and tool_input from stdin.
 
-    Claude Code sends hook data as JSON via stdin:
-    {"tool_name": "Write", "tool_input": {"file_path": "...", ...}}
-
-    Returns:
-        (tool_name, tool_input) — both empty/empty-dict on failure.
+    Tries canonical payload first, then falls back to Claude Code's
+    native PostToolUse JSON format.
     """
     try:
         if not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
                 data = json.loads(raw)
-                return data.get("tool_name", ""), data.get("tool_input", {}) or {}
+                # Canonical payload: {event: "tool_use", tool_name: "...", tool_input: {...}}
+                if data.get("event") == "tool_use":
+                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}
+                # Claude native: {tool_name: "Write", tool_input: {...}}
+                if "tool_name" in data:
+                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}
     except Exception:
         pass
     return "", {}

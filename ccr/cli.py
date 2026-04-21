@@ -615,6 +615,61 @@ def status(project: str) -> None:
         click.echo("\nNo commits yet.")
 
 
+# ---------------------------------------------------------------------------
+# Agent management commands
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def agents():
+    """Manage CCR integrations for AI agents."""
+
+
+@agents.command("list")
+def agents_list():
+    """List all supported agents and their status."""
+    from ccr.adapters import get_adapters
+
+    all_adapters = get_adapters()
+    if not all_adapters:
+        click.echo("No agent adapters registered.")
+        return
+
+    click.echo("Supported AI Agents:\n")
+    for adapter in all_adapters:
+        status = adapter.status()
+        installed = "✓ installed" if status.installed else "  not installed"
+        ccr = "CCR enabled" if status.ccr_enabled else "CCR not configured"
+        level_name = {5: "MCP+Hooks", 4: "MCP", 3: "FileWatcher", 2: "SDK", 1: "Manual"}.get(
+            status.integration_level, "Unknown"
+        )
+        click.echo(f"  {adapter.display_name:<20} {installed:<18} {ccr} ({level_name})")
+
+    click.echo(f"\n  Run 'ccr agents info <name>' for details on a specific agent.")
+
+
+@agents.command("info")
+@click.argument("name")
+def agents_info(name: str):
+    """Show detailed info about a specific agent's CCR integration."""
+    from ccr.adapters import get_adapter
+
+    adapter = get_adapter(name)
+    if not adapter:
+        click.echo(f"Unknown agent: {name}", err=True)
+        return
+
+    status = adapter.status()
+    click.echo(f"Agent: {adapter.display_name} ({adapter.name})")
+    click.echo(f"  Installed:      {status.installed}")
+    click.echo(f"  CCR enabled:    {status.ccr_enabled}")
+    click.echo(f"  MCP support:    {adapter.supports_mcp()}")
+    click.echo(f"  Hooks support:  {adapter.supports_hooks()}")
+    click.echo(f"  Integration:    {status.integration_level}")
+    click.echo(f"  Context format: {adapter.context_format()}")
+    click.echo(f"\n  Install command:")
+    click.echo(f"    ccr install-global --agents {adapter.name}")
+
+
 # doctor and stats live in submodules (split for 800-line compliance)
 # Re-exported here so `from ccr.cli import doctor/stats` continues to work
 from ccr.cli_doctor import doctor  # noqa: E402
@@ -624,6 +679,7 @@ cli.add_command(doctor)
 cli.add_command(stats)
 cli.add_command(install_global)
 cli.add_command(uninstall_global)
+cli.add_command(agents)
 
 
 @cli.command()

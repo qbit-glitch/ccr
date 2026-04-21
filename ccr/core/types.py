@@ -652,3 +652,27 @@ class CCREngineConfig:
             )
 
         return warnings
+
+
+# =============================================================================
+# Provider-agnostic event and format types (Phase 3)
+# =============================================================================
+
+class CanonicalEvent(str, Enum):
+    """Canonical lifecycle events that any agent adapter can map to."""
+
+    SESSION_START = "session_start"      # Before first user prompt
+    PROMPT_SUBMIT = "prompt_submit"      # On each user prompt
+    TOOL_USE = "tool_use"                # After tool execution
+    PRE_COMPACT = "pre_compact"          # Before context window fills
+    SESSION_END = "session_end"          # On graceful shutdown
+    STOP = "stop"                        # On any exit
+
+
+class ContextFormat(str, Enum):
+    """Context injection output formats."""
+
+    XML = "xml"               # <gcc_context>...</gcc_context> (Claude, Kimi)
+    MARKDOWN = "markdown"     # ## CCR Context\n... (generic)
+    PLAIN = "plain"           # No wrapping (minimal)
+    FRONTMATTER = "frontmatter"  # YAML frontmatter + content

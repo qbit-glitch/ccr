@@ -1,16 +1,23 @@
-"""Global CCR installation commands for Claude Code and Kimi Code CLI.
+"""Global CCR installation commands — now provider-agnostic via adapters.
 
 Extracted from cli.py to satisfy 800-line limit.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
-import shlex
 import sys
 
 import click
+
+from ccr.adapters import (
+    BaseAgentAdapter,
+    InstallResult,
+    UninstallResult,
+    detect_installed,
+    get_adapter,
+    get_adapters,
+    list_adapter_names,
+)
 
 
 def _get_ccr_paths() -> tuple[str, str, str]:
@@ -21,184 +28,35 @@ def _get_ccr_paths() -> tuple[str, str, str]:
     return ccr_pkg, python_exe, hooks_dir
 
 
-def _ensure_claude_global_mcp(python_exe: str) -> str:
-    """Write CCR MCP server to ~/.claude/.mcp.json (merge with existing)."""
-    claude_dir = os.path.expanduser("~/.claude")
-    os.makedirs(claude_dir, exist_ok=True)
-    mcp_path = os.path.join(claude_dir, ".mcp.json")
+def _resolve_agents(agents_flag: str) -> list[BaseAgentAdapter]:
+    """Resolve --agents flag to a list of adapter instances.
 
-    existing: dict = {}
-    if os.path.isfile(mcp_path):
-        try:
-            with open(mcp_path, "r", encoding="utf-8") as f:
-                existing = json.loads(f.read())
-        except (json.JSONDecodeError, OSError):
-            pass
+    Values:
+        auto   → all adapters whose agent is_installed()
+        all    → all registered adapters
+        name1,name2  → specific adapters by name
+    """
+    all_adapters = get_adapters()
 
-    existing.setdefault("mcpServers", {})
-    existing["mcpServers"]["ccr"] = {
-        "command": python_exe,
-        "args": ["-m", "ccr.mcp_server", "--project", "."],
-        "env": {"CCR_OLLAMA_MODEL": os.environ.get("CCR_OLLAMA_MODEL", "")},
-    }
-    # Remove empty env values for cleanliness
-    if not existing["mcpServers"]["ccr"]["env"].get("CCR_OLLAMA_MODEL"):
-        del existing["mcpServers"]["ccr"]["env"]
+    if agents_flag == "auto":
+        return [a for a in all_adapters if a.is_installed()]
 
-    with open(mcp_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
-    return mcp_path
+    if agents_flag == "all":
+        return all_adapters
 
-
-def _ensure_claude_global_hooks(python_exe: str, hooks_dir: str) -> str:
-    """Write CCR hooks to ~/.claude/settings.json (merge with existing)."""
-    claude_dir = os.path.expanduser("~/.claude")
-    os.makedirs(claude_dir, exist_ok=True)
-    settings_path = os.path.join(claude_dir, "settings.json")
-
-    existing: dict = {}
-    if os.path.isfile(settings_path):
-        try:
-            with open(settings_path, "r", encoding="utf-8") as f:
-                existing = json.loads(f.read())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    _q = shlex.quote
-    _py = _q(python_exe)
-
-    ccr_hooks = {
-        "UserPromptSubmit": [{
-            "type": "command",
-            "command": f"CCR_AUTO_INIT=1 {_py} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
-        }],
-        "PostToolUse": [{
-            "type": "command",
-            "command": f"CCR_AUTO_INIT=1 {_py} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
-        }],
-        "Stop": [{
-            "type": "command",
-            "command": f"CCR_AUTO_INIT=1 {_py} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
-        }],
-        "PreCompact": [{
-            "type": "command",
-            "command": f"CCR_AUTO_INIT=1 {_py} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
-        }],
-    }
-
-    existing.setdefault("hooks", {})
-    for event, commands in ccr_hooks.items():
-        # Identify CCR hook script for this event
-        try:
-            hook_script = shlex.split(commands[0]["command"])[-1]
-        except (ValueError, IndexError):
-            hook_script = commands[0]["command"].split()[-1]
-        # Remove any pre-existing CCR hook for this event
-        existing_cmds = [
-            c for c in existing["hooks"].get(event, [])
-            if hook_script not in c.get("command", "")
-        ]
-        existing["hooks"][event] = existing_cmds + commands
-
-    with open(settings_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
-    return settings_path
-
-
-def _ensure_kimi_global_mcp(python_exe: str) -> str:
-    """Write CCR MCP server to ~/.kimi/mcp.json (merge with existing)."""
-    kimi_dir = os.path.expanduser("~/.kimi")
-    os.makedirs(kimi_dir, exist_ok=True)
-    mcp_path = os.path.join(kimi_dir, "mcp.json")
-
-    existing: dict = {}
-    if os.path.isfile(mcp_path):
-        try:
-            with open(mcp_path, "r", encoding="utf-8") as f:
-                existing = json.loads(f.read())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    existing.setdefault("mcpServers", {})
-    existing["mcpServers"]["ccr"] = {
-        "command": python_exe,
-        "args": ["-m", "ccr.mcp_server", "--project", "."],
-        "env": {"CCR_OLLAMA_MODEL": os.environ.get("CCR_OLLAMA_MODEL", "")},
-    }
-    if not existing["mcpServers"]["ccr"]["env"].get("CCR_OLLAMA_MODEL"):
-        del existing["mcpServers"]["ccr"]["env"]
-
-    with open(mcp_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2)
-        f.write("\n")
-    return mcp_path
-
-
-def _ensure_kimi_global_hooks(python_exe: str, hooks_dir: str) -> str:
-    """Write CCR hooks to ~/.kimi/config.toml (merge with existing non-CCR hooks)."""
-    kimi_dir = os.path.expanduser("~/.kimi")
-    os.makedirs(kimi_dir, exist_ok=True)
-    config_path = os.path.join(kimi_dir, "config.toml")
-
-    content = ""
-    if os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-    # Remove existing CCR hooks
-    content = re.sub(r"^hooks\s*=\s*\[\]\s*\n?", "", content, flags=re.MULTILINE)
-    hook_blocks = []
-    rest = content
-    while True:
-        match = re.search(r"\[\[hooks\]\]\n", rest)
-        if not match:
-            break
-        start = match.start()
-        next_match = re.search(r"\[\[hooks\]\]\n", rest[start + 1 :])
-        if next_match:
-            end = start + 1 + next_match.start()
-            block = rest[start:end]
-            if "ccr" not in block.lower():
-                hook_blocks.append(block)
-            rest = rest[:start] + rest[end:]
+    names = [n.strip() for n in agents_flag.split(",") if n.strip()]
+    resolved = []
+    for name in names:
+        adapter = get_adapter(name)
+        if adapter:
+            resolved.append(adapter)
         else:
-            block = rest[start:]
-            if "ccr" not in block.lower():
-                hook_blocks.append(block)
-            rest = rest[:start]
-            break
-
-    ccr_hooks_toml = f"""
-[[hooks]]
-event = "UserPromptSubmit"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_session_start.py'))}"
-timeout = 30
-
-[[hooks]]
-event = "PostToolUse"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_tool_use.py'))}"
-timeout = 30
-
-[[hooks]]
-event = "PreCompact"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_compact.py'))}"
-timeout = 30
-
-[[hooks]]
-event = "Stop"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_stop.py'))}"
-timeout = 60
-"""
-
-    new_content = rest.rstrip() + "\n" + ccr_hooks_toml.lstrip("\n")
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    return config_path
+            known = ", ".join(list_adapter_names())
+            click.echo(f"[WARN] Unknown agent '{name}'. Known agents: {known}", err=True)
+    return resolved
 
 
-def _create_global_helpers(python_exe: str, hooks_dir: str, ccr_pkg: str) -> str:
+def _create_global_helpers(python_exe: str, hooks_dir: str, ccr_pkg: str, adapters: list[BaseAgentAdapter]) -> str:
     """Create ~/.ccr/bin/ helper scripts. Returns the bin directory path."""
     bin_dir = os.path.expanduser("~/.ccr/bin")
     os.makedirs(bin_dir, exist_ok=True)
@@ -206,33 +64,45 @@ def _create_global_helpers(python_exe: str, hooks_dir: str, ccr_pkg: str) -> str
     # ccr-global — runs ccr CLI from the dev venv
     ccr_global = os.path.join(bin_dir, "ccr-global")
     with open(ccr_global, "w", encoding="utf-8") as f:
-        f.write(f"#!/bin/bash\n# Global CCR CLI wrapper\nexec {shlex.quote(python_exe)} -m ccr.cli \"$@\"\n")
+        f.write(f"#!/bin/bash\n# Global CCR CLI wrapper\nexec {__import__('shlex').quote(python_exe)} -m ccr.cli \"$@\"\n")
     os.chmod(ccr_global, 0o755)
 
-    # claude-ccr — auto-inits .ccr/ then launches claude
-    claude_ccr = os.path.join(bin_dir, "claude-ccr")
-    with open(claude_ccr, "w", encoding="utf-8") as f:
-        f.write(
-            f"#!/bin/bash\n"
-            f"set -e\n"
-            f'PROJECT_ROOT="$(pwd)"\n'
-            f"if [ ! -d \"$PROJECT_ROOT/.ccr\" ]; then\n"
-            f'  echo "[CCR] Initializing memory in $PROJECT_ROOT..."\n'
-            f'  CCR_PROJECT_ROOT="$PROJECT_ROOT" {shlex.quote(python_exe)} -m ccr.cli init "$PROJECT_ROOT" 2>/dev/null || true\n'
-            f"fi\n"
-            f'exec claude "$@"\n'
-        )
-    os.chmod(claude_ccr, 0o755)
+    # Per-agent wrapper scripts
+    for adapter in adapters:
+        if adapter.name == "claude-code":
+            _write_claude_ccr(bin_dir, python_exe, ccr_pkg)
+        elif adapter.name == "kimi":
+            _write_kimi_ccr(bin_dir, python_exe, ccr_pkg)
 
-    # kimi-ccr — auto-inits .ccr/ then launches kimi with merged MCP config
-    kimi_ccr = os.path.join(bin_dir, "kimi-ccr")
-    ollama_model = os.environ.get("CCR_OLLAMA_MODEL", "")
-    with open(kimi_ccr, "w", encoding="utf-8") as f:
+    return bin_dir
+
+
+def _write_claude_ccr(bin_dir: str, python_exe: str, ccr_pkg: str) -> None:
+    script = os.path.join(bin_dir, "claude-ccr")
+    with open(script, "w", encoding="utf-8") as f:
         f.write(
             "#!/bin/bash\n"
             "set -e\n"
             'PROJECT_ROOT="$(pwd)"\n'
-            "if [ ! -d \"$PROJECT_ROOT/.ccr\" ]; then\n"
+            'if [ ! -d "$PROJECT_ROOT/.ccr" ]; then\n'
+            '  echo "[CCR] Initializing memory in $PROJECT_ROOT..."\n'
+            f'  CCR_PROJECT_ROOT="$PROJECT_ROOT" {__import__("shlex").quote(python_exe)} -m ccr.cli init "$PROJECT_ROOT" 2>/dev/null || true\n'
+            "fi\n"
+            'exec claude "$@"\n'
+        )
+    os.chmod(script, 0o755)
+
+
+def _write_kimi_ccr(bin_dir: str, python_exe: str, ccr_pkg: str) -> None:
+    import shlex
+
+    script = os.path.join(bin_dir, "kimi-ccr")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/bash\n"
+            "set -e\n"
+            'PROJECT_ROOT="$(pwd)"\n'
+            'if [ ! -d "$PROJECT_ROOT/.ccr" ]; then\n'
             '  echo "[CCR] Initializing memory in $PROJECT_ROOT..."\n'
             f'  CCR_PROJECT_ROOT="$PROJECT_ROOT" {shlex.quote(python_exe)} -m ccr.cli init "$PROJECT_ROOT" 2>/dev/null || true\n'
             "fi\n"
@@ -249,34 +119,22 @@ def _create_global_helpers(python_exe: str, hooks_dir: str, ccr_pkg: str) -> str
             "existing['mcpServers']['ccr'] = {\n"
             f"    'command': '{python_exe}',\n"
             "    'args': ['-m', 'ccr.mcp_server', '--project', '$PROJECT_ROOT'],\n"
-        )
-        if ollama_model:
-            f.write(
-                f"    'env': {{'CCR_OLLAMA_MODEL': '{ollama_model}'}}\n"
-            )
-        else:
-            f.write("    'env': {}\n")
-        f.write(
             "}\n"
-            "if not existing['mcpServers']['ccr'].get('env', {}).get('CCR_OLLAMA_MODEL'):\n"
-            "    existing['mcpServers']['ccr'].pop('env', None)\n"
             "print(json.dumps(existing))\n"
             '" "$EXISTING")\n'
             'exec kimi --mcp-config "$MERGED" "$@"\n'
         )
-    os.chmod(kimi_ccr, 0o755)
-
-    return bin_dir
+    os.chmod(script, 0o755)
 
 
 def _update_shell_aliases() -> list[str]:
     """Add CCR aliases to shell profiles. Returns list of modified files."""
     alias_block = (
-        '\n# CCR global tools (auto-init memory + launch Claude Code / Kimi)\n'
+        '\n# CCR global tools (auto-init memory + launch AI agents)\n'
         'export PATH="$HOME/.ccr/bin:$PATH"\n'
         "alias ccr='ccr-global'\n"
         "alias cclaude='claude-ccr'\n"
-        "alias kimi-ccr='kimi-ccr'\n"
+        "alias ckimi='kimi-ccr'\n"
     )
     modified: list[str] = []
     for rc_file in (os.path.expanduser("~/.zshrc"), os.path.expanduser("~/.bashrc")):
@@ -293,54 +151,70 @@ def _update_shell_aliases() -> list[str]:
 
 @click.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def install_global(yes: bool) -> None:
-    """Install CCR globally for Claude Code and Kimi Code CLI.
+@click.option(
+    "--agents",
+    default="claude-code,kimi",
+    show_default=True,
+    help="Comma-separated agent names, or 'auto' (detect installed), or 'all'",
+)
+def install_global(yes: bool, agents: str) -> None:
+    """Install CCR globally for AI agents.
 
     Sets up global MCP servers and hooks so CCR works automatically
-    in any directory you launch claude or kimi from. Memory is stored
+    in any directory you launch your agent from. Memory is stored
     per-project in ./.ccr/ and auto-initialized on first use.
+
+    \b
+    Examples:
+        ccr install-global                    # Claude Code + Kimi (default)
+        ccr install-global --agents auto      # Auto-detect installed agents
+        ccr install-global --agents all       # All supported agents
+        ccr install-global --agents ollama    # Ollama only
     """
     ccr_pkg, python_exe, hooks_dir = _get_ccr_paths()
 
-    click.echo("=== CCR Global Installation ===\n")
-    click.echo("This will configure CCR to work across ALL projects:")
-    click.echo("  - Claude Code: ~/.claude/.mcp.json + ~/.claude/settings.json")
-    click.echo("  - Kimi Code CLI: ~/.kimi/mcp.json + ~/.kimi/config.toml")
-    click.echo("  - Helper scripts: ~/.ccr/bin/")
-    click.echo("  - Shell aliases: ~/.zshrc + ~/.bashrc")
-    click.echo("")
-    click.echo("Memory will be auto-created in ./.ccr/ on first use.")
-    click.echo("")
+    selected = _resolve_agents(agents)
+    if not selected:
+        click.echo("No agents selected or found. Run 'ccr agents list' to see supported agents.", err=True)
+        return
+
+    names = ", ".join(a.display_name for a in selected)
+    click.echo(f"=== CCR Global Installation ===\n")
+    click.echo(f"Target agents: {names}")
+    click.echo("Memory will be auto-created in ./.ccr/ on first use.\n")
 
     if not yes:
         click.confirm("Proceed?", abort=True)
 
-    # 1. Claude Code global
-    try:
-        mcp_path = _ensure_claude_global_mcp(python_exe)
-        settings_path = _ensure_claude_global_hooks(python_exe, hooks_dir)
-        click.echo(f"  [OK] Claude Code global MCP: {mcp_path}")
-        click.echo(f"  [OK] Claude Code global hooks: {settings_path}")
-    except Exception as exc:
-        click.echo(f"  [!!] Claude Code setup failed: {exc}", err=True)
+    # Run adapter installs
+    all_created: list[str] = []
+    all_modified: list[str] = []
+    failures: list[str] = []
 
-    # 2. Kimi global
-    try:
-        mcp_path = _ensure_kimi_global_mcp(python_exe)
-        config_path = _ensure_kimi_global_hooks(python_exe, hooks_dir)
-        click.echo(f"  [OK] Kimi global MCP: {mcp_path}")
-        click.echo(f"  [OK] Kimi global hooks: {config_path}")
-    except Exception as exc:
-        click.echo(f"  [!!] Kimi setup failed: {exc}", err=True)
+    for adapter in selected:
+        click.echo(f"\n  → Setting up {adapter.display_name}...")
+        try:
+            result = adapter.install(python_exe, hooks_dir, ccr_pkg)
+            if result.success:
+                for f in result.files_created:
+                    click.echo(f"    [OK] Created: {f}")
+                for f in result.files_modified:
+                    click.echo(f"    [OK] Updated: {f}")
+                all_created.extend(result.files_created)
+                all_modified.extend(result.files_modified)
+            else:
+                failures.append(f"{adapter.display_name}: {result.message}")
+        except Exception as exc:
+            failures.append(f"{adapter.display_name}: {exc}")
 
-    # 3. Helper scripts
+    # Helper scripts
     try:
-        bin_dir = _create_global_helpers(python_exe, hooks_dir, ccr_pkg)
-        click.echo(f"  [OK] Helper scripts: {bin_dir}")
+        bin_dir = _create_global_helpers(python_exe, hooks_dir, ccr_pkg, selected)
+        click.echo(f"\n  [OK] Helper scripts: {bin_dir}")
     except Exception as exc:
-        click.echo(f"  [!!] Helper scripts failed: {exc}", err=True)
+        failures.append(f"Helper scripts: {exc}")
 
-    # 4. Shell aliases
+    # Shell aliases
     modified = _update_shell_aliases()
     if modified:
         for rc in modified:
@@ -349,145 +223,69 @@ def install_global(yes: bool) -> None:
     else:
         click.echo("  [OK] Aliases already present in shell profiles")
 
+    # Summary
+    click.echo("\n=== Summary ===")
+    if all_created:
+        click.echo(f"  Created: {len(all_created)} file(s)")
+    if all_modified:
+        click.echo(f"  Modified: {len(all_modified)} file(s)")
+    if failures:
+        click.echo(f"  Failures: {len(failures)}")
+        for f in failures:
+            click.echo(f"    [!!] {f}")
+
     click.echo("\n=== Next steps ===")
     click.echo("  Open a NEW terminal, then:")
-    click.echo("    cd ~/any-project && claude     # Claude Code with auto-memory")
-    click.echo("    cd ~/any-project && kimi       # Kimi with auto-memory")
-    click.echo("")
-    click.echo("  Or use wrappers before reloading shell:")
-    click.echo("    ~/.ccr/bin/claude-ccr")
-    click.echo("    ~/.ccr/bin/kimi-ccr")
+    for adapter in selected:
+        if adapter.name == "claude-code":
+            click.echo("    cd ~/any-project && claude     # Claude Code with auto-memory")
+        elif adapter.name == "kimi":
+            click.echo("    cd ~/any-project && kimi       # Kimi with auto-memory")
+        else:
+            click.echo(f"    cd ~/any-project && <{adapter.name}>   # {adapter.display_name}")
 
 
 @click.command()
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def uninstall_global(yes: bool) -> None:
+@click.option(
+    "--agents",
+    default="claude-code,kimi",
+    show_default=True,
+    help="Comma-separated agent names, or 'auto' (detect installed), or 'all'",
+)
+def uninstall_global(yes: bool, agents: str) -> None:
     """Remove global CCR configuration. Per-project .ccr/ memory is preserved."""
-    import json as _json
-
-    paths_to_clean = []
-
-    # Claude
-    claude_mcp = os.path.expanduser("~/.claude/.mcp.json")
-    claude_settings = os.path.expanduser("~/.claude/settings.json")
-    if os.path.isfile(claude_mcp):
-        paths_to_clean.append(("Claude MCP", claude_mcp))
-    if os.path.isfile(claude_settings):
-        paths_to_clean.append(("Claude hooks", claude_settings))
-
-    # Kimi
-    kimi_mcp = os.path.expanduser("~/.kimi/mcp.json")
-    kimi_config = os.path.expanduser("~/.kimi/config.toml")
-    if os.path.isfile(kimi_mcp):
-        paths_to_clean.append(("Kimi MCP", kimi_mcp))
-    if os.path.isfile(kimi_config):
-        paths_to_clean.append(("Kimi hooks", kimi_config))
-
-    # Helpers
-    bin_dir = os.path.expanduser("~/.ccr/bin")
-    if os.path.isdir(bin_dir):
-        paths_to_clean.append(("Helper scripts", bin_dir))
-
-    if not paths_to_clean:
-        click.echo("CCR is not installed globally — nothing to remove.")
+    selected = _resolve_agents(agents)
+    if not selected:
+        click.echo("No agents selected. Run 'ccr agents list' to see supported agents.", err=True)
         return
 
-    click.echo("Will remove global CCR configuration:")
-    for label, path in paths_to_clean:
-        click.echo(f"  {label}: {path}")
+    names = ", ".join(a.display_name for a in selected)
+    click.echo(f"Will remove global CCR configuration for: {names}")
     click.echo("  Per-project .ccr/ memory will NOT be touched.")
 
     if not yes:
         click.confirm("Proceed?", abort=True)
 
-    # Claude MCP
-    if os.path.isfile(claude_mcp):
+    failures: list[str] = []
+    for adapter in selected:
+        click.echo(f"\n  → Removing {adapter.display_name}...")
         try:
-            with open(claude_mcp, "r", encoding="utf-8") as f:
-                d = _json.loads(f.read())
-            d.get("mcpServers", {}).pop("ccr", None)
-            with open(claude_mcp, "w", encoding="utf-8") as f:
-                _json.dump(d, f, indent=2)
-                f.write("\n")
-            click.echo(f"  ✓ Removed CCR from {claude_mcp}")
+            result = adapter.uninstall()
+            if result.success:
+                for f in result.files_removed:
+                    click.echo(f"    [OK] Removed: {f}")
+                for f in result.files_modified:
+                    click.echo(f"    [OK] Updated: {f}")
+            else:
+                failures.append(f"{adapter.display_name}: {result.message}")
         except Exception as exc:
-            click.echo(f"  ⚠️  Failed to update {claude_mcp}: {exc}", err=True)
+            failures.append(f"{adapter.display_name}: {exc}")
 
-    # Claude settings
-    if os.path.isfile(claude_settings):
-        try:
-            with open(claude_settings, "r", encoding="utf-8") as f:
-                d = _json.loads(f.read())
-            for event in list(d.get("hooks", {}).keys()):
-                d["hooks"][event] = [
-                    c for c in d["hooks"][event]
-                    if "ccr" not in c.get("command", "").lower()
-                ]
-                if not d["hooks"][event]:
-                    del d["hooks"][event]
-            if not d.get("hooks"):
-                d.pop("hooks", None)
-            with open(claude_settings, "w", encoding="utf-8") as f:
-                _json.dump(d, f, indent=2)
-                f.write("\n")
-            click.echo(f"  ✓ Removed CCR hooks from {claude_settings}")
-        except Exception as exc:
-            click.echo(f"  ⚠️  Failed to update {claude_settings}: {exc}", err=True)
+    if failures:
+        click.echo(f"\n  {len(failures)} failure(s):")
+        for f in failures:
+            click.echo(f"    [!!] {f}")
 
-    # Kimi MCP
-    if os.path.isfile(kimi_mcp):
-        try:
-            with open(kimi_mcp, "r", encoding="utf-8") as f:
-                d = _json.loads(f.read())
-            d.get("mcpServers", {}).pop("ccr", None)
-            with open(kimi_mcp, "w", encoding="utf-8") as f:
-                _json.dump(d, f, indent=2)
-                f.write("\n")
-            click.echo(f"  ✓ Removed CCR from {kimi_mcp}")
-        except Exception as exc:
-            click.echo(f"  ⚠️  Failed to update {kimi_mcp}: {exc}", err=True)
-
-    # Kimi config
-    if os.path.isfile(kimi_config):
-        try:
-            with open(kimi_config, "r", encoding="utf-8") as f:
-                content = f.read()
-            content = re.sub(r"^hooks\s*=\s*\[\]\s*\n?", "", content, flags=re.MULTILINE)
-            rest = content
-            cleaned = ""
-            while True:
-                match = re.search(r"\[\[hooks\]\]\n", rest)
-                if not match:
-                    cleaned += rest
-                    break
-                start = match.start()
-                next_match = re.search(r"\[\[hooks\]\]\n", rest[start + 1 :])
-                if next_match:
-                    end = start + 1 + next_match.start()
-                    block = rest[start:end]
-                    if "ccr" not in block.lower():
-                        cleaned += block
-                    rest = rest[end:]
-                else:
-                    block = rest[start:]
-                    if "ccr" not in block.lower():
-                        cleaned += block
-                    rest = rest[:start]
-                    break
-            with open(kimi_config, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-            click.echo(f"  ✓ Removed CCR hooks from {kimi_config}")
-        except Exception as exc:
-            click.echo(f"  ⚠️  Failed to update {kimi_config}: {exc}", err=True)
-
-    # Helpers
-    if os.path.isdir(bin_dir):
-        import shutil as _shutil
-        try:
-            _shutil.rmtree(bin_dir)
-            click.echo(f"  ✓ Removed {bin_dir}")
-        except Exception as exc:
-            click.echo(f"  ⚠️  Failed to remove {bin_dir}: {exc}", err=True)
-
-    click.echo("\nCCR globally uninstalled. Your .ccr/ memory is intact.")
+    click.echo("\nCCR globally uninstalled for selected agents. Your .ccr/ memory is intact.")
     click.echo("To reinstall: ccr install-global")

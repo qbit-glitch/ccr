@@ -70,7 +70,7 @@ mcp = FastMCP(
     instructions=(
         "CCR gives you persistent project memory (GCC), self-evolving strategy "
         "playbooks (ACE), a sandboxed Python REPL (RLM), and repo indexing. "
-        "Works with both Claude Code and Kimi Code CLI. "
+        "Works with any AI agent that supports MCP (Claude Code, Kimi, Continue.dev, etc.). "
         "Use gcc_* tools for memory, ace_* for playbook management, rlm_* for "
         "sandboxed code execution, and index_* for repo search. "
         "Call gcc_projects() to see other projects with CCR memory."

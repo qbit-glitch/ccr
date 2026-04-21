@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Claude Code hook: fires on PreCompact (context approaching limit).
+"""Hook: fires before context compaction (PreCompact).
 
-Reminds Claude Code to commit progress before context is compacted,
+Reminds the agent to commit progress before context is compacted,
 preventing loss of reasoning state.
+
+Provider-agnostic: reads CanonicalEvent payload from stdin for formatting.
 """
 
 import os
@@ -44,10 +46,23 @@ def main():
         action="Triggered pre-compact reminder",
     )
 
-    print(
-        "REMINDER: Context is about to be compacted. "
+    from ccr.hooks.canonical import HookPayload, format_reminder, ContextFormat
+
+    payload = HookPayload.from_stdin()
+    fmt = payload.format
+
+    mem.log_ota(
+        tool_name="pre-compact",
+        observation="Context approaching compaction threshold",
+        thought="Should commit progress before compaction",
+        action="Triggered pre-compact reminder",
+    )
+
+    reminder = (
+        "Context is about to be compacted. "
         "Use gcc_commit to save your progress before state is lost."
     )
+    print(format_reminder(reminder, fmt=fmt))
 
 
 if __name__ == "__main__":

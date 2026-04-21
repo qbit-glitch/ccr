@@ -1,9 +1,9 @@
-# CCR — Claude Context Reducer
+# CCR — Context Compression & Retrieval
 
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
-> **With CCR:** Claude already knows — months of decisions, experiments, and code reasoning recalled instantly.
+> **With CCR:** Your AI agent already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-CCR gives Claude Code and Kimi Code CLI persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Pro ($20/mo)**, **Claude Max ($100/mo)**, or an Anthropic API key. Also supports **Kimi Code CLI** (free tier). **macOS/Linux only** (Windows support is not yet implemented).
+CCR gives AI agents persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Code**, **Kimi Code CLI**, **Continue.dev**, **Ollama**, **OpenAI API**, and any MCP-capable agent. **macOS/Linux only** (Windows support is not yet implemented).
 
 > **New to CCR?** See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
@@ -32,7 +32,7 @@ That's it. Your agent will automatically load project memory on every session st
 
 ### What CCR Does
 
-CCR is an MCP server that gives Claude Code and Kimi Code CLI three capabilities they don't have natively:
+CCR is an MCP server that gives AI agents three capabilities they don't have natively:
 
 1. **Persistent Memory (GCC)** — Git-style version-controlled memory that survives across sessions. Branch, merge, and search your project's decision history.
 2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
@@ -40,7 +40,7 @@ CCR is an MCP server that gives Claude Code and Kimi Code CLI three capabilities
 
 All tools run as pure logic with zero LLM calls. The AI agent itself provides the reasoning.
 
-**Works with both Claude Code and Kimi Code CLI** — use whichever agent you prefer, or switch between them. CCR memory is shared.
+**Works with any AI agent** — use Claude Code, Kimi, Continue.dev, Ollama, or OpenAI. CCR memory is shared across all of them.
 
 ### For Researchers and Students
 
@@ -69,15 +69,21 @@ See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blo
 Run once to enable CCR across **all** projects:
 
 ```bash
-ccr install-global
+ccr install-global              # Claude Code + Kimi (default)
+ccr install-global --agents auto # Auto-detect all installed agents
 ```
 
 This configures:
 - **Claude Code** global MCP + hooks (`~/.claude/.mcp.json`, `~/.claude/settings.json`)
 - **Kimi Code CLI** global MCP + hooks (`~/.kimi/mcp.json`, `~/.kimi/config.toml`)
+- **Continue.dev** MCP config (`~/.continue/config.json`)
+- **Ollama** wrapper script (`~/.ccr/bin/ollama-ccr`)
+- **OpenAI API** SDK wrapper + CLI prefix
 - Helper scripts in `~/.ccr/bin/` and shell aliases
 
-After installation, simply run `claude` or `kimi` from any project directory. `.ccr/` is auto-created on first use.
+After installation, simply run your agent from any project directory. `.ccr/` is auto-created on first use.
+
+See [docs/AGENTS.md](docs/AGENTS.md) for per-agent setup details.
 
 ### Per-Project Setup (`ccr install`)
 
@@ -85,7 +91,7 @@ If you prefer per-project configuration (e.g., for team settings in version cont
 
 ```bash
 cd /your/project
-ccr install
+ccr install --agent claude-code
 ```
 
 ### Manual Setup
@@ -145,7 +151,7 @@ Every Q&A turn (user message + Claude's response) is persisted to `.ccr/sessions
 ## Architecture
 
 ```
-Claude Code ──stdio──> CCR MCP Server
+AI Agent ──stdio──> CCR MCP Server
                          ├── GCC Memory    (.ccr/commits, branches, patterns)
                          ├── ACE Playbook  (.ccr/playbook.txt, failure_lessons.json)
                          ├── RLM Sandbox   (isolated Python subprocess)
