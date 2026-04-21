@@ -619,8 +619,11 @@ def status(project: str) -> None:
 # Re-exported here so `from ccr.cli import doctor/stats` continues to work
 from ccr.cli_doctor import doctor  # noqa: E402
 from ccr.cli_stats import stats  # noqa: E402
+from ccr.cli_global import install_global, uninstall_global  # noqa: E402
 cli.add_command(doctor)
 cli.add_command(stats)
+cli.add_command(install_global)
+cli.add_command(uninstall_global)
 
 
 @cli.command()

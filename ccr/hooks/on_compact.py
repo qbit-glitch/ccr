@@ -32,7 +32,10 @@ def main():
 
     mem = MemoryManager(project_root, CCRConfig())
     if not os.path.isdir(mem.ccr_root):
-        return
+        if os.environ.get("CCR_AUTO_INIT", "").lower() in ("1", "true", "yes"):
+            mem.ensure_structure()
+        else:
+            return
 
     mem.log_ota(
         tool_name="pre-compact",

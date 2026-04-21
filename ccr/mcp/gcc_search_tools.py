@@ -6,6 +6,7 @@ Covers: gcc_search, gcc_experiments, gcc_patterns, gcc_links,
 
 from __future__ import annotations
 
+import os
 import re
 
 from mcp.types import ToolAnnotations
@@ -219,6 +220,7 @@ def gcc_experiments(
     date_range: list[str] | None = None,
     top_n: str | None = None,
     compare: list[str] | None = None,
+    project: str | None = None,
 ) -> GccExperimentsResult:
     """Query and filter experiment records stored in commits via gcc_commit(experiment={...}).
 
@@ -237,6 +239,8 @@ def gcc_experiments(
             Example: "val_loss:asc" (best validation loss first)
         compare: Two commit IDs for side-by-side comparison table.
             Example: ["C041", "C053"]
+        project: Absolute or relative path to another project. If None, uses
+            the current project.
 
     Returns:
         count: Number of matching experiments.
@@ -257,7 +261,7 @@ def gcc_experiments(
         gcc_experiments(hypothesis_contains="LoRA", date_range=["2026-03-01", "2026-04-05"])
     """
     with _srv._state_lock:
-        mem = _srv._ensure_memory()
+        mem = _srv._get_project_memory(project)
 
     result = mem.get_experiments(
         experiment_id=experiment_id,
@@ -343,6 +347,7 @@ def gcc_discussions(
     search: str | None = None,
     topic: str | None = None,
     date_range: list[str] | None = None,
+    project: str | None = None,
 ) -> GccDiscussionsResult:
     """Query the persistent discussion log.
 
@@ -354,6 +359,8 @@ def gcc_discussions(
         search: Full-text substring match across all fields (case-insensitive).
         topic: Exact topic match (case-insensitive).
         date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
+        project: Absolute or relative path to another project. If None, uses
+            the current project.
 
     Returns:
         count: Number of matching discussions.
@@ -365,7 +372,7 @@ def gcc_discussions(
         gcc_discussions(date_range=["2026-03-01", "2026-04-05"])
     """
     with _srv._state_lock:
-        mem = _srv._ensure_memory()
+        mem = _srv._get_project_memory(project)
 
     result = mem.get_discussions(
         search=search,
@@ -380,57 +387,25 @@ def gcc_discussions(
     )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def gcc_search(
+def _search_single_project(
     query: str,
-    sources: list[str] | None = None,
-    limit: int = 10,
-    date_range: list[str] | None = None,
-) -> GccSearchResult:
-    """Unified search across all CCR memory sources.
-
-    Searches commits, discussions, experiments, and session history in one call.
-    Returns aggregated results grouped by source. Use this instead of calling
-    gcc_context(level=5), gcc_discussions, gcc_experiments, and session_search
-    separately.
-
-    Args:
-        query: Text to search for. Case-insensitive substring match.
-        sources: Which sources to search. Default: all available.
-            Options: "commits", "discussions", "experiments", "sessions".
-        limit: Max results per source (default 10).
-        date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
-            Applied to all sources that support date filtering.
-
-    Returns:
-        total: Total number of matches across all sources.
-        sources_searched: List of sources that were queried.
-        message: Aggregated markdown results grouped by source.
-
-    Example:
-        gcc_search("LoRA")
-        gcc_search("val_loss", sources=["commits", "experiments"])
-        gcc_search("dataset", date_range=["2026-03-01", "2026-04-05"])
-    """
-    with _srv._state_lock:
-        mem = _srv._ensure_memory()
-
-    all_sources = ["commits", "discussions", "experiments", "sessions"]
-    if sources:
-        active_sources = [s.lower() for s in sources if s.lower() in all_sources]
-    else:
-        active_sources = all_sources
-
-    sections = []
+    mem,
+    active_sources: list[str],
+    limit: int,
+    date_range: list[str] | None,
+    project_name: str = "",
+) -> tuple[list[str], int, list[str]]:
+    """Search one project's memory. Returns (sections, total, searched)."""
+    sections: list[str] = []
     total = 0
-    searched = []
+    searched: list[str] = []
+    prefix = f"**[{project_name}]** " if project_name else ""
 
     # --- Commits ---
     if "commits" in active_sources:
         searched.append("commits")
         try:
             branch = mem.get_active_branch()
-            # Phase 2.5: FTS5-aware snippet path (SQLite backend with FTS5)
             snippet_hits: list[dict] = []
             if getattr(mem._storage, "fts_available", False):
                 try:
@@ -453,17 +428,15 @@ def gcc_search(
                     rank = h.get("rank")
                     rank_str = f"{rank:.3f}" if isinstance(rank, float) else str(rank)
                     lines.append(
-                        f"### [{cid}] {title}\n"
-                        f"- **Snippet**: {snip}\n"
-                        f"- **Rank**: {rank_str}"
+                        f"{prefix}### [{cid}] {title}\n"
+                        f"{prefix}- **Snippet**: {snip}\n"
+                        f"{prefix}- **Rank**: {rank_str}"
                     )
                 body = "\n\n".join(lines)
                 sections.append(f"## Commits ({count} match{'es' if count != 1 else ''})\n\n{body}")
             else:
-                # Fall through to existing 3-phase keyword/semantic/BM25 chain
                 commits_text = mem._search_commits(branch, query)
                 if commits_text and commits_text.strip():
-                    # Count results (## [C###] headers)
                     count = len(re.findall(r"## \[C\d{3,}\]", commits_text))
                     if count:
                         total += count
@@ -488,7 +461,6 @@ def gcc_search(
         try:
             result = mem.get_experiments(date_range=date_range)
             q_lower = query.lower()
-            # Match on hypothesis OR any field (metric keys, values, etc.)
             all_exp_records = [
                 r for r in result["records"]
                 if q_lower in str(r.get("hypothesis", "")).lower()
@@ -524,8 +496,103 @@ def gcc_search(
         except Exception as _exc:
             _log_search_error("sessions", query, _exc)
 
+    return sections, total, searched
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_search(
+    query: str,
+    sources: list[str] | None = None,
+    limit: int = 10,
+    date_range: list[str] | None = None,
+    project: str | None = None,
+) -> GccSearchResult:
+    """Unified search across all CCR memory sources.
+
+    Searches commits, discussions, experiments, and session history in one call.
+    Returns aggregated results grouped by source. Use this instead of calling
+    gcc_context(level=5), gcc_discussions, gcc_experiments, and session_search
+    separately.
+
+    Args:
+        query: Text to search for. Case-insensitive substring match.
+        sources: Which sources to search. Default: all available.
+            Options: "commits", "discussions", "experiments", "sessions".
+        limit: Max results per source (default 10).
+        date_range: [start_date, end_date] as "YYYY-MM-DD" strings.
+            Applied to all sources that support date filtering.
+        project: Absolute or relative path to another project. Special values:
+            - None: search current project
+            - "all": search ALL registered projects (global memory search)
+
+    Returns:
+        total: Total number of matches across all sources.
+        sources_searched: List of sources that were queried.
+        message: Aggregated markdown results grouped by source.
+
+    Example:
+        gcc_search("LoRA")
+        gcc_search("val_loss", sources=["commits", "experiments"])
+        gcc_search("dataset", date_range=["2026-03-01", "2026-04-05"])
+        gcc_search("auth", project="all")  # search every project
+    """
+    all_sources = ["commits", "discussions", "experiments", "sessions"]
+    if sources:
+        active_sources = [s.lower() for s in sources if s.lower() in all_sources]
+    else:
+        active_sources = all_sources
+
+    sections = []
+    total = 0
+    searched = []
+
+    # Multi-project search mode
+    if project == "all":
+        import json as _json
+        registry_path = os.path.expanduser("~/.ccr/projects.json")
+        projects: list[dict] = []
+        if os.path.isfile(registry_path):
+            try:
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    projects = _json.loads(f.read())
+            except (_json.JSONDecodeError, OSError):
+                pass
+
+        if not projects:
+            return GccSearchResult(
+                total=0,
+                sources_searched=[],
+                message="No registered projects found. Run 'ccr init' in a project first.",
+            )
+
+        for p in projects:
+            proj_path = p.get("path", "")
+            proj_name = p.get("name", os.path.basename(proj_path))
+            if not proj_path or not os.path.isdir(os.path.join(proj_path, ".ccr")):
+                continue
+            try:
+                with _srv._state_lock:
+                    mem = _srv._get_project_memory(proj_path)
+                proj_sections, proj_total, proj_searched = _search_single_project(
+                    query, mem, active_sources, limit, date_range, project_name=proj_name
+                )
+                if proj_sections:
+                    total += proj_total
+                    searched = list(set(searched + proj_searched))
+                    sections.append(f"# 📁 {proj_name}\n\n" + "\n\n".join(proj_sections))
+            except Exception:
+                continue  # Skip projects that fail to load
+
+    else:
+        with _srv._state_lock:
+            mem = _srv._get_project_memory(project)
+        sections, total, searched = _search_single_project(
+            query, mem, active_sources, limit, date_range
+        )
+
     if not sections:
-        message = f"No results for '{query}' in {', '.join(searched)}."
+        scope = "all registered projects" if project == "all" else (project or "current project")
+        message = f"No results for '{query}' in {scope}."
     else:
         message = "\n\n".join(sections)
 

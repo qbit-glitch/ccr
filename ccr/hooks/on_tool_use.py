@@ -53,7 +53,12 @@ def main() -> None:
 
     ccr_root = os.path.join(project_root, ".ccr")
     if not os.path.isdir(ccr_root):
-        return
+        if os.environ.get("CCR_AUTO_INIT", "").lower() in ("1", "true", "yes"):
+            from ccr.core.memory import MemoryManager  # noqa: PLC0415
+            from ccr.core.types import CCRConfig  # noqa: PLC0415
+            MemoryManager(project_root, CCRConfig()).ensure_structure()
+        else:
+            return
 
     # Primary: Claude Code sends PostToolUse hook data via stdin JSON.
     tool_name, input_data = _read_tool_data_from_stdin()

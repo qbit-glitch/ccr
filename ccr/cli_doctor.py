@@ -129,52 +129,68 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     except ImportError:
         notices.append("Vector store not installed (optional) — pip install 'ccr-memory[vector]'")
 
-    # 7. Hooks configured — check project-local first, then global (~/.claude/)
-    settings_path = os.path.join(project, ".claude", "settings.local.json")
-    global_settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json")
-    if not os.path.isfile(settings_path) and os.path.isfile(global_settings_path):
-        settings_path = global_settings_path
-        _from_global = True
-    else:
-        _from_global = False
-    if os.path.isfile(settings_path):
+    # 7a. Claude Code hooks — check project-local AND global (~/.claude/)
+    claude_hooks_found = False
+    local_settings = os.path.join(project, ".claude", "settings.local.json")
+    global_claude_settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+    for settings_path, scope_label in ((local_settings, ""), (global_claude_settings, " (global)")):
+        if not os.path.isfile(settings_path):
+            continue
         try:
             with open(settings_path, encoding="utf-8") as f:
                 settings = json.loads(f.read())
             hooks = settings.get("hooks", {})
-            scope = " (global)" if _from_global else ""
             if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                ok_items.append(f"Auto-commit hooks configured{scope}")
-                ok_items.append("Session logging enabled (Q&A turns saved to sessions.db)")
-            else:
-                issues.append("Hooks not configured — run 'ccr install'")
-                issues.append(
-                    "Session logging disabled — hooks file exists but Stop/UserPromptSubmit not configured\n"
-                    "         Fix: run 'ccr install' to enable automatic session capture"
-                )
-            # Check for duplicate hook commands (from running ccr install twice before fix)
+                ok_items.append(f"Claude Code hooks configured{scope_label}")
+                claude_hooks_found = True
+            # Check for duplicate hook commands
             for event, cmds in hooks.items():
                 commands = [c.get("command", "") for c in cmds if isinstance(c, dict)]
                 if len(commands) != len(set(commands)):
                     issues.append(
                         f"Duplicate hook command in {event} — run: ccr uninstall && ccr install"
                     )
-            # Check for stale hook paths (python exe or script missing after pip upgrade)
+            # Check for stale hook paths
             stale_items = _check_stale_hook_paths(hooks)
             if stale_items:
                 for stale_msg in stale_items:
-                    issues.append(stale_msg)  # Stale paths are blockers, not notices
+                    issues.append(stale_msg)
             else:
-                # Only emit OK when hooks are actually configured
                 if "Stop" in hooks or "UserPromptSubmit" in hooks:
-                    ok_items.append("Hook paths valid (python + 4 scripts found)")
+                    ok_items.append("Claude Code hook paths valid")
         except (json.JSONDecodeError, OSError):
-            issues.append("settings.local.json exists but unreadable")
+            issues.append(f"Claude settings file exists but unreadable: {settings_path}")
+
+    if not claude_hooks_found:
+        notices.append("No Claude Code hooks found — run 'ccr install' (per-project) or 'ccr install-global'")
+
+    # 7b. Kimi Code CLI hooks — check global ~/.kimi/config.toml
+    kimi_hooks_found = False
+    kimi_config = os.path.expanduser("~/.kimi/config.toml")
+    if os.path.isfile(kimi_config):
+        try:
+            with open(kimi_config, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Count CCR hook blocks
+            ccr_hook_count = len(re.findall(r"\[\[hooks\]\]", content)) if "ccr" in content.lower() else 0
+            if ccr_hook_count > 0 and "ccr" in content.lower():
+                ok_items.append("Kimi Code CLI hooks configured (global)")
+                kimi_hooks_found = True
+            elif "[[hooks]]" in content:
+                notices.append("Kimi has hooks but no CCR hooks — run 'ccr install-global'")
+        except (OSError, UnicodeDecodeError):
+            notices.append("Kimi config exists but unreadable")
     else:
-        issues.append("No hooks configured — run 'ccr install' for auto-commit")
+        notices.append("No Kimi Code CLI config found — install Kimi CLI first")
+
+    # Session logging summary
+    if claude_hooks_found or kimi_hooks_found:
+        ok_items.append("Session logging enabled (Q&A turns saved to sessions.db)")
+    else:
         issues.append(
-            "Session logging disabled — no hooks file found (.claude/settings.local.json)\n"
-            "         Fix: run 'ccr install' to enable automatic session capture"
+            "No auto-commit hooks found — run 'ccr install-global' to enable automatic memory\n"
+            "         across all projects for both Claude Code and Kimi Code CLI"
         )
 
     # 8. Hook error log

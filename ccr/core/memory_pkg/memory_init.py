@@ -151,7 +151,49 @@ class InitMixin:
         # Load A-MEM evolved summaries overlay
         self._load_evolved_summaries()
 
+        # Register in global project registry (global setup awareness)
+        try:
+            self._register_in_global_registry()
+        except Exception:
+            pass  # Non-critical — never block init
+
         return created
+
+    def _register_in_global_registry(self) -> None:
+        """Register this project in ~/.ccr/projects.json for global discovery."""
+        import json
+        from datetime import datetime, timezone
+
+        global_ccr = os.path.expanduser("~/.ccr")
+        os.makedirs(global_ccr, exist_ok=True)
+        registry_path = os.path.join(global_ccr, "projects.json")
+
+        projects_list: list[dict] = []
+        if os.path.isfile(registry_path):
+            try:
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    projects_list = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                projects_list = []
+
+        abs_path = self.project_root
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        for p in projects_list:
+            if p.get("path") == abs_path:
+                p["last_used"] = now
+                break
+        else:
+            projects_list.append({
+                "path": abs_path,
+                "name": os.path.basename(abs_path),
+                "last_used": now,
+                "commit_count": 0,
+            })
+
+        with open(registry_path, "w", encoding="utf-8") as f:
+            json.dump(projects_list, f, indent=2)
+            f.write("\n")
 
     # --- Branch Operations ---
 

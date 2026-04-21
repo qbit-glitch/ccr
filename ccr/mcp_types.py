@@ -61,6 +61,12 @@ class GccStatusResult(TypedDict):
     message: str
 
 
+class GccProjectsResult(TypedDict):
+    project_count: int
+    projects: list[dict]
+    message: str
+
+
 class GccConsolidateResult(TypedDict):
     tier: str
     message: str

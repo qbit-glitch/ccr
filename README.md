@@ -3,7 +3,7 @@
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
 > **With CCR:** Claude already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Pro ($20/mo)**, **Claude Max ($100/mo)**, or an Anthropic API key. **macOS/Linux only** (Windows support is not yet implemented).
+CCR gives Claude Code and Kimi Code CLI persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Pro ($20/mo)**, **Claude Max ($100/mo)**, or an Anthropic API key. Also supports **Kimi Code CLI** (free tier). **macOS/Linux only** (Windows support is not yet implemented).
 
 > **New to CCR?** See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
@@ -15,28 +15,32 @@ CCR gives Claude Code persistent memory, self-evolving strategy playbooks, and a
 # 0. Prerequisites (if not already installed)
 # - Python 3.11+:  python3 --version
 # - Claude Code:   npm install -g @anthropic-ai/claude-code
+# - Kimi CLI:      pip install kimi-cli  (optional, for Kimi support)
 
 # 1. Install
 pip install ccr-memory  # or: pip install -e . (from source)
 
-# 2. Configure hooks for automatic memory management
-ccr install
+# 2. Global setup — works across ALL projects automatically
+ccr install-global
 
-# 3. Open Claude Code from your project directory — CCR handles the rest
-cd /your/project && claude
+# 3. Open your agent from any project directory — CCR handles the rest
+cd /your/project && claude   # Claude Code
+cd /your/project && kimi     # Kimi Code CLI
 ```
 
-That's it. Claude will automatically load your project memory on every session start and auto-commit progress when you finish.
+That's it. Your agent will automatically load project memory on every session start and auto-commit progress when you finish — in **every directory** without per-project setup. Memory is stored per-project in `./.ccr/` and auto-initialized on first use.
 
 ### What CCR Does
 
-CCR is an MCP server that gives Claude Code three capabilities it doesn't have natively:
+CCR is an MCP server that gives Claude Code and Kimi Code CLI three capabilities they don't have natively:
 
 1. **Persistent Memory (GCC)** — Git-style version-controlled memory that survives across sessions. Branch, merge, and search your project's decision history.
 2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
 3. **Sandboxed REPL (RLM)** — An isolated Python environment for iterative analysis, with repo search and structured output.
 
-All tools run as pure logic with zero LLM calls. Claude Code itself provides the reasoning.
+All tools run as pure logic with zero LLM calls. The AI agent itself provides the reasoning.
+
+**Works with both Claude Code and Kimi Code CLI** — use whichever agent you prefer, or switch between them. CCR memory is shared.
 
 ### For Researchers and Students
 
@@ -60,7 +64,31 @@ CCR is designed for long-running research projects where context loss is the mai
 
 See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
 
-### Manual Setup (without `ccr install`)
+### Global Setup (`ccr install-global`) — Recommended
+
+Run once to enable CCR across **all** projects:
+
+```bash
+ccr install-global
+```
+
+This configures:
+- **Claude Code** global MCP + hooks (`~/.claude/.mcp.json`, `~/.claude/settings.json`)
+- **Kimi Code CLI** global MCP + hooks (`~/.kimi/mcp.json`, `~/.kimi/config.toml`)
+- Helper scripts in `~/.ccr/bin/` and shell aliases
+
+After installation, simply run `claude` or `kimi` from any project directory. `.ccr/` is auto-created on first use.
+
+### Per-Project Setup (`ccr install`)
+
+If you prefer per-project configuration (e.g., for team settings in version control):
+
+```bash
+cd /your/project
+ccr install
+```
+
+### Manual Setup
 
 Add to your project's `.mcp.json`:
 
@@ -75,7 +103,7 @@ Add to your project's `.mcp.json`:
 }
 ```
 
-Then in your Claude Code session, call `gcc_context(level=2)` to load memory and `gcc_commit` after completing tasks.
+Then in your session, call `gcc_context(level=2)` to load memory and `gcc_commit` after completing tasks.
 
 ## Features
 
@@ -195,6 +223,7 @@ All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` 
 | Feature | CCR | Mem0 | Letta/MemGPT | Graphiti |
 |---------|-----|------|--------------|---------|
 | Auto-manages memory | Yes (hooks) | Yes | Yes | Yes |
+| Multi-agent (Claude + Kimi) | Yes | No | No | No |
 | Version control (branch/merge) | Yes | No | No | No |
 | Self-evolving strategies | Yes | No | No | No |
 | Sandboxed REPL | Yes | No | No | No |

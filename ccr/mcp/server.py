@@ -70,8 +70,10 @@ mcp = FastMCP(
     instructions=(
         "CCR gives you persistent project memory (GCC), self-evolving strategy "
         "playbooks (ACE), a sandboxed Python REPL (RLM), and repo indexing. "
+        "Works with both Claude Code and Kimi Code CLI. "
         "Use gcc_* tools for memory, ace_* for playbook management, rlm_* for "
-        "sandboxed code execution, and index_* for repo search."
+        "sandboxed code execution, and index_* for repo search. "
+        "Call gcc_projects() to see other projects with CCR memory."
     ),
 )
 
@@ -302,6 +304,13 @@ def health_check() -> str:
     status["sub_model_available"] = _get_sub_client() is not None
     status["playbook_bullets"] = len(_playbook.bullets) if _playbook else 0
 
+    # Global setup detection
+    status["global_setup"] = {}
+    if os.path.isfile(os.path.expanduser("~/.claude/settings.json")):
+        status["global_setup"]["claude"] = True
+    if os.path.isfile(os.path.expanduser("~/.kimi/config.toml")):
+        status["global_setup"]["kimi"] = True
+
     return _json.dumps(status, indent=2)
 
 
@@ -499,6 +508,27 @@ def _ensure_memory() -> MemoryManager:
     if _memory is None:
         raise RuntimeError("MemoryManager failed to initialize")
     return _memory
+
+
+def _get_project_memory(project: str | None = None) -> MemoryManager:
+    """Return a MemoryManager for the given project path, or current project if None.
+
+    For cross-project read-only queries.  Does NOT mutate global server state.
+    When CCR_AUTO_INIT is enabled, creates .ccr/ on first access instead of raising.
+    """
+    if project is None:
+        return _ensure_memory()
+    project = os.path.abspath(os.path.expanduser(project))
+    ccr_dir = os.path.join(project, ".ccr")
+    if not os.path.isdir(ccr_dir):
+        if os.environ.get("CCR_AUTO_INIT", "").lower() in ("1", "true", "yes"):
+            mem = MemoryManager(project, CCRConfig())
+            mem.ensure_structure()
+            return mem
+        raise RuntimeError(
+            f"No CCR memory in {project} — run 'ccr init' there first."
+        )
+    return MemoryManager(project, CCRConfig())
 
 
 def _ensure_playbook() -> Playbook:

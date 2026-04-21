@@ -28,10 +28,45 @@ from ccr.mcp_types import (
     GccContextResult,
     GccLogOtaResult,
     GccPatternsResult,
+    GccProjectsResult,
     GccScratchpadResult,
     GccStatusResult,
     GccTriplesResult,
 )
+
+
+# ---------------------------------------------------------------------------
+# Global registry helpers
+# ---------------------------------------------------------------------------
+
+def _update_global_registry_commit_count(project_root: str) -> None:
+    """Update commit_count for project_root in ~/.ccr/projects.json."""
+    import json
+    from datetime import datetime, timezone
+
+    registry_path = os.path.expanduser("~/.ccr/projects.json")
+    if not os.path.isfile(registry_path):
+        return
+
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            projects_list = json.loads(f.read())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    abs_path = os.path.abspath(project_root)
+    updated = False
+    for p in projects_list:
+        if p.get("path") == abs_path:
+            p["commit_count"] = p.get("commit_count", 0) + 1
+            p["last_used"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            updated = True
+            break
+
+    if updated:
+        with open(registry_path, "w", encoding="utf-8") as f:
+            json.dump(projects_list, f, indent=2)
+            f.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +238,12 @@ def gcc_commit(
             except Exception:
                 pass  # Non-fatal — worst case: on_stop creates a harmless duplicate baseline
 
+            # Update commit count in global registry
+            try:
+                _update_global_registry_commit_count(_srv._project_root)
+            except Exception:
+                pass  # Non-critical
+
         # ACE §3.1-3.3: Generator → Reflector → Curator pipeline (fire-and-forget)
         sub = _srv._get_sub_client()
         if sub is not None and result and not result.startswith("Error"):
@@ -275,6 +316,7 @@ def gcc_context(
     max_tokens: int | None = None,
     result_limit: int = 20,
     time_range_hours: int | None = None,
+    project: str | None = None,
 ) -> GccContextResult:
     """Retrieve project memory at the specified depth.
 
@@ -298,6 +340,8 @@ def gcc_context(
             Use to prevent overly large context at higher levels.
         result_limit: Maximum number of commit blocks to include (default 20).
         time_range_hours: If set, only include commit blocks from the last N hours.
+        project: Absolute or relative path to another project to query. If None, uses
+            the current project. Useful for recalling context from a different codebase.
     """
     from datetime import datetime, timezone, timedelta
 
@@ -310,7 +354,7 @@ def gcc_context(
     if commit_id and level < 5:
         _level_warnings.append(f"commit_id is only active at level=5 (current level={level}); use level=5 for specific commit lookup.")
     with _srv._state_lock:
-        mem = _srv._ensure_memory()
+        mem = _srv._get_project_memory(project)
     result = mem.get_context(
         level=level,
         search_term=search_term,
@@ -409,16 +453,20 @@ def gcc_context(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
-def gcc_status() -> GccStatusResult:
-    """Show current project memory status.
+def gcc_status(project: str | None = None) -> GccStatusResult:
+    """Show project memory status.
 
     Returns the active branch, recent milestones, open branches,
     and metadata summary. Warns if any active branch is more than 30 days old.
+
+    Args:
+        project: Absolute or relative path to another project. If None, uses
+            the current project.
     """
     from datetime import datetime, timezone
 
     with _srv._state_lock:
-        mem = _srv._ensure_memory()
+        mem = _srv._get_project_memory(project)
 
     parts = []
     branch = mem.get_active_branch()
@@ -457,7 +505,70 @@ def gcc_status() -> GccStatusResult:
     except Exception:
         pass  # Stale branch detection is supplementary — never fail status
 
+    # Global setup detection
+    try:
+        global_parts = []
+        claude_global_mcp = os.path.expanduser("~/.claude/.mcp.json")
+        claude_global_hooks = os.path.expanduser("~/.claude/settings.json")
+        kimi_global_mcp = os.path.expanduser("~/.kimi/mcp.json")
+        kimi_global_hooks = os.path.expanduser("~/.kimi/config.toml")
+
+        if os.path.isfile(claude_global_hooks) or os.path.isfile(claude_global_mcp):
+            global_parts.append("Claude Code: global")
+        if os.path.isfile(kimi_global_hooks) or os.path.isfile(kimi_global_mcp):
+            global_parts.append("Kimi Code CLI: global")
+
+        if global_parts:
+            text += "\n\n## Global Setup\n"
+            text += "CCR is configured globally: " + ", ".join(global_parts)
+            text += "\nAuto-init: enabled (CCR_AUTO_INIT=1)"
+    except Exception:
+        pass
+
     return GccStatusResult(branch=branch, total_commits=total_commits, message=text)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_projects() -> GccProjectsResult:
+    """List all known CCR projects from the global registry.
+
+    Returns projects registered in ~/.ccr/projects.json with their
+    path, commit count, and last-used timestamp.
+    """
+    import json
+
+    registry_path = os.path.expanduser("~/.ccr/projects.json")
+    projects: list[dict] = []
+    if os.path.isfile(registry_path):
+        try:
+            with open(registry_path, "r", encoding="utf-8") as f:
+                projects = json.loads(f.read())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not projects:
+        return GccProjectsResult(
+            project_count=0,
+            projects=[],
+            message="No projects registered yet. Run 'ccr init' or use CCR in a project to register it.",
+        )
+
+    lines = [f"Known CCR projects: {len(projects)}\n"]
+    for p in projects:
+        name = p.get("name", "?")
+        path = p.get("path", "?")
+        commits = p.get("commit_count", "?")
+        last_used = p.get("last_used", "never")
+        lines.append(f"  {name}")
+        lines.append(f"    Path: {path}")
+        lines.append(f"    Commits: {commits}, Last used: {last_used}")
+        lines.append("")
+
+    return GccProjectsResult(
+        project_count=len(projects),
+        projects=projects,
+        message="\n".join(lines).rstrip(),
+    )
 
 
 # ===========================================================================

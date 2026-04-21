@@ -45,6 +45,7 @@ from ccr.mcp.gcc_tools import (  # noqa: F401
     gcc_evolve_memory,
     gcc_log_ota,
     gcc_status,
+    gcc_projects,
     gcc_consolidate,
     gcc_patterns,
     gcc_scratchpad,
