@@ -39,7 +39,7 @@ CCR is an MCP server that gives AI agents three capabilities they don't have nat
 2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
 3. **Sandboxed REPL (RLM)** — An isolated Python environment for iterative analysis, with repo search and structured output.
 
-All tools run as pure logic with zero LLM calls. The AI agent itself provides the reasoning.
+All core tools run with minimal overhead. The AI agent itself provides the reasoning; CCR provides the memory layer.
 
 **Works with any AI agent** — use Claude Code, Kimi, Continue.dev, Ollama, or OpenAI. CCR memory is shared across all of them.
 
@@ -225,7 +225,7 @@ CCR draws on 16 research papers across three tiers of implementation fidelity:
 - **AgentEvolver** — Contribution-weighted counters
 - **ALMA** — Meta-learned retrieval parameters
 
-All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` (project architecture notes) for detailed limitation tables comparing CCR's implementation vs. each paper.
+All implementations use mechanical heuristics where possible. See `CLAUDE.md` (project architecture notes) for detailed limitation tables comparing CCR's implementation vs. each paper.
 
 ## vs. Alternatives
 
@@ -236,7 +236,7 @@ All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` 
 | Version control (branch/merge) | Yes | No | No | No |
 | Self-evolving strategies | Yes | No | No | No |
 | Sandboxed REPL | Yes | No | No | No |
-| Zero LLM calls | Yes | No | No | No |
+| Minimal infrastructure | Yes | No | No | No |
 | Zero infrastructure | Yes | No | No (DB) | No (Neo4j) |
 | Works without per-call LLM billing | Yes | No | No | No |
 | Open source | Apache 2.0 | Yes | Apache 2.0 | Apache 2.0 |
