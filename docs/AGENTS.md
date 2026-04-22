@@ -4,14 +4,18 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 
 ## Quick Reference
 
-| Agent | MCP | Hooks | Level | Install Command |
-|-------|:---:|:-----:|:-----:|-----------------|
-| **Claude Code** | ✅ | ✅ JSON | 5 (Full) | `ccr install-global --agents claude-code` |
-| **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | `ccr install-global --agents kimi` |
-| **Continue.dev** | ✅ | ❌ | 4 (MCP) | `ccr install-global --agents continue-dev` |
-| **Ollama** | ❌ | ❌ | 3 (File) | `ccr install-global --agents ollama` |
-| **OpenAI API** | ❌ | ❌ | 2 (SDK) | `ccr install-global --agents openai` |
-| **Generic MCP** | ✅ | ❌ | 4 (MCP) | `ccr install-global --agents generic-mcp` |
+| Agent | MCP | Hooks | Level | Status | Install Command |
+|-------|:---:|:-----:|:-----:|--------|-----------------|
+| **Claude Code** | ✅ | ✅ JSON | 5 (Full) | ✅ Verified | `ccr install-global --agents claude-code` |
+| **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | ✅ Verified | `ccr install-global --agents kimi` |
+| **Continue.dev** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | `ccr install-global --agents continue-dev` |
+| **Ollama** | ❌ | ❌ | 3 (File) | 🧪 Experimental | `ccr install-global --agents ollama` |
+| **OpenAI API** | ❌ | ❌ | 2 (SDK) | 🧪 Experimental | `ccr install-global --agents openai` |
+| **Generic MCP** | ✅ | ❌ | 4 (MCP) | ✅ Verified | `ccr install-global --agents generic-mcp` |
+
+**Status legend:**
+- ✅ **Verified** — Integration tested with real software
+- 🧪 **Experimental** — Adapter generates correct config/wrapper, but not yet tested against the actual agent. Community testing welcome!
 
 ## Integration Levels
 
