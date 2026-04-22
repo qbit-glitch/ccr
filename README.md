@@ -9,23 +9,24 @@ CCR gives AI agents persistent memory, self-evolving strategy playbooks, and a s
 
 ## Quick Start
 
-> **Requirements**: macOS/Linux · Python 3.11+ · Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
+> **Requirements**: macOS/Linux · Python 3.11+ · An AI agent (see cost table below)
 
 ```bash
 # 0. Prerequisites (if not already installed)
 # - Python 3.11+:  python3 --version
-# - Claude Code:   npm install -g @anthropic-ai/claude-code
-# - Kimi CLI:      pip install kimi-cli  (optional, for Kimi support)
+# - Claude Code:   npm install -g @anthropic-ai/claude-code  (requires paid Claude Pro or API key)
+# - Kimi CLI:      pip install kimi-cli  (free tier available)
+# - Ollama:        https://ollama.com  (free, runs locally)
 
-# 1. Install
+# 1. Install CCR (free and open source)
 pip install ccr-memory  # or: pip install -e . (from source)
 
 # 2. Global setup — works across ALL projects automatically
 ccr install-global
 
 # 3. Open your agent from any project directory — CCR handles the rest
-cd /your/project && claude   # Claude Code
-cd /your/project && kimi     # Kimi Code CLI
+cd /your/project && claude   # Claude Code (paid)
+cd /your/project && kimi     # Kimi Code CLI (free tier)
 ```
 
 That's it. Your agent will automatically load project memory on every session start and auto-commit progress when you finish — in **every directory** without per-project setup. Memory is stored per-project in `./.ccr/` and auto-initialized on first use.
@@ -52,15 +53,17 @@ CCR is designed for long-running research projects where context loss is the mai
 - `gcc_discuss(topic=..., decision=..., rationale=...)` — persistent decision log for architecture choices
 - `gcc_search("preprocessing decision")` — find any past decision across commits, discussions, and sessions
 
-**Cost options:**
+**CCR is free and open source.** The AI agents it connects to are not:
 
-| Path | Cost | Notes |
-|------|------|-------|
-| Claude Pro | $20/mo | Claude Code access with rate limits |
-| Claude Max | $100/mo | Higher rate limits for heavy daily use |
-| Anthropic API key | ~$2–8/mo | Pay-per-token; cheapest for light/moderate use |
+| Agent | Cost | Notes |
+|-------|------|-------|
+| Claude Code | $20/mo Pro or ~$2–8/mo API | Most capable; requires Claude Pro subscription or Anthropic API key |
+| Kimi Code CLI | Free tier | No payment required for basic usage |
+| Continue | Free extension | But LLM backends (OpenAI/Anthropic) require paid API keys |
+| Ollama | Free | Runs local models; needs RAM/GPU for larger models |
+| OpenAI API | Pay-per-token | No subscription, but every API call costs money |
 
-> **Global pricing note:** Claude Pro ($20/mo) is US-priced. At PPP, this is $40–80/mo equivalent in many countries. The API-key path (~$2–8/mo actual usage) is the most accessible entry point for budget-constrained students — set `ANTHROPIC_API_KEY` and `claude` works normally.
+> **Global pricing note:** Claude Pro ($20/mo) is US-priced. At PPP, this is $40–80/mo equivalent in many countries. The API-key path (~$2–8/mo actual usage) is the most accessible entry point for budget-constrained students.
 
 See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
 

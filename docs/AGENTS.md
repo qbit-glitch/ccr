@@ -4,18 +4,22 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 
 ## Quick Reference
 
-| Agent | MCP | Hooks | Level | Status | Install Command |
-|-------|:---:|:-----:|:-----:|--------|-----------------|
-| **Claude Code** | ✅ | ✅ JSON | 5 (Full) | ✅ Verified | `ccr install-global --agents claude-code` |
-| **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | ✅ Verified | `ccr install-global --agents kimi` |
-| **Continue** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | `ccr install-global --agents continue-dev` |
-| **Ollama** | ❌ | ❌ | 3 (File) | 🧪 Experimental | `ccr install-global --agents ollama` |
-| **OpenAI API** | ❌ | ❌ | 2 (SDK) | 🧪 Experimental | `ccr install-global --agents openai` |
-| **Generic MCP** | ✅ | ❌ | 4 (MCP) | ✅ Verified | `ccr install-global --agents generic-mcp` |
+| Agent | MCP | Hooks | Level | Status | Cost | Install Command |
+|-------|:---:|:-----:|:-----:|--------|------|-----------------|
+| **Claude Code** | ✅ | ✅ JSON | 5 (Full) | ✅ Verified | $20/mo Pro or API key | `ccr install-global --agents claude-code` |
+| **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | ✅ Verified | Free tier | `ccr install-global --agents kimi` |
+| **Continue** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | LLM backend costs* | `ccr install-global --agents continue-dev` |
+| **Ollama** | ❌ | ❌ | 3 (File) | 🧪 Experimental | Free (needs RAM/GPU) | `ccr install-global --agents ollama` |
+| **OpenAI API** | ❌ | ❌ | 2 (SDK) | 🧪 Experimental | Pay-per-token | `ccr install-global --agents openai` |
+| **Generic MCP** | ✅ | ❌ | 4 (MCP) | ✅ Verified | Depends on LLM | `ccr install-global --agents generic-mcp` |
 
 **Status legend:**
 - ✅ **Verified** — Integration tested with real software
 - 🧪 **Experimental** — Adapter generates correct config/wrapper, but not yet tested against the actual agent. Community testing welcome!
+
+**Cost legend:**
+- CCR itself is **free and open source** (MIT license)
+- *Continue extension is free, but the LLM backends (OpenAI, Anthropic, etc.) require paid API keys
 
 ## Integration Levels
 
