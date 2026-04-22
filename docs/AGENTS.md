@@ -18,7 +18,7 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 - 🧪 **Experimental** — Adapter generates correct config/wrapper, but not yet tested against the actual agent. Community testing welcome!
 
 **Cost legend:**
-- CCR itself is **free and open source** (MIT license)
+- CCR itself is **free and open source** (Apache 2.0)
 - *Continue extension is free, but the LLM backends (OpenAI, Anthropic, etc.) require paid API keys
 
 ## Integration Levels

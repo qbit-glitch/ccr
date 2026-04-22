@@ -239,7 +239,7 @@ All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` 
 | Zero LLM calls | Yes | No | No | No |
 | Zero infrastructure | Yes | No | No (DB) | No (Neo4j) |
 | Works without per-call LLM billing | Yes | No | No | No |
-| Open source | MIT | Yes | Apache 2.0 | Apache 2.0 |
+| Open source | Apache 2.0 | Yes | Apache 2.0 | Apache 2.0 |
 
 ## Configuration
 
@@ -281,4 +281,4 @@ pytest tests/unit/ tests/integration/ -x -q
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE) for full text.
