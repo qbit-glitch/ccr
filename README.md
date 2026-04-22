@@ -3,7 +3,7 @@
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
 > **With CCR:** Your AI agent already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-CCR gives AI agents persistent memory, self-evolving strategy playbooks, and a sandboxed Python REPL. Works with **Claude Code**, **Kimi Code CLI**, **Continue.dev**, **Ollama**, **OpenAI API**, and any MCP-capable agent. **macOS/Linux only** (Windows support is not yet implemented).
+CCR gives MCP-capable AI agents persistent project memory, strategy playbooks, and a sandboxed Python REPL. Full auto-context for **Claude Code** and **Kimi Code CLI**; MCP tools for **Continue.dev**; SDK wrappers for **Ollama** and **OpenAI API**. **macOS/Linux only** (Windows support is not yet implemented).
 
 > **New to CCR?** See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
@@ -41,7 +41,7 @@ CCR is an MCP server that gives AI agents three capabilities they don't have nat
 
 All core tools run with minimal overhead. The AI agent itself provides the reasoning; CCR provides the memory layer.
 
-**Works with any AI agent** — use Claude Code, Kimi, Continue.dev, Ollama, or OpenAI. CCR memory is shared across all of them.
+**Works across agents** — Claude Code and Kimi share memory via hooks; Continue.dev via MCP; Ollama and OpenAI via SDK wrappers. The same `.ccr/` directory is readable by all.
 
 ### For Researchers and Students
 
@@ -125,20 +125,20 @@ Then in your session, call `gcc_context(level=2)` to load memory and `gcc_commit
 - **Cross-linking**: Automatic bidirectional links between related commits
 - **Semantic search**: Find past work by meaning, not just keywords (ONNX embeddings)
 
-### Self-Evolving Playbooks (ACE)
+### Playbooks (ACE)
 
 - **Strategy bullets**: "When X, do Y" rules with helpful/harmful counters
 - **Temporal decay**: Unused strategies fade (30 days → 21% weight, 90 days → 1%)
 - **Two-tier scope**: Global strategies (all projects) + project-specific strategies
 - **Failure lessons**: Structured analysis of what went wrong and prevention principles
-- **Schema evolution**: The playbook structure itself evolves based on usage metrics
+- **Optional LLM-powered evolution**: Automatic bullet generation, curation, and deduplication when a sub-model is configured
 
 ### Sandboxed REPL (RLM)
 
-- **Kernel-level isolation**: macOS Seatbelt sandbox (deny-default + allowlist)
-- **Module allowlist**: Only safe standard library modules permitted
+- **Python-level sandbox**: AST validation, restricted builtins, and module allowlist
 - **Repo tools**: `search_repo()`, `get_file()`, `estimate_tokens()` available in REPL
 - **Structured output**: `FINAL_VAR` termination pattern for clean results
+- **Optional kernel sandbox**: macOS Seatbelt / Linux Landlock available for standalone execution (disabled in MCP path to preserve repo tool access)
 
 ### Repo Indexing
 
@@ -231,13 +231,13 @@ All implementations use mechanical heuristics where possible. See `CLAUDE.md` (p
 
 | Feature | CCR | Mem0 | Letta/MemGPT | Graphiti |
 |---------|-----|------|--------------|---------|
-| Auto-manages memory | Yes (hooks) | Yes | Yes | Yes |
-| Multi-agent (any combination) | Yes | No | No | No |
+| Auto-manages memory | Yes (Claude + Kimi hooks) | Yes | Yes | Yes |
+| Multi-agent support | Yes (shared `.ccr/`) | No | No | No |
 | Version control (branch/merge) | Yes | No | No | No |
-| Self-evolving strategies | Yes | No | No | No |
+| Playbooks with optional LLM evolution | Yes | No | No | No |
 | Sandboxed REPL | Yes | No | No | No |
-| Zero infrastructure | Yes | No | No (DB) | No (Neo4j) |
-| Works without per-call LLM billing | Yes | No | No | No |
+| No external database server | Yes | No | No (DB) | No (Neo4j) |
+| Core features work without LLM billing | Yes | No | No | No |
 | Open source | Apache 2.0 | Yes | Apache 2.0 | Apache 2.0 |
 
 ## Configuration
