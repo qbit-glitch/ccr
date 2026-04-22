@@ -1,4 +1,4 @@
-# CCR — Context Compression & Retrieval
+# CCR — Continuous Context Retention
 
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
 > **With CCR:** Your AI agent already knows — months of decisions, experiments, and code reasoning recalled instantly.
@@ -25,7 +25,7 @@ pip install ccr-memory  # or: pip install -e . (from source)
 ccr install-global
 
 # 3. Open your agent from any project directory — CCR handles the rest
-cd /your/project && claude   # Claude Code (paid)
+cd /your/project && claude   # or kimi, continue, ollama, etc.
 cd /your/project && kimi     # Kimi Code CLI (free tier)
 ```
 
@@ -45,7 +45,7 @@ All tools run as pure logic with zero LLM calls. The AI agent itself provides th
 
 ### For Researchers and Students
 
-CCR is designed for long-running research projects where context loss is the main productivity bottleneck. A 3-month project means ~90 Claude Code sessions. Without CCR, each starts from scratch. With CCR, each starts where the last left off.
+CCR is designed for long-running research projects where context loss is the main productivity bottleneck. A 3-month project means ~90 agent sessions. Without CCR, each starts from scratch. With CCR, each starts where the last left off.
 
 **Researcher-specific features:**
 - `gcc_commit(experiment={"metrics": {"val_loss": 0.23}})` — log ML runs with metrics and hypothesis
@@ -63,7 +63,7 @@ CCR is designed for long-running research projects where context loss is the mai
 | Ollama | Free | Runs local models; needs RAM/GPU for larger models |
 | OpenAI API | Pay-per-token | No subscription, but every API call costs money |
 
-> **Global pricing note:** Claude Pro ($20/mo) is US-priced. At PPP, this is $40–80/mo equivalent in many countries. The API-key path (~$2–8/mo actual usage) is the most accessible entry point for budget-constrained students.
+> **Global pricing note:** Agent subscriptions (e.g., Claude Pro at $20/mo) are US-priced. At PPP, this is $40–80/mo equivalent in many countries. The API-key path (~$2–8/mo actual usage) is the most accessible entry point for budget-constrained students.
 
 See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) for setup, cost details, and a full PhD workflow guide.
 
@@ -149,7 +149,7 @@ Then in your session, call `gcc_context(level=2)` to load memory and `gcc_commit
 
 ### Session Logger
 
-Every Q&A turn (user message + Claude's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected Claude behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — Claude calls `session_log_turn` after each response. See [docs/session-logger.md](https://github.com/qbit-glitch/ccr/blob/main/docs/session-logger.md) for the full reference.
+Every Q&A turn (user message + the agent's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected agent behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — the agent calls `session_log_turn` after each response. See [docs/session-logger.md](https://github.com/qbit-glitch/ccr/blob/main/docs/session-logger.md) for the full reference.
 
 ## Architecture
 
@@ -225,14 +225,14 @@ CCR draws on 16 research papers across three tiers of implementation fidelity:
 - **AgentEvolver** — Contribution-weighted counters
 - **ALMA** — Meta-learned retrieval parameters
 
-All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` for detailed limitation tables comparing CCR's implementation vs. each paper.
+All implementations use mechanical heuristics (zero LLM calls). See `CLAUDE.md` (project architecture notes) for detailed limitation tables comparing CCR's implementation vs. each paper.
 
 ## vs. Alternatives
 
 | Feature | CCR | Mem0 | Letta/MemGPT | Graphiti |
 |---------|-----|------|--------------|---------|
 | Auto-manages memory | Yes (hooks) | Yes | Yes | Yes |
-| Multi-agent (Claude + Kimi) | Yes | No | No | No |
+| Multi-agent (any combination) | Yes | No | No | No |
 | Version control (branch/merge) | Yes | No | No | No |
 | Self-evolving strategies | Yes | No | No | No |
 | Sandboxed REPL | Yes | No | No | No |
