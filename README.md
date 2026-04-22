@@ -236,7 +236,6 @@ All implementations use mechanical heuristics where possible. See `CLAUDE.md` (p
 | Version control (branch/merge) | Yes | No | No | No |
 | Self-evolving strategies | Yes | No | No | No |
 | Sandboxed REPL | Yes | No | No | No |
-| Minimal infrastructure | Yes | No | No | No |
 | Zero infrastructure | Yes | No | No (DB) | No (Neo4j) |
 | Works without per-call LLM billing | Yes | No | No | No |
 | Open source | Apache 2.0 | Yes | Apache 2.0 | Apache 2.0 |
