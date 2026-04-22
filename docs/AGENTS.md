@@ -8,7 +8,7 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 |-------|:---:|:-----:|:-----:|--------|-----------------|
 | **Claude Code** | ✅ | ✅ JSON | 5 (Full) | ✅ Verified | `ccr install-global --agents claude-code` |
 | **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | ✅ Verified | `ccr install-global --agents kimi` |
-| **Continue.dev** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | `ccr install-global --agents continue-dev` |
+| **Continue** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | `ccr install-global --agents continue-dev` |
 | **Ollama** | ❌ | ❌ | 3 (File) | 🧪 Experimental | `ccr install-global --agents ollama` |
 | **OpenAI API** | ❌ | ❌ | 2 (SDK) | 🧪 Experimental | `ccr install-global --agents openai` |
 | **Generic MCP** | ✅ | ❌ | 4 (MCP) | ✅ Verified | `ccr install-global --agents generic-mcp` |
@@ -68,13 +68,15 @@ ccr install-global
 
 Then run `kimi` from any project directory.
 
-### Continue.dev
+### Continue (VS Code / JetBrains extension)
 
 ```bash
 ccr install-global --agents continue-dev
 ```
 
-Then reload Continue.dev in your IDE. CCR tools will appear in the MCP tools panel. Call `gcc_context(level=2)` manually when you want memory loaded.
+Then reload Continue in your IDE. CCR tools will appear in the MCP tools panel. Call `gcc_context(level=2)` manually when you want memory loaded.
+
+> Note: The extension is called **"Continue"** in the VS Code marketplace (not "Continue.dev"). Visit [continue.dev](https://continue.dev) for installation instructions.
 
 ### Ollama
 

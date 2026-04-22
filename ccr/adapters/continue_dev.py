@@ -1,4 +1,9 @@
-"""Continue.dev adapter — MCP-only integration via ~/.continue/config.json."""
+"""Continue adapter — MCP-only integration via ~/.continue/config.json.
+
+Continue is a VS Code / JetBrains extension (continue.dev).
+Supports MCP servers via its config.json.
+No hooks — users must call gcc_context() manually in their prompts.
+"""
 
 from __future__ import annotations
 
@@ -9,20 +14,33 @@ from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult
 
 
 class ContinueDevAdapter(BaseAgentAdapter):
-    """Continue.dev IDE extension (VS Code, JetBrains, etc.).
+    """Continue IDE extension (VS Code, JetBrains, etc.).
 
-    Continue.dev supports MCP servers via its config.json.
+    Continue supports MCP servers via its config.json.
     No hooks — users must call gcc_context() manually in their prompts.
     """
 
     name = "continue-dev"
-    display_name = "Continue.dev"
+    display_name = "Continue (VS Code extension)"
 
     _CONFIG_DIR = os.path.expanduser("~/.continue")
     _CONFIG_PATH = os.path.join(_CONFIG_DIR, "config.json")
 
+    # VS Code extension paths to check for installation
+    _VSCODE_EXTENSION_PATHS = [
+        os.path.expanduser("~/.vscode/extensions/continue.continue"),
+        os.path.expanduser("~/.vscode-server/extensions/continue.continue"),
+        os.path.expanduser("~/Library/Application Support/Code/User/globalStorage/continue.continue"),
+    ]
+
     def is_installed(self) -> bool:
-        return os.path.isdir(self._CONFIG_DIR) or os.path.isfile(self._CONFIG_PATH)
+        # Check for config directory, config file, or VS Code extension
+        if os.path.isdir(self._CONFIG_DIR) or os.path.isfile(self._CONFIG_PATH):
+            return True
+        for path in self._VSCODE_EXTENSION_PATHS:
+            if os.path.exists(path):
+                return True
+        return False
 
     def supports_mcp(self) -> bool:
         return True

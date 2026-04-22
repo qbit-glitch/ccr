@@ -156,7 +156,7 @@ class TestKimiAdapter:
 
 
 class TestContinueDevAdapter:
-    """Test Continue.dev adapter — validates JSON schema only."""
+    """Test Continue adapter — validates JSON schema only."""
 
     def test_install_writes_valid_mcp_json(self, tmp_path):
         adapter = ContinueDevAdapter()
@@ -177,6 +177,20 @@ class TestContinueDevAdapter:
     def test_context_format_is_markdown(self):
         adapter = ContinueDevAdapter()
         assert adapter.context_format() == "markdown"
+
+    def test_detects_vscode_extension(self, tmp_path):
+        adapter = ContinueDevAdapter()
+        # Override paths so real ~/.continue doesn't interfere
+        adapter._CONFIG_DIR = str(tmp_path / "nonexistent")
+        adapter._CONFIG_PATH = str(tmp_path / "nonexistent" / "config.json")
+        adapter._VSCODE_EXTENSION_PATHS = [str(tmp_path / ".vscode" / "extensions" / "continue.continue")]
+
+        # Not installed initially
+        assert adapter.is_installed() is False
+
+        # Create fake extension directory
+        os.makedirs(adapter._VSCODE_EXTENSION_PATHS[0])
+        assert adapter.is_installed() is True
 
 
 class TestOllamaAdapter:
