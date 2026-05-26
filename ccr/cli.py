@@ -295,6 +295,10 @@ def index(project: str) -> None:
     from ccr.core.memory import MemoryManager
 
     project = os.path.abspath(project)
+    if not os.path.isdir(project):
+        raise click.BadParameter(
+            f"path does not exist: {project}", param_hint="PROJECT"
+        )
     click.echo(f"Indexing {project}...")
     idx = RepoIndex.build(project)
     click.echo(idx.get_summary())
