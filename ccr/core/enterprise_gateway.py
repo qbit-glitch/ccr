@@ -14,6 +14,36 @@ from typing import Any
 
 from ccr.core.governance import load_policy, save_policy, scan_text
 
+# Write tools mapped to the policy operation they require. A role must hold the
+# operation (or "*") to be allowed the tool. Tools not listed here are treated as
+# read-only and only require the role to hold some grant. fnmatch; first match wins.
+_WRITE_TOOL_OPERATIONS: list[tuple[str, str]] = [
+    ("gcc_commit", "commit"),
+    ("gcc_branch", "commit"),
+    ("gcc_merge", "commit"),
+    ("gcc_consolidate", "commit"),
+    ("gcc_evolve_memory", "commit"),
+    ("gcc_discuss", "commit"),
+    ("gcc_scratchpad", "commit"),
+    ("gcc_facts", "fact_write"),
+    ("ace_apply_delta", "commit"),
+    ("ace_update_counters", "commit"),
+    ("ace_prune", "commit"),
+    ("ace_evolve_*", "commit"),
+    ("ace_generate_bullets", "commit"),
+    ("index_build", "commit"),
+    ("session_log_turn", "commit"),
+    ("sync_push", "sync_push"),
+]
+
+
+def required_operation(tool_name: str) -> str:
+    """Return the policy operation a tool requires, or "" if read-only/unlisted."""
+    for pattern, op in _WRITE_TOOL_OPERATIONS:
+        if fnmatch.fnmatch(tool_name, pattern):
+            return op
+    return ""
+
 
 @dataclass
 class GatewayDecision:
@@ -41,8 +71,15 @@ class EnterprisePolicyGateway:
         if allowed_tools and not any(fnmatch.fnmatch(tool_name, pat) for pat in allowed_tools):
             reasons.append(f"tool {tool_name} is not approved")
         grants = self.policy.roles.get(actor_role, [])
-        if "*" not in grants and not grants:
-            reasons.append(f"role {actor_role} has no permissions")
+        if "*" not in grants:
+            if not grants:
+                reasons.append(f"role {actor_role} has no permissions")
+            else:
+                required = required_operation(tool_name)
+                if required and required not in grants:
+                    reasons.append(
+                        f"role {actor_role} lacks '{required}' permission required for {tool_name}"
+                    )
         return GatewayDecision(not reasons, reasons)
 
     def check_memory_write(self, text: str, actor_role: str = "writer") -> GatewayDecision:

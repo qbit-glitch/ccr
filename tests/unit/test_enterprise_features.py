@@ -190,6 +190,24 @@ def test_export_redacted_and_gateway_policy(tmp_path, monkeypatch):
         _reset_mcp_globals()
 
 
+def test_gateway_enforces_per_operation_role_grants(tmp_path):
+    """check_tool must deny a role lacking the operation a write tool requires."""
+    from ccr.core.memory import MemoryManager
+
+    MemoryManager(str(tmp_path)).ensure_structure()
+    gate = EnterprisePolicyGateway(str(tmp_path))
+    gate.init_policy()
+
+    # reader grants = recall/context/export_redacted — no commit/fact_write/sync_push
+    assert not gate.check_tool("gcc_commit", actor_role="reader").allowed
+    assert not gate.check_tool("gcc_facts", actor_role="reader").allowed
+    # reader may still use read-only tools
+    assert gate.check_tool("gcc_recall", actor_role="reader").allowed
+    # writer holds commit; admin holds "*"
+    assert gate.check_tool("gcc_commit", actor_role="writer").allowed
+    assert gate.check_tool("gcc_commit", actor_role="admin").allowed
+
+
 def test_reranker_falls_back_for_unknown_provider(monkeypatch):
     monkeypatch.setenv("CCR_RERANKER", "not-a-real-provider")
     assert get_reranker().provider == "lexical"
