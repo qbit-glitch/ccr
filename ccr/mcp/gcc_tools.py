@@ -18,6 +18,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from ccr.mcp.server import mcp
 import ccr.mcp.server as _srv
+from ccr.core.observability import ccr_span
 
 # All server functions/globals accessed via _srv to support test patching.
 # Only `mcp` (the FastMCP singleton) is imported directly — it never changes.
@@ -27,7 +28,6 @@ from ccr.mcp_types import (
     GccConsolidateResult,
     GccContextResult,
     GccLogOtaResult,
-    GccPatternsResult,
     GccProjectsResult,
     GccScratchpadResult,
     GccStatusResult,
@@ -202,31 +202,32 @@ def gcc_commit(
             )
         # --- End validation ---
 
-        with _srv._state_lock:
-            mem = _srv._ensure_memory()
-            # Phase 2: Auto-extract patterns via sub-model when not provided (CER §3.2)
-            # Retry up to 2 times on transient failure (A7 sub-model retry)
-            if patterns_learned is None and mem.config.auto_extract_patterns and len(what) > 100:
-                sub = _srv._get_sub_client()
-                if sub is not None:
-                    _extracted = None
-                    for _attempt in range(2):
-                        try:
-                            _extracted = _srv._extract_patterns_from_commit(
-                                title, what, why, files_changed or [], sub
-                            )
-                            break
-                        except Exception:
-                            if _attempt == 0:
-                                time.sleep(1)
-                    patterns_learned = _extracted or None
-            result = mem.commit(title, what, why, files_changed, next_step,
-                                patterns_learned,
-                                admission_threshold, rejection_threshold,
-                                compressed_summary,
-                                author=author,
-                                ci_context=ci_context,
-                                experiment=experiment)
+        with ccr_span("ccr.memory.write.commit", project_root=_proj_root, attributes={"title": title}):
+            with _srv._state_lock:
+                mem = _srv._ensure_memory()
+                # Phase 2: Auto-extract patterns via sub-model when not provided (CER §3.2)
+                # Retry up to 2 times on transient failure (A7 sub-model retry)
+                if patterns_learned is None and mem.config.auto_extract_patterns and len(what) > 100:
+                    sub = _srv._get_sub_client()
+                    if sub is not None:
+                        _extracted = None
+                        for _attempt in range(2):
+                            try:
+                                _extracted = _srv._extract_patterns_from_commit(
+                                    title, what, why, files_changed or [], sub
+                                )
+                                break
+                            except Exception:
+                                if _attempt == 0:
+                                    time.sleep(1)
+                        patterns_learned = _extracted or None
+                result = mem.commit(title, what, why, files_changed, next_step,
+                                    patterns_learned,
+                                    admission_threshold, rejection_threshold,
+                                    compressed_summary,
+                                    author=author,
+                                    ci_context=ci_context,
+                                    experiment=experiment)
 
         # Write explicit-commit marker so on_stop.py skips auto-baseline for this session
         if result and not result.startswith("Error") and not result.startswith("[REJECTED]"):
@@ -288,6 +289,17 @@ def gcc_commit(
         trigger_suggestions: list[dict] = []
         if patterns_learned:
             trigger_suggestions = _extract_trigger_suggestions(patterns_learned)
+
+        try:
+            from ccr.core.governance import append_audit
+            append_audit(mem.ccr_root, "memory_write", author or "mcp", {
+                "tool": "gcc_commit",
+                "commit_id": cid,
+                "title": title,
+                "decision": admission_decision,
+            })
+        except Exception:
+            pass
 
         return GccCommitResult(
             commit_id=cid,
@@ -355,13 +367,18 @@ def gcc_context(
         _level_warnings.append(f"commit_id is only active at level=5 (current level={level}); use level=5 for specific commit lookup.")
     with _srv._state_lock:
         mem = _srv._get_project_memory(project)
-    result = mem.get_context(
-        level=level,
-        search_term=search_term,
-        commit_id=commit_id,
-        log_window=log_window,
-        follow_links=follow_links,
-    )
+    with ccr_span(
+        "ccr.memory.read.context",
+        project_root=mem.project_root,
+        attributes={"level": level, "search": bool(search_term), "commit_id": bool(commit_id)},
+    ):
+        result = mem.get_context(
+            level=level,
+            search_term=search_term,
+            commit_id=commit_id,
+            log_window=log_window,
+            follow_links=follow_links,
+        )
 
     # Apply result_limit and time_range_hours filtering on commit blocks
     # Commit blocks start with "\n## [C" or "## [C" at the beginning
@@ -512,11 +529,14 @@ def gcc_status(project: str | None = None) -> GccStatusResult:
         claude_global_hooks = os.path.expanduser("~/.claude/settings.json")
         kimi_global_mcp = os.path.expanduser("~/.kimi/mcp.json")
         kimi_global_hooks = os.path.expanduser("~/.kimi/config.toml")
+        codex_global_config = os.path.expanduser("~/.codex/config.toml")
 
         if os.path.isfile(claude_global_hooks) or os.path.isfile(claude_global_mcp):
             global_parts.append("Claude Code: global")
         if os.path.isfile(kimi_global_hooks) or os.path.isfile(kimi_global_mcp):
             global_parts.append("Kimi Code CLI: global")
+        if os.path.isfile(codex_global_config):
+            global_parts.append("Codex CLI: global")
 
         if global_parts:
             text += "\n\n## Global Setup\n"
@@ -813,8 +833,12 @@ from ccr.mcp.gcc_branch_tools import (  # noqa: E402,F401
     gcc_evolve_memory,
 )
 from ccr.mcp.gcc_search_tools import (  # noqa: E402,F401
+    gcc_conflicts,
+    gcc_conflicts_resolve,
+    gcc_facts,
     gcc_links,
     gcc_patterns,
+    gcc_recall,
     gcc_experiments,
     gcc_discuss,
     gcc_discussions,

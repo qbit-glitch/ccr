@@ -16,11 +16,14 @@ from ccr.mcp.server import mcp
 import ccr.mcp.server as _srv
 
 from ccr.mcp_types import (
+    GccConflictsResult,
     GccDiscussResult,
     GccDiscussionsResult,
     GccExperimentsResult,
+    GccFactsResult,
     GccLinksResult,
     GccPatternsResult,
+    GccRecallResult,
     GccScratchpadSearchResult,
     GccSearchResult,
 )
@@ -47,9 +50,317 @@ def _log_search_error(source: str, query: str, exc: Exception) -> None:
         pass
 
 
+def _format_fact_line(fact: dict) -> str:
+    """Return one markdown line for a fact dict."""
+    active = "" if not (fact.get("valid_to") or fact.get("superseded_by")) else " [inactive]"
+    source = fact.get("source_commit") or fact.get("source_session") or fact.get("source_file") or "manual"
+    classification = fact.get("classification") or "confirmed"
+    return (
+        f"- **[{fact.get('id', '?')}]**{active} `{fact.get('key', '')}` "
+        f"conf={float(fact.get('confidence', 0.0)):.2f} class={classification} source={source}: "
+        f"{fact.get('statement', '')}"
+    )
+
+
 # ===========================================================================
 # GCC Search & Query Tools
 # ===========================================================================
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_recall(
+    query: str,
+    limit: int = 5,
+    sources: list[str] | None = None,
+    include_sessions: bool = True,
+    project: str | None = None,
+) -> GccRecallResult:
+    """Evidence-first recall over CCR memory.
+
+    Unlike gcc_context, which loads broad context for the agent, gcc_recall
+    returns a compact answer with explicit evidence IDs, confidence, and
+    stale/conflict notes.
+
+    Args:
+        query: Natural-language question to answer from CCR memory.
+        limit: Maximum evidence items to return.
+        sources: Optional source filter: facts, commits, discussions, sessions.
+        include_sessions: Whether to search .ccr/sessions.db turns.
+        project: Project path to query. None uses current project.
+    """
+    from ccr.core.recall import RecallEngine
+
+    with _srv._state_lock:
+        mem = _srv._get_project_memory(project)
+    try:
+        result = RecallEngine(mem).recall(
+            query=query,
+            limit=limit,
+            sources=sources,
+            include_sessions=include_sessions,
+        )
+        try:
+            from ccr.core.governance import append_audit
+            append_audit(mem.ccr_root, "memory_read", "mcp", {
+                "tool": "gcc_recall",
+                "query": query,
+                "evidence_count": len(result.evidence),
+                "confidence": result.confidence,
+            })
+        except Exception:
+            pass
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+    data = result.to_dict()
+    return GccRecallResult(
+        query=data["query"],
+        answer=data["answer"],
+        confidence=data["confidence"],
+        evidence=data["evidence"],
+        stale_notes=data["stale_notes"],
+        conflict_notes=data["conflict_notes"],
+        plan=data.get("plan", {}),
+        trace_id=data.get("trace_id", ""),
+        message=data["message"],
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def gcc_facts(
+    action: str = "list",
+    statement: str = "",
+    key: str = "",
+    fact_id: str = "",
+    query: str = "",
+    observed_at: str = "",
+    valid_from: str = "",
+    valid_to: str = "",
+    superseded_by: str = "",
+    confidence: float = 0.75,
+    source_commit: str = "",
+    source_session: str = "",
+    source_file: str = "",
+    pinned: bool = False,
+    classification: str = "confirmed",
+    evidence_ids: list[str] | None = None,
+    episode_ids: list[str] | None = None,
+    force: bool = False,
+    include_inactive: bool = False,
+    limit: int = 25,
+    project: str | None = None,
+) -> GccFactsResult:
+    """Manage the temporal fact ledger.
+
+    The ledger is stored in .ccr/facts.json and is intentionally additive.
+    Supported actions:
+      - list: return facts matching query
+      - add: append a fact with temporal/provenance metadata
+      - supersede: mark a fact inactive
+    """
+    from ccr.core.facts import FactLedger
+
+    action = action.lower().strip()
+    if action not in {"list", "add", "supersede"}:
+        raise ToolError("action must be one of: list, add, supersede")
+    with _srv._state_lock:
+        mem = _srv._get_project_memory(project)
+    ledger = FactLedger(mem.ccr_root)
+
+    try:
+        if action == "add":
+            from ccr.core.episodes import EpisodeStore
+            from ccr.core.quarantine import MemoryQuarantine, normalize_classification
+
+            normalized_classification = normalize_classification(classification)
+            if normalized_classification in {"inferred", "speculative"} and not force:
+                item = MemoryQuarantine(mem.ccr_root).submit(
+                    statement,
+                    key=key,
+                    classification=normalized_classification,
+                    reason="gcc_facts quarantine policy requires review for inferred/speculative facts.",
+                    confidence=confidence,
+                    source_commit=source_commit,
+                    source_session=source_session,
+                    source_file=source_file,
+                    evidence_ids=evidence_ids,
+                    episode_ids=episode_ids,
+                    metadata={"tool": "gcc_facts"},
+                )
+                episode = EpisodeStore(mem.ccr_root).append_episode(
+                    "memory_quarantined",
+                    summary=f"Quarantined {normalized_classification} fact {item.id}",
+                    content=statement,
+                    source_ids=[item.id, *(evidence_ids or []), *(episode_ids or [])],
+                    files=[source_file] if source_file else [],
+                    tools=["gcc_facts"],
+                    metadata={"classification": normalized_classification, "key": item.key},
+                )
+                facts = []
+                message = (
+                    f"Quarantined {normalized_classification} memory {item.id} "
+                    f"for review. Evidence episode: {episode.id}."
+                )
+                return GccFactsResult(action=action, count=0, facts=facts, message=message)
+            fact = ledger.add_fact(
+                statement,
+                key=key,
+                observed_at=observed_at,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                superseded_by=superseded_by,
+                confidence=confidence,
+                source_commit=source_commit,
+                source_session=source_session,
+                source_file=source_file,
+                pinned=pinned,
+                classification=normalized_classification,
+                evidence_ids=evidence_ids,
+                episode_ids=episode_ids,
+            )
+            EpisodeStore(mem.ccr_root).append_episode(
+                "fact_added",
+                summary=f"Added {normalized_classification} fact {fact.id}",
+                content=statement,
+                source_ids=[fact.id, *(evidence_ids or []), *(episode_ids or [])],
+                files=[source_file] if source_file else [],
+                tools=["gcc_facts"],
+                metadata={"classification": normalized_classification, "key": fact.key},
+            )
+            facts = [fact.to_dict()]
+            message = "Added fact:\n" + _format_fact_line(facts[0])
+        elif action == "supersede":
+            if not fact_id:
+                raise ToolError("fact_id is required for action='supersede'")
+            changed = ledger.supersede_fact(
+                fact_id,
+                superseded_by=superseded_by,
+                valid_to=valid_to,
+            )
+            if changed:
+                try:
+                    from ccr.core.episodes import EpisodeStore
+                    EpisodeStore(mem.ccr_root).append_episode(
+                        "fact_superseded",
+                        summary=f"Superseded fact {fact_id}",
+                        source_ids=[fact_id, superseded_by] if superseded_by else [fact_id],
+                        tools=["gcc_facts"],
+                        metadata={"superseded_by": superseded_by},
+                    )
+                except Exception:
+                    pass
+            facts = [f.to_dict() for f in ledger.list_facts(
+                query=fact_id,
+                include_inactive=True,
+                limit=1,
+            )]
+            message = f"Superseded {fact_id}." if changed else f"Fact {fact_id} not found."
+        else:
+            facts = [
+                f.to_dict()
+                for f in ledger.list_facts(
+                    query=query,
+                    include_inactive=include_inactive,
+                    limit=limit,
+                )
+            ]
+            if not facts:
+                message = "No facts found."
+            else:
+                message = "# Temporal Facts\n" + "\n".join(_format_fact_line(f) for f in facts)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+
+    return GccFactsResult(
+        action=action,
+        count=len(facts),
+        facts=facts,
+        message=message,
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+def gcc_conflicts(
+    query: str = "",
+    limit: int = 25,
+    project: str | None = None,
+) -> GccConflictsResult:
+    """Find candidate conflicts in the temporal fact ledger.
+
+    The first implementation is conservative and local: active facts with the
+    same key but different statements are flagged. Opposing polarity receives
+    high severity.
+    """
+    from ccr.core.facts import FactLedger
+
+    with _srv._state_lock:
+        mem = _srv._get_project_memory(project)
+    conflicts = [c.to_dict() for c in FactLedger(mem.ccr_root).detect_conflicts(query, limit)]
+    if not conflicts:
+        message = "No fact conflicts found."
+    else:
+        lines = ["# Fact Conflicts"]
+        for c in conflicts:
+            lines.append(
+                f"- **{c['severity']}** `{c['key']}`: "
+                f"{c['fact_a']} vs {c['fact_b']} ({c['reason']})"
+            )
+        message = "\n".join(lines)
+    return GccConflictsResult(count=len(conflicts), conflicts=conflicts, message=message)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+def gcc_conflicts_resolve(
+    winner_fact_id: str,
+    loser_fact_id: str,
+    reason: str = "",
+    project: str | None = None,
+) -> GccConflictsResult:
+    """Resolve a fact conflict by superseding the losing fact with the winner.
+
+    This preserves both facts while marking the loser inactive.  The resolution
+    is recorded as an immutable episode so later recall can explain why the
+    memory changed.
+    """
+    from ccr.core.episodes import EpisodeStore
+    from ccr.core.facts import FactLedger
+
+    winner = winner_fact_id.strip()
+    loser = loser_fact_id.strip()
+    if not winner or not loser:
+        raise ToolError("winner_fact_id and loser_fact_id are required")
+    if winner == loser:
+        raise ToolError("winner_fact_id and loser_fact_id must be different")
+
+    with _srv._state_lock:
+        mem = _srv._get_project_memory(project)
+    ledger = FactLedger(mem.ccr_root)
+    winner_matches = ledger.list_facts(query=winner, include_inactive=True, limit=1)
+    loser_matches = ledger.list_facts(query=loser, include_inactive=True, limit=1)
+    if not winner_matches:
+        raise ToolError(f"Winner fact {winner} not found")
+    if not loser_matches:
+        raise ToolError(f"Loser fact {loser} not found")
+    changed = ledger.supersede_fact(loser, superseded_by=winner)
+    if not changed:
+        raise ToolError(f"Loser fact {loser} could not be superseded")
+    episode = EpisodeStore(mem.ccr_root).append_episode(
+        "conflict_resolution",
+        summary=f"Resolved fact conflict: {winner} supersedes {loser}",
+        content=reason,
+        source_ids=[winner, loser],
+        tools=["gcc_conflicts_resolve"],
+        metadata={"winner": winner, "loser": loser},
+    )
+    conflicts = [c.to_dict() for c in ledger.detect_conflicts(query=winner_matches[0].key, limit=25)]
+    message = (
+        f"Resolved conflict: {winner} supersedes {loser}. "
+        f"Resolution episode: {episode.id}. Remaining conflicts for key: {len(conflicts)}."
+    )
+    return GccConflictsResult(count=len(conflicts), conflicts=conflicts, message=message)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
