@@ -9,7 +9,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 
@@ -218,6 +217,31 @@ class TestSqliteStorageBackend:
         assert isinstance(backend.memory_conn, sqlite3.Connection)
         backend.close()
 
+    def test_syncs_flat_file_commits_after_migrated_sentinel(self, tmp_path):
+        ccr = tmp_path / ".ccr"
+        branch = ccr / "branches" / "main"
+        branch.mkdir(parents=True)
+        (ccr / ".migrated").write_text("2026-04-18")
+        (branch / "commits.md").write_text(
+            "# Branch: main\n\n"
+            "# Milestone Journal\n\n"
+            "## [C101] 2026-04-26 16:44 | branch:main | SQLite sync works\n"
+            "**What**: Synced missing flat-file commit into SQLite.\n"
+            "**Why**: Backend switched after initial migration.\n"
+            "**Files**: ccr/core/storage/sqlite_backend.py\n"
+            "**Next**: Keep SQLite current.\n"
+        )
+
+        backend = SqliteStorageBackend(str(ccr))
+        try:
+            commits = backend.commit_list("main", limit=5)
+        finally:
+            backend.close()
+
+        assert [c["id"] for c in commits] == ["C101"]
+        assert commits[0]["title"] == "SQLite sync works"
+        assert commits[0]["what"] == "Synced missing flat-file commit into SQLite."
+
 
 # ── FileStorageBackend ──────────────────────────────────────────
 
@@ -306,7 +330,7 @@ class TestFileStorageBackend:
         for i in range(20):
             backend.log_append("main", f"line{i}", max_lines=10)
         content = backend.log_read("main", count=100)
-        lines = [l for l in content.split("\n") if l]
+        lines = [line for line in content.split("\n") if line]
         assert len(lines) == 10
 
     def test_log_read_empty(self, tmp_path):

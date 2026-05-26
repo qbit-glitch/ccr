@@ -1,25 +1,26 @@
 # Global CCR Setup Guide — Fully Automatic Memory Across All Projects
 
-> **Status:** ✅ Active — CCR memory is now **fully automatic** for both **Claude Code** and **Kimi Code CLI** across every directory on your system. No manual `gcc_commit` needed.
+> **Status:** ✅ Active — CCR memory is fully automatic for **Claude Code**, **Kimi Code CLI**, and **Codex CLI**. Codex gets complete lifecycle parity through the `codex-ccr` wrapper plus Codex-native hooks.
 
 ---
 
 ## What Changed
 
-Your CCR installation has been upgraded from **per-project** to **global**. You no longer need to run `ccr install` in every new repository, and memory management is now **fully automatic** in both Claude Code and Kimi.
+Your CCR installation has been upgraded from **per-project** to **global**. You no longer need to run `ccr install` in every new repository. Memory management is **fully automatic** in Claude Code, Kimi, and Codex.
 
 ### Before (Per-Project)
 ```bash
 cd ~/project-a && ccr install
 cd ~/project-b && ccr install
 cd ~/project-c && ccr install  # ... repeat for every project
-# Inside session: manually call gcc_commit()
+# Inside session: memory only works after local hooks are installed
 ```
 
 ### After (Global + Fully Automatic)
 ```bash
 cd ~/any-project && cclaude      # Claude Code — memory auto-managed
 cd ~/any-project && kimi-ccr     # Kimi — memory auto-managed (same experience!)
+cd ~/any-project && codex-ccr    # Codex — memory auto-managed with wrapper lifecycle
 ```
 
 ---
@@ -27,7 +28,7 @@ cd ~/any-project && kimi-ccr     # Kimi — memory auto-managed (same experience
 ## Architecture
 
 ```
-Any Directory ──cclaude / kimi-ccr──► AI Agent
+Any Directory ──cclaude / kimi-ccr / codex-ccr──► AI Agent
                                           ├── MCP Server (tools)
                                           │   └── gcc_commit, gcc_context,
                                           │       ace_get_playbook, rlm_execute,
@@ -35,12 +36,12 @@ Any Directory ──cclaude / kimi-ccr──► AI Agent
                                           │
                                           └── Hooks (auto-memory lifecycle)
                                               ├── UserPromptSubmit → inject context
-                                              ├── PostToolUse      → track changes
-                                              ├── PreCompact       → save state
+                                              ├── PostToolUse      → track changes (Claude/Kimi, optional Codex)
+                                              ├── PreCompact/sim  → save state
                                               └── Stop             → auto-commit
 ```
 
-**Both Claude Code and Kimi now run the exact same CCR hook scripts**, giving you identical fully-automatic memory behavior in either agent.
+**Claude Code, Kimi, and Codex all use CCR MCP tools plus lifecycle hooks.** Codex uses native `SessionStart`, `UserPromptSubmit`, and turn-scoped `Stop` hooks by default. Because Codex shows hook stdout, `SessionStart` retrieves full memory but prints only a compact 1-2 line summary. The high-frequency Codex `PostToolUse` hook is opt-in with `CCR_CODEX_POST_TOOL_USE=1 ccr install-global --agents codex`. The `codex-ccr` wrapper adds process start/exit lifecycle so session finalization and transcript reconciliation match Claude/Kimi as closely as Codex allows.
 
 ---
 
@@ -55,6 +56,13 @@ cclaude                          # alias → auto-inits .ccr/ → launches Claud
 ```bash
 kimi-ccr                         # auto-inits .ccr/ → launches Kimi with CCR
 ```
+
+### Codex CLI (fully automatic)
+```bash
+codex-ccr                        # native Codex hooks + CCR wrapper lifecycle
+```
+
+Plain `codex` still receives global CCR MCP tools and native hooks from `~/.codex/config.toml`, but it cannot provide process-exit finalization because Codex does not expose that lifecycle event to hooks.
 
 ### CCR CLI (anywhere)
 ```bash
@@ -78,43 +86,50 @@ When you type your first message, CCR automatically:
 **You do nothing.** The agent already knows the project history.
 
 ### 2. During Session (`PostToolUse` hook)
-After every tool call (file write, shell command, etc.), CCR silently:
+For Claude Code and Kimi, after every tool call (file write, shell command, etc.), CCR silently:
 - Tracks which files were modified
 - Accumulates session state for auto-commit
 
 **You do nothing.** Changes are tracked automatically.
 
-### 3. Context Compaction (`PreCompact` hook)
+Codex does not install this high-frequency hook by default to avoid repeated
+hook activity during normal work. Codex is instructed to call `gcc_commit` only
+after meaningful milestones, before likely context loss, or when the user
+explicitly asks to save/update CCR memory. Otherwise it relies on prompt/session
+hooks, turn `Stop`, and wrapper exit finalization unless
+`CCR_CODEX_POST_TOOL_USE=1` is set during install.
+
+### 3. Context Compaction (`PreCompact` hook or Codex simulation)
 Before Claude/Kimi compacts context to save tokens, CCR:
 - Logs the compaction event to memory
 - Ensures no state is lost during the reset
 
-**You do nothing.** State is preserved automatically.
+Codex does not expose a native `PreCompact` hook, so CCR simulates the safety check with prompt-time context pressure reminders and wrapper-managed session state.
 
-### 4. Session End (`Stop` hook)
-When the agent turn ends, CCR automatically:
+### 4. Session End (`Stop` hook + Codex wrapper exit)
+When the agent session or Codex turn ends, CCR automatically:
 - Generates a commit title, summary, and file list
 - Saves the commit to `.ccr/commits.md`
 - Extracts transferable patterns for the playbook
 - Cross-links related commits
 
-**You do nothing.** Memory is committed automatically.
+For Codex, turn-level `Stop` saves meaningful progress, and `codex-ccr` finalizes the overall session when the Codex process exits.
 
 ---
 
-## Claude Code vs Kimi — Feature Parity
+## Agent Feature Matrix
 
-| Feature | Claude Code | Kimi Code CLI |
-|---------|------------|---------------|
-| **MCP tools** (`gcc_commit`, `gcc_context`, `ace_get_playbook`, `rlm_execute`, `index_search`, etc.) | ✅ Yes | ✅ Yes |
-| **Auto memory injection** at session start | ✅ Yes | ✅ Yes |
-| **Auto-commit on session end** | ✅ Yes | ✅ Yes |
-| **Tool-use tracking** | ✅ Yes | ✅ Yes |
-| **Pre-compact save** | ✅ Yes | ✅ Yes |
-| **Session logger** (`session_log_turn`, `session_search`) | ✅ Yes | ✅ Yes |
-| **Fully automatic** — no manual `gcc_commit` | ✅ Yes | ✅ Yes |
+| Feature | Claude Code | Kimi Code CLI | Codex CLI |
+|---------|------------|---------------|-----------|
+| **MCP tools** (`gcc_commit`, `gcc_context`, `ace_get_playbook`, `rlm_execute`, `index_search`, etc.) | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Auto memory injection** at session start | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Auto-commit on session end / turn stop** | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Tool-use tracking** | ✅ Yes | ✅ Yes | Opt-in |
+| **Pre-compact save** | ✅ Yes | ✅ Yes | ✅ Simulated |
+| **Session logger** (`session_log_turn`, `session_search`) | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Fully automatic** — no manual `gcc_commit` | ✅ Yes | ✅ Yes | Quiet lifecycle + milestone saves |
 
-**Bottom line:** Identical fully-automatic memory experience in both agents.
+**Bottom line:** all three primary CLIs now have automatic CCR memory. Use `codex-ccr` for full Codex lifecycle parity; plain `codex` has MCP and native hooks but not wrapper exit finalization.
 
 ---
 
@@ -127,12 +142,14 @@ When the agent turn ends, CCR automatically:
 | `~/.claude/settings.json` | CCR hooks for Claude Code |
 | `~/.kimi/mcp.json` | CCR MCP server for Kimi (fallback) |
 | `~/.kimi/config.toml` | CCR hooks for Kimi (UserPromptSubmit, PostToolUse, PreCompact, Stop) |
+| `~/.codex/config.toml` | CCR MCP server and hooks for Codex CLI |
 
 ### Helper Scripts (`~/.ccr/bin/`)
 | Script | Purpose |
 |--------|---------|
 | `claude-ccr` | Auto-inits `.ccr/` → launches `claude` |
 | `kimi-ccr` | Auto-inits `.ccr/` → launches `kimi` with explicit project root + merges existing MCP servers |
+| `codex-ccr` | Auto-inits `.ccr/` → launches `codex` with CCR lifecycle env + exit finalization |
 | `ccr-global` | Runs `ccr` CLI from dev venv anywhere |
 
 ### Shell Aliases (`~/.zshrc`, `~/.bashrc`)
@@ -140,6 +157,7 @@ When the agent turn ends, CCR automatically:
 alias ccr='ccr-global'
 alias cclaude='claude-ccr'
 alias kimi-ccr='kimi-ccr'
+alias ccodex='codex-ccr'
 ```
 
 ---
@@ -192,7 +210,7 @@ ccr uninstall                    # removes local hooks + .mcp.json entry
 | Variable | Effect |
 |----------|--------|
 | `CCR_PROJECT_ROOT` | Override project root detection (hooks + MCP) |
-| `CCR_STORAGE_BACKEND` | `sqlite` (default) or `files` |
+| `CCR_STORAGE_BACKEND` | Generated MCP/hook configs set `sqlite`; unset defaults to `files` for backward-compatible manual use |
 | `CCR_OLLAMA_MODEL` | Enable local sub-model (e.g. `qwen2.5:7b`) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_SUB` | Enable Haiku sub-model for synthesis |
 
@@ -205,15 +223,16 @@ ccr uninstall                    # removes local hooks + .mcp.json entry
    - `~/.claude/settings.json` → all CCR hook `command` fields
    - `~/.kimi/config.toml` → all CCR hook `command` fields
    - `~/.kimi/mcp.json` → `command`
+   - `~/.codex/config.toml` → MCP `command` and hook `command` fields
    - `~/.ccr/bin/*` → `PYTHON` and `REPO` variables
 
 2. **Kimi hooks are Beta:** Kimi's hook system is marked Beta. If Kimi updates its hook format in a future release, the CCR hooks may need adjustment. The hooks use the exact same Python scripts as Claude Code, so any behavioral changes will be minimal.
 
 3. **Doctor reports missing hooks (Claude only):** `ccr doctor` checks the **current project** for `.claude/settings.local.json` hooks. With global hooks, it reports `[!!] Hooks not configured` — this is expected and harmless. The global hooks in `~/.claude/settings.json` are active.
 
-4. **Session logging:** Sessions are logged to `.ccr/sessions.db` per-project. With Kimi, sessions are auto-logged via hooks just like Claude Code.
+4. **Session logging:** Sessions are logged to `.ccr/sessions.db` per-project. `codex-ccr` reconciles Codex JSONL transcripts on wrapper exit; native Codex turn `Stop` also reconciles when Codex provides a transcript path.
 
-5. **Launch from project directory:** For the most reliable project detection, always launch `cclaude` or `kimi-ccr` from inside your project directory. Both wrappers auto-initialize `.ccr/` if missing.
+5. **Launch from project directory:** For the most reliable project detection, always launch `cclaude`, `kimi-ccr`, or `codex-ccr` from inside your project directory. Hooks auto-initialize `.ccr/` if missing.
 
 ---
 
@@ -222,6 +241,7 @@ ccr uninstall                    # removes local hooks + .mcp.json entry
 ### CCR tools not appearing
 **Claude:** Restart Claude Code completely (quit and re-open).  
 **Kimi:** Run `kimi mcp list` or `/mcp` inside Kimi to check connection status.
+**Codex:** Run `codex mcp get ccr` to verify the global CCR server entry.
 
 ### Hooks not firing
 ```bash
@@ -238,6 +258,9 @@ cat ~/.claude/settings.json | grep ccr
 
 # Kimi:
 cat ~/.kimi/config.toml | grep -A1 "\[\[hooks\]\]"
+
+# Codex:
+cat ~/.codex/config.toml | grep -A3 "\[\[hooks\."
 ```
 
 ### Kimi wrapper issues

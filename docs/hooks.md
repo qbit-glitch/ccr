@@ -2,15 +2,15 @@
 
 ## Overview
 
-CCR uses Claude Code hooks to automatically track work and commit to memory without requiring manual `gcc_commit` calls. Hooks fire at specific lifecycle events in a Claude Code session.
+CCR uses agent lifecycle hooks to automatically track work and commit to memory without requiring manual `gcc_commit` calls. Claude Code and Kimi use their native prompt/tool/compact/stop hooks. Codex uses native prompt/stop hooks plus the `codex-ccr` wrapper for process start/exit finalization.
 
 Three hooks work together as a pipeline:
 
-1. **UserPromptSubmit** -- Initializes session, injects context and playbook.
-2. **PostToolUse** -- Silently accumulates file edits, test runs, and git operations.
+1. **UserPromptSubmit / SessionStart** -- Initializes session, injects context and playbook. Codex retrieves the same memory but prints only a short summary because hook stdout is visible in Codex.
+2. **PostToolUse** -- Silently accumulates file edits, test runs, and git operations. Enabled for Claude Code/Kimi and opt-in for Codex.
 3. **Stop** -- Auto-commits accumulated state if meaningful progress was detected.
 
-An additional **PreCompact** hook reminds Claude Code to commit before context window compaction.
+An additional **PreCompact** hook reminds Claude Code/Kimi to commit before context window compaction. Codex has no native PreCompact hook, so CCR simulates this with prompt-time reminders when accumulated context is large. Codex does not install high-frequency `PostToolUse` tracking by default because Codex surfaces hook activity during normal tool use; set `CCR_CODEX_POST_TOOL_USE=1` during install to opt in. Codex lifecycle hooks are installed without visible status labels, and Codex is instructed to call `gcc_commit` only after meaningful milestones, before likely context loss, or when the user explicitly asks.
 
 ## How It Works
 
@@ -38,20 +38,23 @@ On **subsequent prompts** in the same session:
 
 File: `ccr/hooks/on_tool_use.py`
 
-Fires after every tool use. **Silent** -- produces no stdout. Reads tool context from `CLAUDE_TOOL_NAME` and `CLAUDE_TOOL_INPUT` environment variables.
+Fires after every tool use. **Silent** -- produces no stdout. Reads native JSON hook payloads first, with `CLAUDE_TOOL_NAME` and `CLAUDE_TOOL_INPUT` environment variables as a compatibility fallback.
 
 Detects and accumulates:
 
 | Tool | Detection | What is recorded |
 |------|-----------|-----------------|
 | `Write`, `Edit` | `file_path` in input | File path added to `files_touched` |
+| `apply_patch` | patch file headers | File paths added to `files_touched` |
 | `Bash` (pytest) | `"pytest"` in command | `"Ran tests"` in `what_accumulated` |
 | `Bash` (git commit) | `cmd.startswith("git commit")` | `"Git commit"` |
 | `Bash` (git *) | `cmd.startswith("git ")` | `"Git: {subcommand}"` |
 
+Codex command tools such as `exec_command`, `shell`, and `unified_exec` are normalized into the same shell-command detection path.
+
 Appends each event to `.ccr/.session_state.json` via `state_accumulator.append_tool_use()`.
 
-### Auto-Commit on Stop
+### Auto-Commit on Stop / Codex Wrapper Exit
 
 File: `ccr/hooks/on_stop.py`
 
@@ -63,6 +66,8 @@ Fires when Claude Code session ends. Reads accumulated session state and auto-co
 - If not meaningful: logs a clean session-end OTA triple.
 - Always clears session state file on exit.
 - **Session Logger finalization**: reads `.ccr/.current_session_id`, sets `ended_at` on the session row in `sessions.db`, then deletes `.current_session_id`. Also deletes `.ccr/.pending_user_msg` if it exists (cleanup for any unread buffered prompt). Both operations are non-fatal — a failure here never blocks session termination.
+
+Codex native `Stop` is turn-scoped. `ccr/hooks/codex_stop.py` saves meaningful turn progress while preserving session metrics; `codex-ccr` finalizes the overall session, reconciles Codex JSONL transcript turns, and cleans up session markers when the Codex process exits.
 
 ### Pre-Compact Reminder
 

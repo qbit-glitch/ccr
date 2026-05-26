@@ -23,8 +23,10 @@ def _check_stale_hook_paths(hooks: dict) -> list[str]:
     """
     _CCR_HOOK_SCRIPTS = {
         "on_session_start.py",
+        "on_user_prompt_submit.py",
         "on_tool_use.py",
         "on_stop.py",
+        "codex_stop.py",
         "on_compact.py",
     }
     warnings: list[str] = []
@@ -42,12 +44,20 @@ def _check_stale_hook_paths(hooks: dict) -> list[str]:
                 parts = shlex.split(cmd)
             except ValueError:
                 parts = cmd.split()
-            # Format: CCR_PROJECT_ROOT=... python_exe script_path [args...]
-            if len(parts) < 3:
+            # Format: one or more VAR=value prefixes, then python_exe script_path.
+            # Newer installs add CCR_STORAGE_BACKEND=... beside CCR_PROJECT_ROOT.
+            first_command_part = 0
+            for idx, part in enumerate(parts):
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", part):
+                    first_command_part = idx + 1
+                    continue
+                break
+
+            if len(parts) < first_command_part + 2:
                 continue
 
-            python_exe = parts[1]
-            hook_script = parts[2]
+            python_exe = parts[first_command_part]
+            hook_script = parts[first_command_part + 1]
 
             missing: list[str] = []
             if not os.path.isfile(python_exe):
@@ -110,6 +120,20 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     else:
         issues.append(".mcp.json not found — CCR MCP server not registered")
 
+    local_settings = os.path.join(project, ".claude", "settings.local.json")
+    if os.path.isfile(local_settings):
+        try:
+            with open(local_settings, encoding="utf-8") as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks", {})
+            stale_hook_warnings = _check_stale_hook_paths(hooks)
+            if stale_hook_warnings:
+                issues.extend(stale_hook_warnings)
+            elif hooks:
+                ok_items.append("Hook paths valid")
+        except (json.JSONDecodeError, OSError):
+            issues.append("Could not read .claude/settings.local.json")
+
     # 4. ONNX semantic search (optional feature — demoted to notice)
     try:
         import onnxruntime  # noqa: F401
@@ -133,7 +157,7 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
     except ImportError:
         notices.append("Vector store not installed (optional) — pip install 'ccr-memory[vector]'")
 
-    # 7. Adapter status checks — per-agent CCR configuration
+    # 7. Adapter status checks — per-agent CCR configuration + per-adapter health
     any_hooks_found = False
     for adapter in all_adapters:
         status = adapter.status()
@@ -151,6 +175,36 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
                 f"{adapter.display_name} installed but CCR not configured — "
                 f"run 'ccr install-global --agents {adapter.name}'"
             )
+
+        # Run adapter-specific health checks only when CCR is at least partly
+        # configured — for unconfigured agents the existing "installed but CCR
+        # not configured" notice above is already enough; running health_check
+        # would duplicate the same warnings.
+        if not status.ccr_enabled:
+            continue
+        try:
+            findings = adapter.health_check()
+        except Exception as exc:  # pragma: no cover - defensive
+            issues.append(
+                f"{adapter.display_name}: health_check raised {exc.__class__.__name__}: {exc}"
+            )
+            continue
+        for finding in findings:
+            label = f"{adapter.display_name}"
+            text = f"{label}: {finding.message}"
+            if finding.fix:
+                text += f"\n         fix: {finding.fix}"
+            severity = (finding.severity or "").lower()
+            if severity == "error":
+                issues.append(text)
+            elif severity == "warn":
+                notices.append(text)
+            elif severity == "ok":
+                # Suppress duplicate "MCP/hooks configured" rollups since the
+                # adapter status block already reports those at a higher level.
+                continue
+            else:
+                notices.append(text)
 
     # Session logging summary
     if any_hooks_found:
@@ -241,6 +295,68 @@ def _run_doctor_checks(project: str) -> tuple[list[str], list[str], list[str]]:
                         "Stale .session_active marker found — delete it: "
                         f"rm {session_active}"
                     )
+
+    return ok_items, issues, notices
+
+
+def _run_enterprise_checks(project: str) -> tuple[list[str], list[str], list[str]]:
+    """Run industry-adoption checks that are stricter than default doctor."""
+    ok_items: list[str] = []
+    issues: list[str] = []
+    notices: list[str] = []
+    project = os.path.abspath(project)
+    ccr_dir = os.path.join(project, ".ccr")
+    if not os.path.isdir(ccr_dir):
+        return ok_items, [".ccr/ not found — run 'ccr init'"], notices
+
+    try:
+        from ccr.core.ops import verify_project
+        report = verify_project(project)
+        if report.ok:
+            ok_items.append("Enterprise verify: memory files and SQLite integrity checks passed")
+        else:
+            issues.extend(f"Enterprise verify: {i}" for i in report.issues)
+    except Exception as exc:
+        issues.append(f"Enterprise verify failed: {type(exc).__name__}: {exc}")
+
+    try:
+        from ccr.core.governance import scan_memory_tree, load_policy
+        findings = scan_memory_tree(ccr_dir)
+        if findings:
+            issues.append(f"Governance scan found {len(findings)} secret/PII finding(s)")
+        else:
+            ok_items.append("Governance scan: no secret/PII findings in .ccr text memory")
+        policy = load_policy(ccr_dir)
+        if policy.project_boundary:
+            ok_items.append("Governance policy has a project boundary")
+        else:
+            notices.append("Governance policy not initialized — run 'ccr governance init'")
+    except Exception as exc:
+        issues.append(f"Governance scan failed: {type(exc).__name__}: {exc}")
+
+    try:
+        import platform
+        if platform.system().lower() == "windows":
+            ok_items.append("Running on Windows")
+        else:
+            notices.append(
+                "Windows compatibility not verified on this host; run this command on Windows "
+                "or in CI before enterprise release"
+            )
+    except Exception:
+        pass
+
+    browser_path = os.path.join(ccr_dir, "browser", "index.html")
+    if os.path.isfile(browser_path):
+        ok_items.append("Memory browser artifact exists")
+    else:
+        notices.append("Memory browser not generated — run 'ccr browser'")
+
+    backup_dir = os.path.join(ccr_dir, "backups")
+    if os.path.isdir(backup_dir) and any(n.endswith(".zip") for n in os.listdir(backup_dir)):
+        ok_items.append("At least one CCR backup exists")
+    else:
+        notices.append("No CCR backup found — run 'ccr backup'")
 
     return ok_items, issues, notices
 
@@ -361,13 +477,19 @@ def _fix_duplicate_hooks(project: str) -> list[str]:
 @click.command()
 @click.argument("project", default=".")
 @click.option("--fix", is_flag=True, help="Auto-fix detected issues (stale hooks, corrupt DB, etc.)")
-def doctor(project: str, fix: bool) -> None:
+@click.option("--enterprise", is_flag=True, help="Run stricter governance/reliability checks.")
+def doctor(project: str, fix: bool, enterprise: bool) -> None:
     """Diagnose CCR health and configuration issues.
 
     Use --fix to auto-repair: stale hook paths, duplicate hooks,
     stale session markers, and SQLite integrity/FTS issues.
     """
     ok_items, issues, notices = _run_doctor_checks(project)
+    if enterprise:
+        e_ok, e_issues, e_notices = _run_enterprise_checks(project)
+        ok_items.extend(e_ok)
+        issues.extend(e_issues)
+        notices.extend(e_notices)
 
     click.echo("CCR Doctor\n")
     for item in ok_items:

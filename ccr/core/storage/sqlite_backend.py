@@ -396,6 +396,7 @@ class SqliteStorageBackend(
         self._ensure_phase3a_tables()
         self._ensure_phase3b_tables()
         self._ensure_phase3c_tables()
+        self._sync_flat_file_commits()
 
         # Phase 2: install FTS5 virtual tables + triggers (graceful if FTS5 missing)
         self._fts_available: bool = install_fts5(self.memory_conn)
@@ -461,6 +462,29 @@ class SqliteStorageBackend(
                     )
             except Exception as exc:
                 logger.warning("Phase 5a global migration failed: %s", exc)
+
+    def _sync_flat_file_commits(self) -> None:
+        """Incrementally backfill commits.md rows missing from memory.db.
+
+        The one-shot migration sentinel can be older than recent flat-file
+        commits when users flip CCR_STORAGE_BACKEND=sqlite later. Keep this
+        sync idempotent so SQLite startup never falls behind the canonical
+        commits.md files.
+        """
+        branches_dir = os.path.join(self.ccr_root, "branches")
+        if not os.path.isdir(branches_dir):
+            return
+        try:
+            from ccr.core.storage._migration_phase3 import _migrate_commits  # noqa: PLC0415
+
+            before = self.memory_conn.total_changes
+            with self.memory_conn:
+                _migrate_commits(self.ccr_root, self.memory_conn)
+            inserted = self.memory_conn.total_changes - before
+            if inserted:
+                logger.info("Synced %d flat-file commit row changes into SQLite", inserted)
+        except Exception as exc:
+            logger.warning("SQLite flat-file commit sync failed: %s", exc)
 
     def _ensure_phase1_tables(self) -> None:
         self.memory_conn.executescript(_PHASE1_TABLES)

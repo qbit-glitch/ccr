@@ -2,21 +2,21 @@
 
 ## Overview
 
-The Session Logger persists every Q&A turn — user message plus Claude's full response — to `.ccr/sessions.db` (SQLite). Data is scoped per-project, stored alongside the rest of CCR's state. The three primary use cases are: replaying past sessions to understand what was decided and why, debugging unexpected Claude behaviour by examining the exact context at each turn, and exporting conversation pairs for fine-tuning or evaluation.
+The Session Logger persists every Q&A turn — user message plus the agent's full response — to `.ccr/sessions.db` (SQLite). Data is scoped per-project, stored alongside the rest of CCR's state. The three primary use cases are: replaying past sessions to understand what was decided and why, debugging unexpected agent behaviour by examining the exact context at each turn, and exporting conversation pairs for fine-tuning or evaluation.
 
 ## How It Works
 
 ### Turn capture pipeline
 
-1. **UserPromptSubmit hook** (`ccr/hooks/on_session_start.py`): Fires at the start of every prompt. On the first prompt of a session it creates a new row in `sessions.db` and writes the session ID to `.ccr/.current_session_id`. On every prompt (first and subsequent) it writes the user's message to `.ccr/.pending_user_msg` using an atomic write (`tmp` file + `os.replace`).
+1. **Prompt/session hooks** (`ccr/hooks/on_session_start.py`, `ccr/hooks/on_user_prompt_submit.py`): On the first prompt or native Codex `SessionStart`, CCR creates a new row in `sessions.db` and writes the session ID to `.ccr/.current_session_id`. On every prompt it writes the user's message to `.ccr/.pending_user_msg` using an atomic write (`tmp` file + `os.replace`).
 
-2. **`session_log_turn` MCP tool** (`ccr/mcp/session_tools.py`): Claude calls this after composing each response. The tool reads `.ccr/.pending_user_msg` (consuming and deleting it), pairs it with the `assistant_message` argument, and inserts a row into the `turns` table. Turn numbers are assigned under a threading write lock to prevent concurrent-insert races. If no active session ID is found in memory, the tool reads `.ccr/.current_session_id` from disk; if that is also absent it creates a transient session so no data is silently dropped.
+2. **`session_log_turn` MCP tool** (`ccr/mcp/session_tools.py`): The agent may call this after composing each response. The tool reads `.ccr/.pending_user_msg` (consuming and deleting it), pairs it with the `assistant_message` argument, and inserts a row into the `turns` table. Turn numbers are assigned under a threading write lock to prevent concurrent-insert races. If no active session ID is found in memory, the tool reads `.ccr/.current_session_id` from disk; if that is also absent it creates a transient session so no data is silently dropped.
 
-3. **Stop hook** (`ccr/hooks/on_stop.py`): Fires when the Claude Code session ends. Reads `.ccr/.current_session_id`, sets `ended_at` on the session row, then deletes both `.current_session_id` and `.pending_user_msg`.
+3. **Stop/finalization** (`ccr/hooks/on_stop.py`, `ccr/hooks/codex_stop.py`, `ccr/cli_codex.py`): Claude/Kimi finalize on session `Stop`. Codex native `Stop` is turn-scoped, so `codex_stop.py` saves meaningful turn progress and records the latest transcript path; `codex-ccr` finalizes the DB session and reconciles Codex JSONL transcript turns when the Codex process exits.
 
 ### Reliability note
 
-> Session turns are logged when Claude calls `session_log_turn`. In practice this happens automatically via the `<MANDATORY_CCR_ACTIONS>` directive injected by the UserPromptSubmit hook. If Claude is heavily context-constrained, some turns may be missed. Missed turns appear as gaps in `session_get_history()` — `turn_number` values are sequential, so a jump from turn 3 to turn 5 means turn 4 was not logged.
+> Session turns are logged either by `session_log_turn` or by transcript reconciliation. If an agent is heavily context-constrained, some direct calls may be missed; Stop/finalization hooks insert missing transcript turns where the agent exposes a transcript path. Missed turns appear as gaps in `session_get_history()` — `turn_number` values are sequential, so a jump from turn 3 to turn 5 means turn 4 was not logged.
 
 ### Storage details
 
@@ -123,7 +123,10 @@ session_fts_enabled: bool = True       # set False to skip FTS5 table creation
 | `ccr/core/session_store.py` | `SessionStore` class — all DB logic |
 | `ccr/mcp/session_tools.py` | Four MCP tools wrapping `SessionStore` |
 | `ccr/hooks/on_session_start.py` | Creates DB session + buffers user prompt |
+| `ccr/hooks/on_user_prompt_submit.py` | Buffers Codex prompts + prompt-time reminders |
 | `ccr/hooks/on_stop.py` | Finalizes session + cleans up temp files |
+| `ccr/hooks/codex_stop.py` | Codex turn-level auto-save + transcript-path capture |
+| `ccr/cli_codex.py` | `codex-ccr` process wrapper + Codex session finalization |
 | `.ccr/sessions.db` | SQLite database (per-project) |
 | `.ccr/.current_session_id` | Active session ID (deleted on Stop) |
 | `.ccr/.pending_user_msg` | Buffered user prompt (consumed by `session_log_turn`) |

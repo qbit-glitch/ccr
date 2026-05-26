@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1.0",
+    "cryptography>=42.0.0",
     "pyyaml>=6.0",
     "mcp[cli]>=1.0.0",
 ]
@@ -66,6 +67,7 @@ full = [
 ccr = "ccr.cli:cli"
 ccr-mcp = "ccr.mcp_server:main"
 ccr-agent = "ccr.cli:cli"
+codex-ccr = "ccr.cli_codex:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

@@ -97,6 +97,31 @@ class GccScratchpadResult(TypedDict):
     message: str
 
 
+class GccRecallResult(TypedDict):
+    query: str
+    answer: str
+    confidence: float
+    evidence: list[dict]
+    stale_notes: list[str]
+    conflict_notes: list[str]
+    plan: NotRequired[dict]
+    trace_id: NotRequired[str]
+    message: str
+
+
+class GccFactsResult(TypedDict):
+    action: str
+    count: int
+    facts: list[dict]
+    message: str
+
+
+class GccConflictsResult(TypedDict):
+    count: int
+    conflicts: list[dict]
+    message: str
+
+
 # ===========================================================================
 # ACE Playbook Tools
 # ===========================================================================

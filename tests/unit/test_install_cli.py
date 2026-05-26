@@ -36,6 +36,7 @@ class TestInstallWritesMcpJson:
         assert ccr_entry["command"] == sys.executable
         assert "-m" in ccr_entry["args"]
         assert "ccr.mcp_server" in ccr_entry["args"]
+        assert ccr_entry["env"]["CCR_STORAGE_BACKEND"] == "sqlite"
 
     def test_install_merges_existing_mcp_json(self, project):
         """Existing servers in .mcp.json are preserved."""
@@ -110,6 +111,7 @@ class TestInstallWritesAllFourHooks:
             ), (
                 f"{event} hook missing CCR_PROJECT_ROOT prefix: {cmd!r}"
             )
+            assert "CCR_STORAGE_BACKEND=sqlite" in cmd
 
 
 class TestInstallIdempotent:

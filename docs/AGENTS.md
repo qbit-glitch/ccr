@@ -8,6 +8,7 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 |-------|:---:|:-----:|:-----:|--------|------|-----------------|
 | **Claude Code** | ✅ | ✅ JSON | 5 (Full) | ✅ Verified | $20/mo Pro or API key | `ccr install-global --agents claude-code` |
 | **Kimi Code CLI** | ✅ | ✅ TOML | 5 (Full) | ✅ Verified | Free tier | `ccr install-global --agents kimi` |
+| **Codex CLI** | ✅ | ✅ TOML + wrapper | 5 (Full) | ✅ Verified | OpenAI account/API | `ccr install-global --agents codex` |
 | **Continue** | ✅ | ❌ | 4 (MCP) | 🧪 Experimental | LLM backend costs* | `ccr install-global --agents continue-dev` |
 | **Ollama** | ❌ | ❌ | 3 (File) | 🧪 Experimental | Free (needs RAM/GPU) | `ccr install-global --agents ollama` |
 | **OpenAI API** | ❌ | ❌ | 2 (SDK) | 🧪 Experimental | Pay-per-token | `ccr install-global --agents openai` |
@@ -24,9 +25,9 @@ CCR integrates with AI agents through a pluggable adapter architecture. Each age
 ## Integration Levels
 
 ### Level 5 — MCP + Hooks (Full Experience)
-The agent calls CCR tools via MCP, and CCR automatically injects context via lifecycle hooks. Zero manual work.
+The agent calls CCR tools via MCP, and CCR automatically injects context via lifecycle hooks. Codex uses `codex-ccr` for process start/exit lifecycle parity because native Codex `Stop` is turn-scoped.
 
-**Supported agents:** Claude Code, Kimi Code CLI
+**Supported agents:** Claude Code, Kimi Code CLI, Codex CLI
 
 ### Level 4 — MCP Only (Tool Access)
 The agent calls CCR tools via MCP. You must manually call `gcc_context()` when you want memory loaded.
@@ -81,6 +82,35 @@ ccr install-global --agents continue-dev
 Then reload Continue in your IDE. CCR tools will appear in the MCP tools panel. Call `gcc_context(level=2)` manually when you want memory loaded.
 
 > Note: The extension is called **"Continue"** in the VS Code marketplace (not "Continue.dev"). Visit [continue.dev](https://continue.dev) for installation instructions.
+
+### Codex CLI
+
+```bash
+ccr install-global --agents codex
+```
+
+This writes `~/.codex/config.toml` with a global `[mcp_servers.ccr]` entry plus silent Codex-native hooks:
+
+- `SessionStart` retrieves full CCR memory and exposes only a 1-2 line summary because Codex shows hook stdout
+- `UserPromptSubmit` records prompts and adds lightweight reminders
+- `Stop` auto-saves meaningful turn progress without finalizing the whole Codex session
+
+Generated CCR MCP and hook configs set `CCR_STORAGE_BACKEND=sqlite`, so MCP
+tools, hook saves, playbooks, and wrapper lifecycle state use the same SQLite
+database by default. Manual use with the env var unset keeps the file backend
+for backward compatibility.
+
+By default, Codex does not install the high-frequency `PostToolUse` hook because
+Codex surfaces hook activity during normal tool use. Codex is instructed to call
+`gcc_commit` only after meaningful milestones, before likely context loss, or
+when the user explicitly asks to save/update CCR memory. If you want continuous
+tool tracking anyway, run:
+
+```bash
+CCR_CODEX_POST_TOOL_USE=1 ccr install-global --agents codex
+```
+
+It also creates `~/.ccr/bin/codex-ccr`, which launches Codex with `CCR_PROJECT_ROOT` and finalizes the CCR session when Codex exits. Run `codex-ccr` from any project directory for full lifecycle parity. Plain `codex` still gets MCP tools and native hooks, but not wrapper exit finalization.
 
 ### Ollama
 

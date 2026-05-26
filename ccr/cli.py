@@ -208,6 +208,85 @@ def context(project: str, level: int) -> None:
     click.echo(mem.get_context(level=level))
 
 
+@cli.command("memory-eval")
+@click.option("--project", "-p", default=".", help="Project root directory")
+@click.option("--suite", default="smoke",
+              type=click.Choice(["smoke", "temporal", "v2"]),
+              help="Eval suite to run.")
+@click.option("--report", default="text",
+              type=click.Choice(["text", "json", "html"]),
+              help="Report format.")
+@click.option("--limit", default=10, type=int, help="Maximum generated cases.")
+@click.option("--output", "-o", default="",
+              help="Optional output file. Defaults to .ccr/reports for html/json.")
+@click.option("--min-accuracy", default=0.0, type=float,
+              help="Minimum overall accuracy required for CI mode.")
+@click.option("--min-citation-accuracy", default=0.0, type=float,
+              help="Minimum accuracy for citation-oriented cases in CI mode.")
+@click.option("--min-conflict-accuracy", default=0.0, type=float,
+              help="Minimum accuracy for conflict-detection cases in CI mode.")
+@click.option("--ci", is_flag=True, help="Exit non-zero when thresholds are not met.")
+def memory_eval(
+    project: str,
+    suite: str,
+    report: str,
+    limit: int,
+    output: str,
+    min_accuracy: float,
+    min_citation_accuracy: float,
+    min_conflict_accuracy: float,
+    ci: bool,
+) -> None:
+    """Run local evidence-recall checks against project CCR memory."""
+    from ccr.core.memory_eval import MemoryEvalRunner
+
+    project = os.path.abspath(project)
+    ccr_dir = os.path.join(project, ".ccr")
+    if not os.path.isdir(ccr_dir):
+        click.echo("No .ccr/ found. Run 'ccr init' first.", err=True)
+        sys.exit(1)
+
+    runner = MemoryEvalRunner(project)
+    thresholds = {}
+    if min_accuracy > 0:
+        thresholds["accuracy"] = min(1.0, max(0.0, min_accuracy))
+    if min_citation_accuracy > 0:
+        thresholds["commit-citation"] = min(1.0, max(0.0, min_citation_accuracy))
+        thresholds["fact-citation"] = min(1.0, max(0.0, min_citation_accuracy))
+    if min_conflict_accuracy > 0:
+        thresholds["conflict-detection"] = min(1.0, max(0.0, min_conflict_accuracy))
+    eval_report = runner.run(suite=suite, limit=limit, thresholds=thresholds)
+
+    if report == "json":
+        import json as _json
+        content = _json.dumps(eval_report.to_dict(), indent=2)
+        suffix = "json"
+    elif report == "html":
+        content = eval_report.to_html()
+        suffix = "html"
+    else:
+        content = eval_report.to_markdown()
+        suffix = "txt"
+
+    if output or report in {"json", "html"}:
+        if output:
+            out_path = os.path.abspath(output)
+        else:
+            reports_dir = os.path.join(ccr_dir, "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            stamp = eval_report.generated_at.replace(":", "").replace("+", "Z")
+            out_path = os.path.join(reports_dir, f"memory_eval_{suite}_{stamp}.{suffix}")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.write("\n")
+        click.echo(f"Memory eval: {eval_report.passed}/{eval_report.total} passed ({eval_report.accuracy:.1%})")
+        click.echo(f"Report written to {out_path}")
+    else:
+        click.echo(content)
+    if ci and not eval_report.meets_thresholds:
+        sys.exit(1)
+
+
 @cli.command()
 @click.argument("project", default=".")
 def index(project: str) -> None:
@@ -279,19 +358,19 @@ def install(project: str, preset: str) -> None:
     hook_config = {
         "UserPromptSubmit": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
         }],
         "PostToolUse": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
         }],
         "Stop": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
         }],
         "PreCompact": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} {_python_q} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
         }],
     }
 
@@ -342,6 +421,7 @@ def install(project: str, preset: str) -> None:
     existing_mcp["mcpServers"]["ccr"] = {
         "command": python_exe,
         "args": ["-m", "ccr.mcp_server", "--project", project],
+        "env": {"CCR_STORAGE_BACKEND": "sqlite"},
     }
 
     with open(mcp_json_path, "w", encoding="utf-8") as f:
@@ -361,16 +441,16 @@ def install(project: str, preset: str) -> None:
 
     click.echo(f"\n\u2705 CCR installed in {project}  [preset: {preset}]")
     click.echo(f"\n  Hooks ({claude_dir}/settings.local.json):")
-    click.echo(f"    UserPromptSubmit \u2192 injects memory context at session start")
-    click.echo(f"    PostToolUse      \u2192 tracks tool calls for auto-commit")
-    click.echo(f"    Stop             \u2192 auto-commits session progress on exit")
-    click.echo(f"    PreCompact       \u2192 saves state before context resets")
+    click.echo("    UserPromptSubmit \u2192 injects memory context at session start")
+    click.echo("    PostToolUse      \u2192 tracks tool calls for auto-commit")
+    click.echo("    Stop             \u2192 auto-commits session progress on exit")
+    click.echo("    PreCompact       \u2192 saves state before context resets")
     click.echo(f"\n  MCP server ({mcp_json_path}):")
     click.echo(f"    ccr \u2192 {python_exe} -m ccr.mcp_server")
     # Run doctor inline to confirm install succeeded
-    click.echo(f"\n=== Install verification ===")
+    click.echo("\n=== Install verification ===")
     click.echo(f"  \u2705 CCR_PROJECT_ROOT={project} baked into hook commands.")
-    click.echo(f"     Hooks will work regardless of which directory Claude Code is launched from.")
+    click.echo("     Hooks will work regardless of which directory Claude Code is launched from.")
     try:
         from ccr.cli_doctor import _run_doctor_checks  # noqa: PLC0415
         ok_items, issues, notices = _run_doctor_checks(project)
@@ -383,22 +463,22 @@ def install(project: str, preset: str) -> None:
         if issues:
             click.echo(f"\n  {len(issues)} issue(s) found — fix before opening Claude Code.")
         else:
-            click.echo(f"\n  All checks passed.")
+            click.echo("\n  All checks passed.")
     except Exception:
-        click.echo(f"  (Run 'ccr doctor' to verify installation)")
+        click.echo("  (Run 'ccr doctor' to verify installation)")
 
-    click.echo(f"\n=== Next step ===")
-    click.echo(f"  Open Claude Code in any terminal:")
-    click.echo(f"    claude")
-    click.echo(f"  or from the project directory:")
+    click.echo("\n=== Next step ===")
+    click.echo("  Open Claude Code in any terminal:")
+    click.echo("    claude")
+    click.echo("  or from the project directory:")
     click.echo(f"    cd {project} && claude")
-    click.echo(f"")
-    click.echo(f"  Quick test — ask Claude:")
-    click.echo(f'    "What do you remember about this project?"')
-    click.echo(f"    Then call: gcc_status()")
-    click.echo(f"")
-    click.echo(f"  Other useful commands:")
-    click.echo(f"    ccr export-context   — export memory for claude.ai (web) sessions")
+    click.echo("")
+    click.echo("  Quick test — ask Claude:")
+    click.echo('    "What do you remember about this project?"')
+    click.echo("    Then call: gcc_status()")
+    click.echo("")
+    click.echo("  Other useful commands:")
+    click.echo("    ccr export-context   — export memory for claude.ai (web) sessions")
 
 
 @cli.command()
@@ -413,8 +493,6 @@ def uninstall(project: str, yes: bool) -> None:
     settings_path = os.path.join(claude_dir, "settings.local.json")
     mcp_json_path = os.path.join(project, ".mcp.json")
 
-    changes = []
-
     # Check what will be removed
     hooks_to_remove = []
     if os.path.isfile(settings_path):
@@ -422,7 +500,6 @@ def uninstall(project: str, yes: bool) -> None:
             with open(settings_path, "r", encoding="utf-8") as f:
                 existing = _json.loads(f.read())
             for event, cmds in existing.get("hooks", {}).items():
-                kept = [c for c in cmds if "ccr" not in c.get("command", "")]
                 removed = [c for c in cmds if "ccr" in c.get("command", "")]
                 if removed:
                     hooks_to_remove.extend([(event, c) for c in removed])
@@ -448,7 +525,7 @@ def uninstall(project: str, yes: bool) -> None:
         click.echo(f"  Hook [{event}]: {cmd.get('command', '')}")
     if mcp_entry_exists:
         click.echo(f"  MCP server: ccr entry from {mcp_json_path}")
-    click.echo(f"  Memory (.ccr/) will NOT be touched.")
+    click.echo("  Memory (.ccr/) will NOT be touched.")
 
     if not yes:
         click.confirm("Proceed?", abort=True)
@@ -512,7 +589,6 @@ def clean(project: str, days: int, dry_run: bool, yes: bool) -> None:
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from ccr.core.memory import MemoryManager
-    from ccr.core.types import CCRConfig
 
     mem = MemoryManager(project, CCRConfig())
     branch = mem.get_active_branch()
@@ -644,7 +720,7 @@ def agents_list():
         )
         click.echo(f"  {adapter.display_name:<20} {installed:<18} {ccr} ({level_name})")
 
-    click.echo(f"\n  Run 'ccr agents info <name>' for details on a specific agent.")
+    click.echo("\n  Run 'ccr agents info <name>' for details on a specific agent.")
 
 
 @agents.command("info")
@@ -666,8 +742,177 @@ def agents_info(name: str):
     click.echo(f"  Hooks support:  {adapter.supports_hooks()}")
     click.echo(f"  Integration:    {status.integration_level}")
     click.echo(f"  Context format: {adapter.context_format()}")
-    click.echo(f"\n  Install command:")
+    click.echo("\n  Install command:")
     click.echo(f"    ccr install-global --agents {adapter.name}")
+
+
+def _print_health_findings(display_name: str, findings: list) -> tuple[int, int, int]:
+    """Pretty-print health findings for a single agent. Returns (oks, warns, errors)."""
+    ok_count = warn_count = err_count = 0
+    if not findings:
+        click.echo(f"  {display_name}: no findings")
+        return 0, 0, 0
+    click.echo(f"\n  {display_name}:")
+    for f in findings:
+        sev = (f.severity or "").lower()
+        if sev == "ok":
+            click.echo(f"    [OK] {f.message}")
+            ok_count += 1
+        elif sev == "info":
+            click.echo(f"    [--] {f.message}")
+        elif sev == "warn":
+            click.echo(f"    [!]  {f.message}")
+            warn_count += 1
+        elif sev == "error":
+            click.echo(f"    [!!] {f.message}")
+            err_count += 1
+        else:
+            click.echo(f"    [?]  {f.message}")
+        if f.fix:
+            click.echo(f"         fix: {f.fix}")
+    return ok_count, warn_count, err_count
+
+
+_AGENTS_DOCTOR_JSON_VERSION = 1
+
+
+def _findings_to_json(adapter, findings: list) -> dict:
+    """Convert a list of HealthIssue into a serializable dict."""
+    counts = {"ok": 0, "info": 0, "warn": 0, "error": 0}
+    items: list[dict] = []
+    for f in findings:
+        sev = (f.severity or "").lower()
+        if sev not in counts:
+            sev = "info"
+        counts[sev] += 1
+        items.append({"severity": sev, "message": f.message, "fix": f.fix})
+    return {
+        "name": adapter.name,
+        "display_name": adapter.display_name,
+        "installed": adapter.is_installed(),
+        "supports_mcp": adapter.supports_mcp(),
+        "supports_hooks": adapter.supports_hooks(),
+        "counts": counts,
+        "findings": items,
+    }
+
+
+@agents.command("doctor")
+@click.argument("name", required=False)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit machine-readable JSON for CI consumption (stable schema).",
+)
+def agents_doctor(name: str | None, json_output: bool):
+    """Run per-adapter health checks. Use 'all' or omit name to check installed agents."""
+    from ccr.adapters import detect_installed, get_adapter, get_adapters
+
+    if name and name != "all":
+        adapter = get_adapter(name)
+        if not adapter:
+            if json_output:
+                import json as _json
+
+                click.echo(
+                    _json.dumps(
+                        {
+                            "schema_version": _AGENTS_DOCTOR_JSON_VERSION,
+                            "error": f"Unknown agent: {name}",
+                            "agents": [],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                click.echo(f"Unknown agent: {name}", err=True)
+            sys.exit(2)
+        adapters = [adapter]
+    elif name == "all":
+        adapters = get_adapters()
+    else:
+        adapters = detect_installed()
+        if not adapters:
+            if json_output:
+                import json as _json
+
+                click.echo(
+                    _json.dumps(
+                        {
+                            "schema_version": _AGENTS_DOCTOR_JSON_VERSION,
+                            "agents": [],
+                            "totals": {"ok": 0, "info": 0, "warn": 0, "error": 0},
+                            "message": "No supported agents detected",
+                        },
+                        indent=2,
+                    )
+                )
+                return
+            click.echo(
+                "No supported agents detected. Use 'ccr agents doctor all' to inspect every adapter.",
+                err=True,
+            )
+            return
+
+    if json_output:
+        import json as _json
+
+        agents_payload = []
+        totals = {"ok": 0, "info": 0, "warn": 0, "error": 0}
+        for adapter in adapters:
+            try:
+                findings = adapter.health_check()
+            except Exception as exc:
+                agents_payload.append(
+                    {
+                        "name": adapter.name,
+                        "display_name": adapter.display_name,
+                        "error": f"health_check raised {exc.__class__.__name__}: {exc}",
+                        "findings": [],
+                        "counts": {"ok": 0, "info": 0, "warn": 0, "error": 1},
+                    }
+                )
+                totals["error"] += 1
+                continue
+            entry = _findings_to_json(adapter, findings)
+            for k, v in entry["counts"].items():
+                totals[k] = totals.get(k, 0) + v
+            agents_payload.append(entry)
+
+        click.echo(
+            _json.dumps(
+                {
+                    "schema_version": _AGENTS_DOCTOR_JSON_VERSION,
+                    "agents": agents_payload,
+                    "totals": totals,
+                },
+                indent=2,
+            )
+        )
+        if totals.get("error", 0):
+            sys.exit(1)
+        return
+
+    click.echo("CCR Agent Health\n")
+    total_oks = total_warns = total_errs = 0
+    for adapter in adapters:
+        try:
+            findings = adapter.health_check()
+        except Exception as exc:
+            click.echo(f"\n  {adapter.display_name}: health_check raised {exc.__class__.__name__}: {exc}")
+            total_errs += 1
+            continue
+        oks, warns, errs = _print_health_findings(adapter.display_name, findings)
+        total_oks += oks
+        total_warns += warns
+        total_errs += errs
+
+    click.echo(
+        f"\n  {total_oks} OK, {total_warns} warning(s), {total_errs} error(s)"
+    )
+    if total_errs:
+        sys.exit(1)
 
 
 # doctor and stats live in submodules (split for 800-line compliance)
@@ -721,7 +966,10 @@ def _register_project(project_root: str) -> None:
     from datetime import datetime, timezone
 
     global_ccr = os.path.expanduser("~/.ccr")
-    os.makedirs(global_ccr, exist_ok=True)
+    try:
+        os.makedirs(global_ccr, exist_ok=True)
+    except OSError:
+        return
     registry_path = os.path.join(global_ccr, "projects.json")
 
     projects_list: list[dict] = []
@@ -748,16 +996,53 @@ def _register_project(project_root: str) -> None:
             "commit_count": 0,
         })
 
-    with open(registry_path, "w", encoding="utf-8") as f:
-        json.dump(projects_list, f, indent=2)
-        f.write("\n")
+    try:
+        with open(registry_path, "w", encoding="utf-8") as f:
+            json.dump(projects_list, f, indent=2)
+            f.write("\n")
+    except OSError:
+        return
 
 
 # Register export/import commands
 from ccr.cli_export import export as export_cmd  # noqa: E402
 from ccr.cli_import import import_cmd  # noqa: E402
+from ccr.cli_enterprise import (  # noqa: E402
+    backup,
+    browser,
+    conflicts,
+    encryption,
+    enterprise_gateway,
+    episodes,
+    governance,
+    migrate,
+    quarantine,
+    replay,
+    repair,
+    rerankers,
+    restore,
+    sync,
+    tiers,
+    verify,
+)
 cli.add_command(export_cmd)
 cli.add_command(import_cmd)
+cli.add_command(tiers)
+cli.add_command(browser)
+cli.add_command(backup)
+cli.add_command(restore)
+cli.add_command(verify)
+cli.add_command(repair)
+cli.add_command(migrate)
+cli.add_command(episodes)
+cli.add_command(quarantine)
+cli.add_command(conflicts)
+cli.add_command(replay)
+cli.add_command(encryption)
+cli.add_command(governance)
+cli.add_command(rerankers)
+cli.add_command(sync)
+cli.add_command(enterprise_gateway)
 
 # Register preset commands from cli_presets.py
 try:

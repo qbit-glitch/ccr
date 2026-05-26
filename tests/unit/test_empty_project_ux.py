@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -119,6 +119,30 @@ class TestHandleSessionStartEmptyProject(unittest.TestCase):
         mem = FakeMemNoCommits(self.tmp)
         output = self._run_session_start(mem)
         self.assertIn("gcc_commit", output)
+
+    def test_codex_project_with_commits_prints_compact_summary(self):
+        class FakeMemCodex(FakeMemWithCommits):
+            def get_context(self, level: int = 1) -> str:
+                return (
+                    "## Current Focus\n"
+                    "Codex CCR quiet lifecycle policy. Next: restart sessions.\n\n"
+                    "## Recent Milestones\n"
+                    "- [2026-04-26 16:31] (main) Codex CCR quiet lifecycle policy\n\n"
+                    "## Recent Commits\n"
+                    "## [C124] 2026-04-26 16:31 | branch:main | Codex CCR quiet lifecycle policy\n"
+                    "**What**: This raw context should not be printed.\n"
+                )
+
+        mem = FakeMemCodex(self.tmp)
+        with patch.dict(os.environ, {"CCR_HOOK_AGENT": "codex"}):
+            output = self._run_session_start(mem)
+
+        self.assertLessEqual(len(output.strip().splitlines()), 2)
+        self.assertIn("CCR retrieved full memory", output)
+        self.assertIn("Codex CCR quiet lifecycle policy", output)
+        self.assertNotIn("<gcc_context>", output)
+        self.assertNotIn("MANDATORY_CCR_ACTIONS", output)
+        self.assertNotIn("This raw context should not be printed", output)
 
 
 if __name__ == "__main__":

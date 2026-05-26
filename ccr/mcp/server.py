@@ -16,8 +16,6 @@ import logging
 import os
 import threading
 
-logger = logging.getLogger(__name__)
-
 from mcp.server.fastmcp import FastMCP
 
 from ccr.ace.playbook import Playbook
@@ -28,6 +26,8 @@ from ccr.core.triples import TripleStore
 from ccr.core.types import CCRConfig, PlaybookSchema
 from ccr.mcp.audit import configure_audit_log
 from ccr.utils.parsing import extract_json_string
+
+logger = logging.getLogger(__name__)
 
 # Default sub-model for optional Anthropic-backed features (non-critical path)
 _DEFAULT_SUB_MODEL = "claude-haiku-4-5-20251001"
@@ -76,6 +76,30 @@ mcp = FastMCP(
         "Call gcc_projects() to see other projects with CCR memory."
     ),
 )
+
+
+def _configure_stdio_logging(verbose: bool = False) -> None:
+    """Keep MCP stdio clean by default.
+
+    MCP transports use stdout/stdin for protocol messages, and many clients
+    surface stderr directly to users. INFO-level startup or request logs are
+    useful when debugging but too noisy for installed agents, so stdio defaults
+    to warnings/errors only.
+    """
+    level = logging.DEBUG if verbose else logging.WARNING
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(levelname)s:%(name)s:%(message)s",
+        )
+    for handler in root.handlers:
+        handler.setLevel(level)
+
+    for name in ("ccr", "mcp", "anyio"):
+        logging.getLogger(name).setLevel(level)
 
 
 def _get_sub_client() -> object | None:
@@ -138,11 +162,29 @@ def _init(project_root: str | None = None) -> None:
                 from ccr.core.storage.sqlite_backend import SqliteStorageBackend
                 _backend = SqliteStorageBackend(ccr_root)
                 _backend.close()
-                mig = auto_migrate(ccr_root, db_path)
+                migration_loggers = [
+                    "ccr.core.storage._migration_utils",
+                    "ccr.core.storage._migration_phase1",
+                    "ccr.core.storage._migration_phase2",
+                    "ccr.core.storage._migration_phase3",
+                    "ccr.core.storage.migration",
+                ]
+                old_levels: dict[str, int] = {}
+                quiet_migration = os.environ.get("CCR_MCP_VERBOSE", "").lower() not in {"1", "true", "yes"}
+                if quiet_migration:
+                    for name in migration_loggers:
+                        log = logging.getLogger(name)
+                        old_levels[name] = log.level
+                        log.setLevel(logging.WARNING)
+                try:
+                    mig = auto_migrate(ccr_root, db_path)
+                finally:
+                    for name, level in old_levels.items():
+                        logging.getLogger(name).setLevel(level)
                 if mig["errors"]:
                     logger.warning("Auto-migration errors: %s", mig["errors"])
                 else:
-                    logger.info(
+                    logger.debug(
                         "Auto-migrated %d records across phases %s",
                         mig["total_migrated"], mig["phases_run"],
                     )
@@ -310,6 +352,8 @@ def health_check() -> str:
         status["global_setup"]["claude"] = True
     if os.path.isfile(os.path.expanduser("~/.kimi/config.toml")):
         status["global_setup"]["kimi"] = True
+    if os.path.isfile(os.path.expanduser("~/.codex/config.toml")):
+        status["global_setup"]["codex"] = True
 
     return _json.dumps(status, indent=2)
 
@@ -621,8 +665,16 @@ def main():
         default=os.getcwd(),
         help="Project root directory (default: cwd)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable debug/INFO logs on stderr for MCP server diagnostics.",
+    )
     args = parser.parse_args()
 
+    env_verbose = os.environ.get("CCR_MCP_VERBOSE", "").strip().lower()
+    verbose = args.verbose or env_verbose in {"1", "true", "yes", "on", "debug"}
+    _configure_stdio_logging(verbose=verbose)
     _init(args.project)
 
     # Import tool modules to trigger @mcp.tool registration

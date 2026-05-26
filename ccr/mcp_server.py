@@ -39,6 +39,10 @@ from ccr.mcp.gcc_tools import (  # noqa: F401
     gcc_branch,
     gcc_merge,
     gcc_context,
+    gcc_recall,
+    gcc_facts,
+    gcc_conflicts,
+    gcc_conflicts_resolve,
     gcc_links,
     gcc_clusters,
     gcc_triples,
@@ -108,10 +112,8 @@ from ccr.mcp.session_tools import (  # noqa: F401
 # ---------------------------------------------------------------------------
 import sys as _sys
 import ccr.mcp.server as _server_mod
-import ccr.mcp.gcc_tools as _gcc_mod
 import ccr.mcp.ace_tools as _ace_mod
 import ccr.mcp.rlm_tools as _rlm_mod
-import ccr.mcp.index_tools as _index_mod
 
 # Mutable globals that tests read/write via `import ccr.mcp_server as mcp_mod`
 # Maps attribute name -> canonical module where it lives.

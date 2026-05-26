@@ -64,6 +64,8 @@ from ccr.rlm.sandbox_seatbelt import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+_SEATBELT_USABLE: bool | None = None
+
 
 # ---------------------------------------------------------------------------
 # Sandbox executor
@@ -119,6 +121,12 @@ class KernelSandbox:
 
         if self.sandbox_type == "seatbelt" and self.project_root:
             self._generate_profile()
+            if not self._seatbelt_runtime_usable():
+                logger.debug(
+                    "macOS sandbox-exec is present but blocked by this host. "
+                    "Falling back to subprocess-only isolation."
+                )
+                self.sandbox_type = "none"
         elif self.sandbox_type == "none":
             logger.warning(
                 "No kernel sandbox available on this platform. "
@@ -142,6 +150,52 @@ class KernelSandbox:
             os.write(fd, profile.encode("utf-8"))
         finally:
             os.close(fd)
+
+    def _seatbelt_runtime_usable(self) -> bool:
+        """Return whether sandbox-exec can actually apply profiles here.
+
+        Some macOS hosts expose sandbox-exec but reject sandbox_apply with
+        "Operation not permitted" (exit 71), especially inside nested/sandboxed
+        dev environments. Treat that as unavailable so normal REPL execution
+        remains functional and tests can still exercise the subprocess fallback.
+        """
+        global _SEATBELT_USABLE
+
+        if _SEATBELT_USABLE is not None:
+            return _SEATBELT_USABLE
+        if not self._profile_path:
+            _SEATBELT_USABLE = False
+            return False
+
+        python = os.path.realpath(self.python_executable)
+        try:
+            proc = subprocess.run(
+                [
+                    "sandbox-exec",
+                    "-f",
+                    self._profile_path,
+                    python,
+                    "-c",
+                    "print('ccr-seatbelt-ok')",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=min(max(self.timeout_seconds, 1.0), 5.0),
+                env=self._build_env(),
+                cwd=self.temp_dir,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            _SEATBELT_USABLE = False
+            return False
+
+        _SEATBELT_USABLE = proc.returncode == 0
+        if not _SEATBELT_USABLE:
+            logger.debug(
+                "sandbox-exec probe failed with code %s: %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout or "")[:300],
+            )
+        return _SEATBELT_USABLE
 
     def execute(
         self,

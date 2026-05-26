@@ -3,7 +3,7 @@
 > **Without CCR:** "Can you remind me what we decided about the dataset preprocessing last week?"  
 > **With CCR:** Your AI agent already knows — months of decisions, experiments, and code reasoning recalled instantly.
 
-CCR gives MCP-capable AI agents persistent project memory, strategy playbooks, and a sandboxed Python REPL. Full auto-context for **Claude Code** and **Kimi Code CLI**; MCP tools for **Continue.dev**; SDK wrappers for **Ollama** and **OpenAI API**. **macOS/Linux only** (Windows support is not yet implemented).
+CCR gives MCP-capable AI agents persistent project memory, strategy playbooks, and a sandboxed Python REPL. Full auto-context for **Claude Code**, **Kimi Code CLI**, and **Codex CLI** via `codex-ccr`; MCP tools for **Continue.dev**; SDK wrappers for **Ollama** and **OpenAI API**. **macOS/Linux only** (Windows support is not yet implemented).
 
 > **New to CCR?** See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blob/main/docs/quickstart-students.md) — setup in 3 minutes, before/after examples, PhD workflow guide.
 
@@ -27,6 +27,7 @@ ccr install-global
 # 3. Open your agent from any project directory — CCR handles the rest
 cd /your/project && claude   # or kimi, continue, ollama, etc.
 cd /your/project && kimi     # Kimi Code CLI (free tier)
+cd /your/project && codex-ccr # Codex with full CCR lifecycle
 ```
 
 That's it. Your agent will automatically load project memory on every session start and auto-commit progress when you finish — in **every directory** without per-project setup. Memory is stored per-project in `./.ccr/` and auto-initialized on first use.
@@ -41,7 +42,7 @@ CCR is an MCP server that gives AI agents three capabilities they don't have nat
 
 All core tools run with minimal overhead. The AI agent itself provides the reasoning; CCR provides the memory layer.
 
-**Works across agents** — Claude Code and Kimi share memory via hooks; Continue.dev via MCP; Ollama and OpenAI via SDK wrappers. The same `.ccr/` directory is readable by all.
+**Works across agents** — Claude Code, Kimi, and Codex share memory via hooks and wrappers; Continue.dev via MCP; Ollama and OpenAI via SDK wrappers. The same `.ccr/` directory is readable by all.
 
 ### For Researchers and Students
 
@@ -59,6 +60,7 @@ CCR is designed for long-running research projects where context loss is the mai
 |-------|------|-------|
 | Claude Code | $20/mo Pro or ~$2–8/mo API | Most capable; requires Claude Pro subscription or Anthropic API key |
 | Kimi Code CLI | Free tier | No payment required for basic usage |
+| Codex CLI | OpenAI account/API | Use `codex-ccr` for wrapper lifecycle plus native hooks and MCP tools |
 | Continue | Free extension | But LLM backends (OpenAI/Anthropic) require paid API keys |
 | Ollama | Free | Runs local models; needs RAM/GPU for larger models |
 | OpenAI API | Pay-per-token | No subscription, but every API call costs money |
@@ -72,19 +74,24 @@ See the [Student & Researcher Quickstart](https://github.com/qbit-glitch/ccr/blo
 Run once to enable CCR across **all** projects:
 
 ```bash
-ccr install-global              # Claude Code + Kimi (default)
+ccr install-global              # Claude Code + Kimi + Codex (default)
 ccr install-global --agents auto # Auto-detect all installed agents
 ```
 
 This configures:
 - **Claude Code** global MCP + hooks (`~/.claude/.mcp.json`, `~/.claude/settings.json`)
 - **Kimi Code CLI** global MCP + hooks (`~/.kimi/mcp.json`, `~/.kimi/config.toml`)
+- **Codex CLI** global MCP + hooks (`~/.codex/config.toml`)
 - **Continue.dev** MCP config (`~/.continue/config.json`)
 - **Ollama** wrapper script (`~/.ccr/bin/ollama-ccr`)
 - **OpenAI API** SDK wrapper + CLI prefix
 - Helper scripts in `~/.ccr/bin/` and shell aliases
 
-After installation, simply run your agent from any project directory. `.ccr/` is auto-created on first use.
+After installation, run your agent from any project directory. `.ccr/` is auto-created on first use. For Codex, use `codex-ccr` when you want the full CCR lifecycle wrapper; plain `codex` still gets the global MCP server and native hooks.
+
+Generated MCP and hook configs set `CCR_STORAGE_BACKEND=sqlite`, so CCR tools
+and lifecycle hooks use `.ccr/memory.db` by default while manual library use
+without that env var remains file-backed for compatibility.
 
 See [docs/AGENTS.md](docs/AGENTS.md) for per-agent setup details.
 
@@ -231,7 +238,7 @@ All implementations use mechanical heuristics where possible. See `CLAUDE.md` (p
 
 | Feature | CCR | Mem0 | Letta/MemGPT | Graphiti |
 |---------|-----|------|--------------|---------|
-| Auto-manages memory | Yes (Claude + Kimi hooks) | Yes | Yes | Yes |
+| Auto-manages memory | Yes (Claude + Kimi hooks, Codex wrapper/hooks) | Yes | Yes | Yes |
 | Multi-agent support | Yes (shared `.ccr/`) | No | No | No |
 | Version control (branch/merge) | Yes | No | No | No |
 | Playbooks with optional LLM evolution | Yes | No | No | No |

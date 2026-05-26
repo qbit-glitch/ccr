@@ -11,9 +11,6 @@ import click
 
 from ccr.adapters import (
     BaseAgentAdapter,
-    InstallResult,
-    UninstallResult,
-    detect_installed,
     get_adapter,
     get_adapters,
     list_adapter_names,
@@ -73,6 +70,8 @@ def _create_global_helpers(python_exe: str, hooks_dir: str, ccr_pkg: str, adapte
             _write_claude_ccr(bin_dir, python_exe, ccr_pkg)
         elif adapter.name == "kimi":
             _write_kimi_ccr(bin_dir, python_exe, ccr_pkg)
+        elif adapter.name == "codex":
+            _write_codex_ccr(bin_dir, python_exe)
 
     return bin_dir
 
@@ -127,6 +126,19 @@ def _write_kimi_ccr(bin_dir: str, python_exe: str, ccr_pkg: str) -> None:
     os.chmod(script, 0o755)
 
 
+def _write_codex_ccr(bin_dir: str, python_exe: str) -> None:
+    import shlex
+
+    script = os.path.join(bin_dir, "codex-ccr")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/bash\n"
+            "set -e\n"
+            f"exec {shlex.quote(python_exe)} -m ccr.cli_codex \"$@\"\n"
+        )
+    os.chmod(script, 0o755)
+
+
 def _update_shell_aliases() -> list[str]:
     """Add CCR aliases to shell profiles. Returns list of modified files."""
     alias_block = (
@@ -135,6 +147,7 @@ def _update_shell_aliases() -> list[str]:
         "alias ccr='ccr-global'\n"
         "alias cclaude='claude-ccr'\n"
         "alias ckimi='kimi-ccr'\n"
+        "alias ccodex='codex-ccr'\n"
     )
     modified: list[str] = []
     for rc_file in (os.path.expanduser("~/.zshrc"), os.path.expanduser("~/.bashrc")):
@@ -153,7 +166,7 @@ def _update_shell_aliases() -> list[str]:
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 @click.option(
     "--agents",
-    default="claude-code,kimi",
+    default="claude-code,kimi,codex",
     show_default=True,
     help="Comma-separated agent names, or 'auto' (detect installed), or 'all'",
 )
@@ -166,7 +179,7 @@ def install_global(yes: bool, agents: str) -> None:
 
     \b
     Examples:
-        ccr install-global                    # Claude Code + Kimi (default)
+        ccr install-global                    # Claude Code + Kimi + Codex (default)
         ccr install-global --agents auto      # Auto-detect installed agents
         ccr install-global --agents all       # All supported agents
         ccr install-global --agents ollama    # Ollama only
@@ -179,7 +192,7 @@ def install_global(yes: bool, agents: str) -> None:
         return
 
     names = ", ".join(a.display_name for a in selected)
-    click.echo(f"=== CCR Global Installation ===\n")
+    click.echo("=== CCR Global Installation ===\n")
     click.echo(f"Target agents: {names}")
     click.echo("Memory will be auto-created in ./.ccr/ on first use.\n")
 
@@ -241,6 +254,8 @@ def install_global(yes: bool, agents: str) -> None:
             click.echo("    cd ~/any-project && claude     # Claude Code with auto-memory")
         elif adapter.name == "kimi":
             click.echo("    cd ~/any-project && kimi       # Kimi with auto-memory")
+        elif adapter.name == "codex":
+            click.echo("    cd ~/any-project && codex-ccr  # Codex with CCR lifecycle")
         else:
             click.echo(f"    cd ~/any-project && <{adapter.name}>   # {adapter.display_name}")
 
@@ -249,7 +264,7 @@ def install_global(yes: bool, agents: str) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 @click.option(
     "--agents",
-    default="claude-code,kimi",
+    default="claude-code,kimi,codex",
     show_default=True,
     help="Comma-separated agent names, or 'auto' (detect installed), or 'all'",
 )

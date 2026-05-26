@@ -12,7 +12,7 @@ import click
 
 logger = logging.getLogger(__name__)
 
-_TABLES = ("commits", "playbook", "triples", "links", "patterns", "discussions")
+_TABLES = ("commits", "playbook", "triples", "links", "patterns", "discussions", "facts")
 
 
 def _get_backend(ccr_dir: str):
@@ -65,6 +65,15 @@ def _export_discussions(backend, branch: str) -> list[dict]:
     return backend.discussion_list(branch)
 
 
+def _export_facts(backend) -> list[dict]:
+    from ccr.core.facts import FactLedger
+
+    return [f.to_dict() for f in FactLedger(backend.ccr_root).list_facts(
+        include_inactive=True,
+        limit=100000,
+    )]
+
+
 _EXPORTERS = {
     "commits": _export_commits,
     "playbook": _export_playbook,
@@ -72,6 +81,7 @@ _EXPORTERS = {
     "links": _export_links,
     "patterns": _export_patterns,
     "discussions": _export_discussions,
+    "facts": _export_facts,
 }
 
 _BRANCH_TABLES = {"commits", "discussions"}
@@ -144,7 +154,15 @@ _FORMATTERS = {
               help="Output format (default: json)")
 @click.option("--branch", "-b", default="main", help="Branch for commits/discussions")
 @click.option("--output", "-o", default=None, help="Output file (default: stdout)")
-def export(table: str, project: str, fmt: str, branch: str, output: str | None) -> None:
+@click.option("--redacted", is_flag=True, help="Redact secrets/PII before exporting.")
+def export(
+    table: str,
+    project: str,
+    fmt: str,
+    branch: str,
+    output: str | None,
+    redacted: bool,
+) -> None:
     """Export a CCR memory table to a portable format.
 
     \b
@@ -166,6 +184,10 @@ def export(table: str, project: str, fmt: str, branch: str, output: str | None) 
             rows = exporter(backend, branch)
         else:
             rows = exporter(backend)
+        if redacted:
+            from ccr.core.governance import append_audit, redact_data
+            rows = redact_data(rows)
+            append_audit(ccr_dir, "export_redacted", "cli", {"table": table, "rows": len(rows)})
 
         formatter = _FORMATTERS[fmt]
         text = formatter(rows)
