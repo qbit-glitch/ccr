@@ -105,6 +105,18 @@ def clear_state(ccr_root: str) -> None:
         logger.warning("Failed to clear session state: %s", exc)
 
 
+def clear_work_state(ccr_root: str) -> None:
+    """Clear committed work while preserving session-level metrics."""
+    state = load_state(ccr_root)
+    preserved = SessionState(
+        tool_calls=state.tool_calls,
+        start_time=state.start_time,
+        context_tokens=state.context_tokens,
+        session_id=state.session_id,
+    )
+    save_state(ccr_root, preserved)
+
+
 def append_tool_use(ccr_root: str, tool_name: str, summary: str,
                     files: list[str] | None = None) -> None:
     """Append a tool use event to the session state.
@@ -124,6 +136,19 @@ def append_tool_use(ccr_root: str, tool_name: str, summary: str,
                 state.files_touched.append(f)
 
     save_state(ccr_root, state)
+    try:
+        from ccr.core.events import AgentEvent, append_agent_event
+        append_agent_event(ccr_root, AgentEvent(
+            agent=os.environ.get("CCR_HOOK_AGENT", "unknown"),
+            session_id=state.session_id or "unknown",
+            project=os.path.abspath(os.path.dirname(ccr_root)),
+            event_type="tool_use",
+            files_touched=list(files or []),
+            tools_used=[tool_name] if tool_name else [],
+            outcome=summary[:500],
+        ))
+    except Exception:
+        pass
 
 
 def initialize_state(ccr_root: str) -> None:
@@ -133,6 +158,16 @@ def initialize_state(ccr_root: str) -> None:
         session_id=str(uuid.uuid4())[:8],  # Short 8-char ID for sessions.jsonl
     )
     save_state(ccr_root, state)
+    try:
+        from ccr.core.events import AgentEvent, append_agent_event
+        append_agent_event(ccr_root, AgentEvent(
+            agent=os.environ.get("CCR_HOOK_AGENT", "unknown"),
+            session_id=state.session_id,
+            project=os.path.abspath(os.path.dirname(ccr_root)),
+            event_type="session_start",
+        ))
+    except Exception:
+        pass
 
 
 def extract_baseline_summary(

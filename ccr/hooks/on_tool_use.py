@@ -28,7 +28,7 @@ def _log_hook_error(error_text: str) -> None:
         pass
 
 
-def _read_tool_data_from_stdin() -> tuple[str, dict]:
+def _read_tool_payload_from_stdin() -> tuple[str, dict, dict]:
     """Read tool_name and tool_input from stdin.
 
     Tries canonical payload first, then falls back to Claude Code's
@@ -41,30 +41,44 @@ def _read_tool_data_from_stdin() -> tuple[str, dict]:
                 data = json.loads(raw)
                 # Canonical payload: {event: "tool_use", tool_name: "...", tool_input: {...}}
                 if data.get("event") == "tool_use":
-                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}
+                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}, data
                 # Claude native: {tool_name: "Write", tool_input: {...}}
                 if "tool_name" in data:
-                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}
+                    return data.get("tool_name", ""), data.get("tool_input", {}) or {}, data
     except Exception:
         pass
-    return "", {}
+    return "", {}, {}
+
+
+def _read_tool_data_from_stdin() -> tuple[str, dict]:
+    """Backward-compatible two-value reader used by tests and callers."""
+    tool_name, tool_input, _payload = _read_tool_payload_from_stdin()
+    return tool_name, tool_input
 
 
 def main() -> None:
-    project_root = os.environ.get("CCR_PROJECT_ROOT", os.getcwd())
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+    from ccr.hooks.codex import resolve_project_root
+
+    # Primary: agents send PostToolUse hook data via stdin JSON.
+    tool_name, input_data, payload = _read_tool_payload_from_stdin()
+    project_root = resolve_project_root(payload)
     ccr_root = os.path.join(project_root, ".ccr")
     if not os.path.isdir(ccr_root):
         if os.environ.get("CCR_AUTO_INIT", "").lower() in ("1", "true", "yes"):
             from ccr.core.memory import MemoryManager  # noqa: PLC0415
             from ccr.core.types import CCRConfig  # noqa: PLC0415
-            MemoryManager(project_root, CCRConfig()).ensure_structure()
+            storage_backend = os.environ.get(
+                "CCR_STORAGE_BACKEND",
+                CCRConfig().storage_backend,
+            )
+            MemoryManager(
+                project_root,
+                CCRConfig(storage_backend=storage_backend),
+            ).ensure_structure()
         else:
             return
-
-    # Primary: Claude Code sends PostToolUse hook data via stdin JSON.
-    tool_name, input_data = _read_tool_data_from_stdin()
 
     # Fallback: env vars (backward compat / manual invocation / older Claude Code versions).
     if not tool_name:
@@ -79,25 +93,39 @@ def main() -> None:
 
     summary = ""
     files: list[str] = []
+    normalized_tool = _normalize_tool_name(tool_name)
 
     # Detect file operations
-    if tool_name in ("Write", "Edit"):
+    if normalized_tool in ("write", "edit", "multiedit"):
         file_path = input_data.get("file_path", "")
         if file_path:
             rel = _relative_path(file_path, project_root)
             files.append(rel)
             summary = f"Modified {rel}"
 
+    # Codex reports apply_patch edits as tool_name="apply_patch".
+    elif normalized_tool == "apply_patch":
+        patch_text = _command_text(input_data)
+        files = _files_from_apply_patch(str(patch_text), project_root)
+        if files:
+            preview = ", ".join(files[:3])
+            suffix = f" +{len(files) - 3} more" if len(files) > 3 else ""
+            summary = f"Applied patch to {preview}{suffix}"
+        else:
+            summary = "Applied patch"
+
     # Track Read-accessed files (files_touched only, no summary to avoid noise in commits)
-    elif tool_name == "Read":
+    elif normalized_tool in ("read", "view_image"):
         file_path = input_data.get("file_path", "")
+        if not file_path:
+            file_path = input_data.get("path", "")
         if file_path:
             rel = _relative_path(file_path, project_root)
             files.append(rel)
 
     # Detect bash commands that indicate progress
-    elif tool_name == "Bash":
-        cmd = input_data.get("command", "")
+    elif normalized_tool in ("bash", "shell", "exec_command", "unified_exec"):
+        cmd = _command_text(input_data)
         if "pytest" in cmd or "python -m pytest" in cmd:
             summary = "Ran tests"
         elif cmd.startswith("git commit"):
@@ -118,10 +146,51 @@ def main() -> None:
 
 def _relative_path(file_path: str, project_root: str) -> str:
     """Convert absolute path to project-relative path."""
+    if not os.path.isabs(file_path):
+        return file_path
     try:
         return os.path.relpath(file_path, project_root)
     except ValueError:
         return file_path
+
+
+def _normalize_tool_name(tool_name: str) -> str:
+    """Normalize native tool names from Claude, Kimi, and Codex."""
+    return tool_name.rsplit(".", 1)[-1].strip().lower()
+
+
+def _command_text(input_data: dict) -> str:
+    """Extract command/patch text from common hook payload shapes."""
+    for key in ("command", "cmd", "patch", "input"):
+        value = input_data.get(key)
+        if isinstance(value, str):
+            return value
+    args = input_data.get("arguments")
+    if isinstance(args, dict):
+        for key in ("command", "cmd", "patch", "input"):
+            value = args.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _files_from_apply_patch(patch_text: str, project_root: str) -> list[str]:
+    """Extract file paths from an apply_patch payload."""
+    files: list[str] = []
+    prefixes = (
+        "*** Update File: ",
+        "*** Add File: ",
+        "*** Delete File: ",
+    )
+    for raw_line in patch_text.splitlines():
+        line = raw_line.strip()
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                rel = _relative_path(line[len(prefix):].strip(), project_root)
+                if rel not in files:
+                    files.append(rel)
+                break
+    return files
 
 
 if __name__ == "__main__":

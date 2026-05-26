@@ -11,8 +11,8 @@ Provider-agnostic: reads CanonicalEvent payload from stdin, uses the
 agent-declared ContextFormat for output.
 """
 
-import json
 import os
+import re
 import sys
 
 
@@ -120,6 +120,7 @@ def _create_db_session(ccr_root: str, project_root: str) -> None:
 # Preset-aware directives — content only, formatting is applied later
 _DIRECTIVES = {
     "default": (
+        "<!-- MANDATORY_CCR_ACTIONS -->\n"
         "Memory already loaded. Respond directly to the user.\n\n"
         "REQUIRED after each task:\n"
         "  gcc_commit(title, what, why, files_changed, next_step)\n\n"
@@ -130,6 +131,7 @@ _DIRECTIVES = {
         "  session_log_turn(assistant_message=\"...\") — only if you need real-time turn access"
     ),
     "ml": (
+        "<!-- MANDATORY_CCR_ACTIONS -->\n"
         "Memory already loaded. ML Research mode active.\n\n"
         "REQUIRED after each experiment/task:\n"
         '  gcc_commit(title, what, why, files_changed, next_step,\n'
@@ -142,6 +144,7 @@ _DIRECTIVES = {
         "  session_log_turn(assistant_message=\"...\") — only if real-time turn access needed"
     ),
     "academic": (
+        "<!-- MANDATORY_CCR_ACTIONS -->\n"
         "Memory already loaded. Academic Research mode active.\n\n"
         "REQUIRED after each writing/analysis task:\n"
         "  gcc_commit(title, what, why, files_changed, next_step)\n\n"
@@ -153,6 +156,113 @@ _DIRECTIVES = {
         "  session_log_turn(assistant_message=\"...\") — only if real-time turn access needed"
     ),
 }
+
+
+_CODEX_DIRECTIVES = {
+    "default": (
+        "Memory already loaded. Respond directly to the user.\n\n"
+        "CCR SAVE POLICY FOR CODEX:\n"
+        "  Do not call gcc_commit after routine reads, searches, or small edits.\n"
+        "  Call gcc_commit only after a meaningful task milestone, before likely context loss, "
+        "or when the user explicitly asks to save/update CCR memory.\n"
+        "  Prefer one concise commit for a completed task; long sessions should rarely need "
+        "more than 2-3 CCR commits.\n\n"
+        "WHEN NEEDED:\n"
+        "  gcc_context(level=3) — deeper context\n"
+        "  gcc_search(query)    — find past decisions\n"
+        "  ace_get_playbook()   — see evolved strategies\n"
+        "  session_log_turn(assistant_message=\"...\") — only if you need real-time turn access"
+    ),
+    "ml": (
+        "Memory already loaded. ML Research mode active.\n\n"
+        "CCR SAVE POLICY FOR CODEX:\n"
+        "  Do not call gcc_commit after routine reads, searches, or exploratory commands.\n"
+        "  Call gcc_commit after a meaningful experiment result, implementation milestone, "
+        "before likely context loss, or when the user explicitly asks to save/update CCR memory.\n"
+        "  Prefer one concise commit per completed experiment/task; long sessions should rarely "
+        "need more than 2-3 CCR commits.\n\n"
+        "WHEN NEEDED:\n"
+        "  gcc_experiments()           — browse experiment history + metrics\n"
+        "  gcc_branch(name, purpose)   — isolate a hypothesis\n"
+        "  index_search(query)         — find code/config files\n"
+        "  session_log_turn(assistant_message=\"...\") — only if real-time turn access needed"
+    ),
+    "academic": (
+        "Memory already loaded. Academic Research mode active.\n\n"
+        "CCR SAVE POLICY FOR CODEX:\n"
+        "  Do not call gcc_commit after routine reads, searches, or minor notes.\n"
+        "  Call gcc_commit after a meaningful analysis/writing milestone, before likely context "
+        "loss, or when the user explicitly asks to save/update CCR memory.\n"
+        "  Prefer one concise commit per completed task; long sessions should rarely need "
+        "more than 2-3 CCR commits.\n\n"
+        "WHEN NEEDED:\n"
+        "  gcc_discuss(topic, position) — record argument or decision\n"
+        "  gcc_discussions()            — retrieve past positions/notes\n"
+        "  gcc_search(query)            — search all past analysis\n"
+        "  session_search(query)        — search conversation history\n"
+        "  session_log_turn(assistant_message=\"...\") — only if real-time turn access needed"
+    ),
+}
+
+
+def _is_codex_agent() -> bool:
+    return os.environ.get("CCR_HOOK_AGENT", "").strip().lower() == "codex"
+
+
+def _squash_line(text: str, max_chars: int = 220) -> str:
+    """Collapse whitespace and clip long hook output for Codex visibility."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
+
+
+def _context_section(context: str, heading: str) -> str:
+    match = re.search(
+        rf"(?ms)^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)",
+        context or "",
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _first_recent_item(context: str) -> str:
+    for pattern in (
+        r"(?m)^-\s+\[[^\]]+\]\s+\([^)]+\)\s+(.+)$",
+        r"(?m)^##\s+\[C\d+\].*?\|\s+branch:[^|]+\s+\|\s+(.+)$",
+    ):
+        match = re.search(pattern, context or "")
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _codex_session_summary(
+    context: str,
+    global_text: str = "",
+    playbook_text: str = "",
+    was_stale: bool = False,
+) -> str:
+    """Summarize full CCR context into the short stdout Codex exposes."""
+    focus = _context_section(context, "Current Focus")
+    focus = focus.splitlines()[0].strip() if focus else ""
+    recent = _first_recent_item(context)
+    bullet_count = len(re.findall(r"(?m)^\[[a-z]+-\d+\]", f"{global_text}\n{playbook_text}"))
+
+    prefix = "CCR recovered from an unclean shutdown; " if was_stale else ""
+    line1 = prefix + "CCR retrieved full memory"
+    if bullet_count:
+        line1 += f" and {bullet_count} playbook rule{'s' if bullet_count != 1 else ''}"
+    if focus:
+        line1 += f": {_squash_line(focus, 180)}"
+    elif recent:
+        line1 += f": {_squash_line(recent, 180)}"
+    else:
+        line1 += "."
+
+    line2 = "Use gcc_context/gcc_search only for deeper recall; save with gcc_commit only after meaningful milestones or when asked."
+    if focus and recent and recent not in focus:
+        line2 = f"Recent: {_squash_line(recent, 120)}. " + line2
+    return f"{line1}\n{line2}"
 
 
 def _get_preset(ccr_root: str) -> str:
@@ -174,24 +284,24 @@ def _get_preset(ccr_root: str) -> str:
 
 
 def main():
-    project_root = os.environ.get("CCR_PROJECT_ROOT", os.getcwd())
     sys.path.insert(
         0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
 
     # Parse canonical event payload from stdin (provider-agnostic)
-    from ccr.hooks.canonical import HookPayload, format_context_block, format_playbook_block
-    from ccr.hooks.canonical import format_directive, format_ready_message, format_reminder
-    from ccr.core.types import ContextFormat
+    from ccr.hooks.canonical import HookPayload
+    from ccr.hooks.codex import codex_ccr_config, resolve_project_root
 
     payload = HookPayload.from_stdin()
+    project_root = resolve_project_root(payload.raw)
     fmt = payload.format
     user_prompt = payload.prompt or ""
 
     from ccr.core.memory import MemoryManager
     from ccr.core.types import CCRConfig
 
-    mem = MemoryManager(project_root, CCRConfig())
+    config = codex_ccr_config() if _is_codex_agent() else CCRConfig()
+    mem = MemoryManager(project_root, config)
     if not os.path.isdir(mem.ccr_root):
         if os.environ.get("CCR_AUTO_INIT", "").lower() in ("1", "true", "yes"):
             mem.ensure_structure()
@@ -225,6 +335,12 @@ def _handle_session_start(
 
     # Empty-project UX
     if not _project_has_commits(mem):
+        if _is_codex_agent():
+            print(
+                "CCR active: no saved project memory yet. "
+                "Save a concise gcc_commit after the first meaningful task."
+            )
+            return
         msg = (
             "CCR is active. This project has no memory yet — that's normal on first use.\n\n"
             "After finishing your first task, call:\n"
@@ -259,6 +375,23 @@ def _handle_session_start(
     )
 
     # Build output parts using the agent's preferred format
+    if _is_codex_agent():
+        output = _codex_session_summary(
+            context,
+            global_text=global_text,
+            playbook_text=playbook_text,
+            was_stale=was_stale,
+        )
+        print(output)
+        try:
+            from ccr.hooks.state_accumulator import load_state, save_state
+            state = load_state(mem.ccr_root)
+            state.context_tokens = max(1, len(output) // 4)
+            save_state(mem.ccr_root, state)
+        except Exception:
+            pass
+        return
+
     parts = []
     if was_stale:
         parts.append(
@@ -272,7 +405,8 @@ def _handle_session_start(
         parts.append(format_playbook_block(global_text, playbook_text, fmt=fmt))
 
     preset = _get_preset(mem.ccr_root)
-    directive = _DIRECTIVES.get(preset, _DIRECTIVES["default"])
+    directives = _CODEX_DIRECTIVES if _is_codex_agent() else _DIRECTIVES
+    directive = directives.get(preset, directives["default"])
     parts.append(format_directive(directive, fmt=fmt))
 
     if parts:

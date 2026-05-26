@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import sys
 import time
-
-import pytest
+from io import StringIO
 
 from ccr.hooks.state_accumulator import (
     SessionState,
@@ -259,6 +258,78 @@ class TestOnToolUseHook:
             f"Read should track files_touched, got: {state.files_touched}"
         )
 
+    def test_hook_detects_codex_apply_patch(self, tmp_path, monkeypatch):
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root)
+        initialize_state(ccr_root)
+
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "command": (
+                    "*** Begin Patch\n"
+                    "*** Update File: ccr/adapters/codex.py\n"
+                    "@@\n"
+                    "-old\n"
+                    "+new\n"
+                    "*** End Patch\n"
+                )
+            },
+        }
+        monkeypatch.setenv("CCR_PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(payload)))
+
+        from ccr.hooks.on_tool_use import main
+        main()
+
+        state = load_state(ccr_root)
+        assert state.tool_calls == 1
+        assert "ccr/adapters/codex.py" in state.files_touched
+        assert any("Applied patch" in item for item in state.what_accumulated)
+
+    def test_hook_uses_codex_payload_cwd(self, tmp_path, monkeypatch):
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root)
+        initialize_state(ccr_root)
+
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "cwd": str(tmp_path),
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": "*** Update File: src/app.py\n"},
+        }
+        monkeypatch.delenv("CCR_PROJECT_ROOT", raising=False)
+        monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(payload)))
+
+        from ccr.hooks.on_tool_use import main
+        main()
+
+        state = load_state(ccr_root)
+        assert state.tool_calls == 1
+        assert "src/app.py" in state.files_touched
+
+    def test_hook_tracks_codex_exec_command(self, tmp_path, monkeypatch):
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root)
+        initialize_state(ccr_root)
+
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "cwd": str(tmp_path),
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "python -m pytest tests/unit/test_auto_commit.py"},
+        }
+        monkeypatch.delenv("CCR_PROJECT_ROOT", raising=False)
+        monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(payload)))
+
+        from ccr.hooks.on_tool_use import main
+        main()
+
+        state = load_state(ccr_root)
+        assert state.tool_calls == 1
+        assert "Ran tests" in state.what_accumulated
+
     def test_hook_skips_without_ccr_dir(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CCR_PROJECT_ROOT", str(tmp_path))
         monkeypatch.setenv("CLAUDE_TOOL_NAME", "Write")
@@ -312,6 +383,68 @@ class TestOnStopHook:
 
         # State should still be cleared
         assert not os.path.isfile(state_path(ccr_root))
+
+
+class TestCodexStopHook:
+    """Tests for Codex turn-scoped Stop behavior."""
+
+    def test_codex_stop_commits_and_keeps_session_marker(self, tmp_path, monkeypatch):
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root)
+        os.makedirs(os.path.join(ccr_root, "branches"), exist_ok=True)
+        with open(os.path.join(ccr_root, "active_branch.txt"), "w") as f:
+            f.write("main")
+        marker = os.path.join(ccr_root, ".session_active")
+        with open(marker, "w") as f:
+            f.write("12345")
+
+        state = SessionState(
+            what_accumulated=["Applied Codex hook support across adapter and tests"],
+            files_touched=["ccr/adapters/codex.py", "tests/unit/test_adapters.py", "docs/AGENTS.md"],
+            tool_calls=4,
+        )
+        save_state(ccr_root, state)
+
+        payload = {"hook_event_name": "Stop", "cwd": str(tmp_path)}
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("CCR_PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(payload)))
+
+        from ccr.hooks.codex_stop import main
+        main()
+
+        state_after = load_state(ccr_root)
+        assert state_after.what_accumulated == []
+        assert state_after.files_touched == []
+        assert state_after.tool_calls == 4
+        assert os.path.isfile(marker)
+
+    def test_clear_work_state_preserves_codex_session_metrics(self, tmp_path):
+        from ccr.hooks.state_accumulator import clear_work_state
+
+        ccr_root = str(tmp_path / ".ccr")
+        os.makedirs(ccr_root)
+        save_state(
+            ccr_root,
+            SessionState(
+                what_accumulated=["Implemented feature"],
+                files_touched=["a.py"],
+                tool_calls=7,
+                start_time=123.0,
+                context_tokens=99,
+                session_id="abc123",
+            ),
+        )
+
+        clear_work_state(ccr_root)
+
+        state = load_state(ccr_root)
+        assert state.what_accumulated == []
+        assert state.files_touched == []
+        assert state.tool_calls == 7
+        assert state.start_time == 123.0
+        assert state.context_tokens == 99
+        assert state.session_id == "abc123"
 
 
 class TestQuickCosine:

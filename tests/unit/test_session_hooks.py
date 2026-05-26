@@ -62,6 +62,45 @@ def _write_transcript(path: str, turns: list[dict]) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _write_codex_transcript(path: str, turns: list[dict]) -> None:
+    """Write a Codex-style JSONL transcript."""
+    lines = [
+        json.dumps({
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/project", "id": "codex-session"},
+        })
+    ]
+    for t in turns:
+        lines.append(json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": t["user"]}],
+            },
+        }))
+        lines.append(json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "working"}],
+            },
+        }))
+        lines.append(json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": t["assistant"]}],
+            },
+        }))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # _extract_text_from_content
 # ---------------------------------------------------------------------------
@@ -191,6 +230,21 @@ class TestParseTranscript:
         assert len(turns) == 1
         assert turns[0]["user_message"] == "simple question"
         assert turns[0]["assistant_message"] == "simple answer"
+
+    def test_parses_codex_transcript_final_answers(self, tmp_path):
+        tp = str(tmp_path / "codex.jsonl")
+        _write_codex_transcript(tp, [
+            {"user": "Implement the plan", "assistant": "Implemented."},
+            {"user": "Run tests", "assistant": "Tests passed."},
+        ])
+
+        turns = _parse_transcript(tp)
+
+        assert len(turns) == 2
+        assert turns[0]["user_message"] == "Implement the plan"
+        assert turns[0]["assistant_message"] == "Implemented."
+        assert turns[1]["user_message"] == "Run tests"
+        assert turns[1]["assistant_message"] == "Tests passed."
 
 
 # ---------------------------------------------------------------------------
