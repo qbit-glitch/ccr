@@ -53,8 +53,12 @@ class GitMemorySync:
             if not init_result.ok:
                 return init_result
         self._snapshot_to_repo()
+        # Force-add: the snapshot lives under memory/.ccr/, which is matched by the
+        # near-universal ".ccr/" gitignore pattern (global excludesFile or project).
+        # Without -f the snapshot is silently ignored, nothing is committed, and the
+        # push below fails with "src refspec HEAD does not match any".
         commands = [
-            self._git(["add", "memory"]),
+            self._git(["add", "-f", "memory"]),
             self._git(["status", "--short"], check=False),
         ]
         if commands[-1].strip():
@@ -66,7 +70,15 @@ class GitMemorySync:
             ], check=False))
         cfg = self._read_config()
         if cfg.get("remote"):
-            commands.append(self._git(["push", "origin", "HEAD"], check=False))
+            push_out = self._git(["push", "origin", "HEAD"], check=False)
+            commands.append(push_out)
+            if any(tok in push_out.lower() for tok in ("error:", "fatal:", "rejected", "failed to push")):
+                return SyncResult(
+                    False,
+                    f"sync push to remote failed: {push_out.strip()[:200]}",
+                    commands=commands,
+                    artifacts=[self.repo],
+                )
         return SyncResult(True, "sync push completed", commands=commands, artifacts=[self.repo])
 
     def pull(self, apply: bool = False) -> SyncResult:
