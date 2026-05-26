@@ -8,8 +8,15 @@ Provides:
 from __future__ import annotations
 
 import os
+import re
 
-from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult, IntegrationLevel
+from ccr.adapters import (
+    BaseAgentAdapter,
+    HealthIssue,
+    InstallResult,
+    UninstallResult,
+    IntegrationLevel,
+)
 
 
 class OpenAIAdapter(BaseAgentAdapter):
@@ -69,17 +76,115 @@ class OpenAIAdapter(BaseAgentAdapter):
             os.remove(wrapper_path)
             removed.append(wrapper_path)
 
-        wrap_mod_path = os.path.join(os.path.dirname(os.path.expanduser("~/.ccr")), "wrap_openai.py")
         # Note: wrap_openai.py lives in the package dir, don't remove it on uninstall
 
         return UninstallResult(
             success=True,
-            message=f"Removed OpenAI CLI wrapper",
+            message="Removed OpenAI CLI wrapper",
             files_removed=removed,
         )
 
     def context_format(self) -> str:
         return "markdown"
+
+    def health_check(self) -> list[HealthIssue]:
+        """OpenAI SDK-wrapper health checks.
+
+        Verifies wrapper script + ccr.wrap_openai module exist, the openai
+        package is importable, and OPENAI_API_KEY is in the environment.
+        """
+        if not self.is_installed():
+            return [
+                HealthIssue(
+                    severity="info",
+                    message="OpenAI not detected (no openai package, no OPENAI_API_KEY env var)",
+                    fix="pip install openai, set OPENAI_API_KEY, then run 'ccr install-global --agents openai'",
+                )
+            ]
+
+        issues: list[HealthIssue] = []
+        wrapper_path = os.path.join(self._BIN_DIR, "ccr-openai")
+
+        if not os.path.isfile(wrapper_path):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message=f"CCR-OpenAI wrapper not installed: {wrapper_path}",
+                    fix="Run: ccr install-global --agents openai",
+                )
+            )
+        else:
+            if not os.access(wrapper_path, os.X_OK):
+                issues.append(
+                    HealthIssue(
+                        severity="error",
+                        message=f"CCR-OpenAI wrapper not executable: {wrapper_path}",
+                        fix=f"Run: chmod +x {wrapper_path}",
+                    )
+                )
+            try:
+                with open(wrapper_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                match = re.search(r"^([^\s]+)\s+-c\s", content, flags=re.MULTILINE)
+                if match:
+                    embedded_python = match.group(1).strip("'\"")
+                    if not os.path.isfile(embedded_python):
+                        issues.append(
+                            HealthIssue(
+                                severity="error",
+                                message=f"OpenAI wrapper python missing: {embedded_python}",
+                                fix="Re-run 'ccr install-global --agents openai' after fixing the venv",
+                            )
+                        )
+                    else:
+                        issues.append(
+                            HealthIssue(
+                                severity="ok",
+                                message=f"CCR-OpenAI wrapper: {wrapper_path}",
+                            )
+                        )
+            except OSError:
+                pass
+
+        # Check the SDK-wrapper module is importable
+        try:
+            import ccr.wrap_openai  # noqa: F401
+            issues.append(
+                HealthIssue(severity="ok", message="ccr.wrap_openai module importable")
+            )
+        except ImportError:
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="ccr.wrap_openai SDK module not present in package directory",
+                    fix="Re-run 'ccr install-global --agents openai' to regenerate the module",
+                )
+            )
+
+        # API key presence (info only — many users set it just-in-time)
+        if "OPENAI_API_KEY" not in os.environ:
+            issues.append(
+                HealthIssue(
+                    severity="info",
+                    message="OPENAI_API_KEY not set in current shell",
+                    fix="export OPENAI_API_KEY=sk-... or set it in your shell rc file",
+                )
+            )
+
+        # openai package present?
+        try:
+            import openai  # noqa: F401
+            issues.append(HealthIssue(severity="ok", message="openai Python package installed"))
+        except ImportError:
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="openai Python package is not installed",
+                    fix="pip install openai",
+                )
+            )
+
+        return issues
 
     def _wrapper_script(self, python_exe: str) -> str:
         import shlex

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 
-from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult
+from ccr.adapters import BaseAgentAdapter, HealthIssue, InstallResult, UninstallResult
 
 
 class ContinueDevAdapter(BaseAgentAdapter):
@@ -106,3 +106,79 @@ class ContinueDevAdapter(BaseAgentAdapter):
 
     def context_format(self) -> str:
         return "markdown"
+
+    def health_check(self) -> list[HealthIssue]:
+        """Continue.dev health checks against ~/.continue/config.json."""
+        if not self.is_installed():
+            return [
+                HealthIssue(
+                    severity="info",
+                    message="Continue (VS Code extension) not detected on this system",
+                    fix="Install Continue from continue.dev, then run 'ccr install-global --agents continue-dev'",
+                )
+            ]
+
+        issues: list[HealthIssue] = []
+
+        if not os.path.isfile(self._CONFIG_PATH):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message=f"Continue config not found: {self._CONFIG_PATH}",
+                    fix="Run: ccr install-global --agents continue-dev",
+                )
+            )
+            return issues
+
+        try:
+            with open(self._CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.loads(f.read())
+        except json.JSONDecodeError:
+            return [
+                HealthIssue(
+                    severity="error",
+                    message=f"Continue config is not valid JSON: {self._CONFIG_PATH}",
+                    fix="Restore the file or remove and re-run 'ccr install-global --agents continue-dev'",
+                )
+            ]
+        except OSError as exc:
+            return [HealthIssue(severity="error", message=f"Continue config unreadable: {exc}")]
+
+        ccr_entry = (config.get("mcpServers") or {}).get("ccr")
+        if not isinstance(ccr_entry, dict):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="Continue MCP missing ccr server entry",
+                    fix="Run: ccr install-global --agents continue-dev",
+                )
+            )
+            return issues
+
+        cmd = ccr_entry.get("command", "")
+        if cmd and not os.path.isfile(cmd):
+            issues.append(
+                HealthIssue(
+                    severity="error",
+                    message=f"Continue MCP python missing: {cmd}",
+                    fix="Re-run 'ccr install-global --agents continue-dev' after fixing the venv",
+                )
+            )
+
+        env = ccr_entry.get("env") or {}
+        if not isinstance(env, dict) or env.get("CCR_STORAGE_BACKEND") != "sqlite":
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="Continue MCP server not pinned to CCR_STORAGE_BACKEND=sqlite",
+                    fix="Run: ccr install-global --agents continue-dev",
+                )
+            )
+        else:
+            issues.append(
+                HealthIssue(
+                    severity="ok",
+                    message="Continue MCP server: ccr (sqlite backend)",
+                )
+            )
+        return issues

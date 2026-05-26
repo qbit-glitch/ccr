@@ -1,0 +1,8 @@
+[mcp_servers.ccr]
+args = [
+    "-m",
+    "ccr.mcp_server",
+    "--project",
+    "/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens",
+]
+command = "/Users/qbit-glitch/Desktop/coding-projects/powering_claude_with_less_tokens/.venv/bin/python"

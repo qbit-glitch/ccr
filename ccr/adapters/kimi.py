@@ -8,7 +8,19 @@ import re
 import shlex
 import shutil
 
-from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult
+from ccr.adapters import (
+    BaseAgentAdapter,
+    HealthIssue,
+    InstallResult,
+    UninstallResult,
+    verify_hook_command_paths,
+)
+
+
+try:
+    import tomllib as _tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover - 3.10 fallback
+    _tomllib = None  # type: ignore[assignment]
 
 
 class KimiAdapter(BaseAgentAdapter):
@@ -130,6 +142,164 @@ class KimiAdapter(BaseAgentAdapter):
         except Exception:
             return False
 
+    def health_check(self) -> list[HealthIssue]:
+        """Kimi-specific health checks for ~/.kimi/mcp.json + config.toml."""
+        if not self.is_installed():
+            return [
+                HealthIssue(
+                    severity="info",
+                    message="Kimi Code CLI not detected on this system",
+                    fix="Install Kimi, then run 'ccr install-global --agents kimi'",
+                )
+            ]
+
+        issues: list[HealthIssue] = []
+
+        # MCP — JSON validity + ccr entry
+        if not os.path.isfile(self._MCP_PATH):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message=f"Kimi MCP config not found: {self._MCP_PATH}",
+                    fix="Run: ccr install-global --agents kimi",
+                )
+            )
+        else:
+            try:
+                with open(self._MCP_PATH, "r", encoding="utf-8") as f:
+                    mcp = json.loads(f.read())
+                ccr_entry = (mcp.get("mcpServers") or {}).get("ccr")
+                if not isinstance(ccr_entry, dict):
+                    issues.append(
+                        HealthIssue(
+                            severity="warn",
+                            message="Kimi MCP missing ccr server entry",
+                            fix="Run: ccr install-global --agents kimi",
+                        )
+                    )
+                else:
+                    cmd = ccr_entry.get("command", "")
+                    if cmd and not os.path.isfile(cmd):
+                        issues.append(
+                            HealthIssue(
+                                severity="error",
+                                message=f"Kimi MCP python missing: {cmd}",
+                                fix="Re-run 'ccr install-global --agents kimi' after fixing the venv",
+                            )
+                        )
+                    env = ccr_entry.get("env") or {}
+                    if not isinstance(env, dict) or env.get("CCR_STORAGE_BACKEND") != "sqlite":
+                        issues.append(
+                            HealthIssue(
+                                severity="warn",
+                                message="Kimi MCP server not pinned to CCR_STORAGE_BACKEND=sqlite",
+                                fix="Run: ccr install-global --agents kimi",
+                            )
+                        )
+                    else:
+                        issues.append(
+                            HealthIssue(
+                                severity="ok",
+                                message="Kimi MCP server: ccr (sqlite backend)",
+                            )
+                        )
+            except json.JSONDecodeError:
+                issues.append(
+                    HealthIssue(
+                        severity="error",
+                        message=f"Kimi MCP config is not valid JSON: {self._MCP_PATH}",
+                        fix="Manually fix syntax or remove the file and run 'ccr install-global --agents kimi'",
+                    )
+                )
+            except OSError as exc:
+                issues.append(
+                    HealthIssue(
+                        severity="error",
+                        message=f"Kimi MCP config unreadable: {exc}",
+                    )
+                )
+
+        # Hooks — TOML
+        if not os.path.isfile(self._CONFIG_PATH):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message=f"Kimi config not found: {self._CONFIG_PATH}",
+                    fix="Run: ccr install-global --agents kimi",
+                )
+            )
+            return issues
+
+        try:
+            with open(self._CONFIG_PATH, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as exc:
+            issues.append(
+                HealthIssue(severity="error", message=f"Kimi config unreadable: {exc}")
+            )
+            return issues
+
+        parsed: dict | None = None
+        if _tomllib is not None:
+            try:
+                parsed = _tomllib.loads(text)
+            except _tomllib.TOMLDecodeError:
+                issues.append(
+                    HealthIssue(
+                        severity="error",
+                        message=f"Kimi config is not valid TOML: {self._CONFIG_PATH}",
+                        fix="Manually fix syntax or run 'ccr install-global --agents kimi'",
+                    )
+                )
+
+        hook_event_count = 0
+        path_issues: list[HealthIssue] = []
+        if parsed is not None:
+            entries = parsed.get("hooks") or []
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    cmd = str(entry.get("command", ""))
+                    if "ccr" not in cmd.lower():
+                        continue
+                    hook_event_count += 1
+                    path_issues.extend(verify_hook_command_paths(cmd))
+        else:
+            # Fallback substring scan if TOML failed to parse.
+            for match in re.finditer(r"command\s*=\s*\"([^\"]+)\"", text):
+                cmd = match.group(1)
+                if "ccr" not in cmd.lower():
+                    continue
+                hook_event_count += 1
+                path_issues.extend(verify_hook_command_paths(cmd))
+
+        if hook_event_count == 0:
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="No CCR hook entries found in ~/.kimi/config.toml",
+                    fix="Run: ccr install-global --agents kimi",
+                )
+            )
+        else:
+            issues.append(
+                HealthIssue(
+                    severity="ok",
+                    message=f"Kimi CCR hooks: {hook_event_count} command(s) registered",
+                )
+            )
+
+        seen: set[tuple[str, str]] = set()
+        for issue in path_issues:
+            key = (issue.severity, issue.message)
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(issue)
+
+        return issues
+
     def _ensure_mcp(self, python_exe: str) -> str:
         existing: dict = {}
         if os.path.isfile(self._MCP_PATH):
@@ -179,22 +349,22 @@ class KimiAdapter(BaseAgentAdapter):
         ccr_hooks_toml = f"""
 [[hooks]]
 event = "UserPromptSubmit"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_session_start.py'))}"
+command = "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_session_start.py'))}"
 timeout = 30
 
 [[hooks]]
 event = "PostToolUse"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_tool_use.py'))}"
+command = "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_tool_use.py'))}"
 timeout = 30
 
 [[hooks]]
 event = "PreCompact"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_compact.py'))}"
+command = "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_compact.py'))}"
 timeout = 30
 
 [[hooks]]
 event = "Stop"
-command = "CCR_AUTO_INIT=1 {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_stop.py'))}"
+command = "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {shlex.quote(python_exe)} {shlex.quote(os.path.join(hooks_dir, 'on_stop.py'))}"
 timeout = 60
 """
 

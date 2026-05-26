@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 
-from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult
+from ccr.adapters import BaseAgentAdapter, HealthIssue, InstallResult, UninstallResult
 
 
 class GenericMcpAdapter(BaseAgentAdapter):
@@ -68,3 +68,72 @@ class GenericMcpAdapter(BaseAgentAdapter):
 
     def context_format(self) -> str:
         return "markdown"
+
+    def health_check(self) -> list[HealthIssue]:
+        """Generic MCP fallback — verifies ~/.ccr/mcp-config.json is valid.
+
+        ``is_installed`` always returns False so this adapter is invisible
+        to ``ccr agents doctor`` unless the user explicitly targets it.
+        """
+        issues: list[HealthIssue] = []
+        if not os.path.isfile(self._CONFIG_PATH):
+            issues.append(
+                HealthIssue(
+                    severity="info",
+                    message=f"Generic MCP config not generated: {self._CONFIG_PATH}",
+                    fix="Run: ccr install-global --agents generic-mcp (then copy the JSON into your agent)",
+                )
+            )
+            return issues
+
+        try:
+            with open(self._CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.loads(f.read())
+        except json.JSONDecodeError:
+            return [
+                HealthIssue(
+                    severity="error",
+                    message=f"Generic MCP config is not valid JSON: {self._CONFIG_PATH}",
+                    fix="Remove the file and re-run 'ccr install-global --agents generic-mcp'",
+                )
+            ]
+        except OSError as exc:
+            return [HealthIssue(severity="error", message=f"Generic MCP config unreadable: {exc}")]
+
+        ccr_entry = (config.get("mcpServers") or {}).get("ccr")
+        if not isinstance(ccr_entry, dict):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="Generic MCP config missing ccr server entry",
+                    fix="Run: ccr install-global --agents generic-mcp",
+                )
+            )
+            return issues
+
+        cmd = ccr_entry.get("command", "")
+        if cmd and not os.path.isfile(cmd):
+            issues.append(
+                HealthIssue(
+                    severity="error",
+                    message=f"Generic MCP python missing: {cmd}",
+                    fix="Re-run 'ccr install-global --agents generic-mcp' after fixing the venv",
+                )
+            )
+        env = ccr_entry.get("env") or {}
+        if isinstance(env, dict) and env.get("CCR_STORAGE_BACKEND") == "sqlite":
+            issues.append(
+                HealthIssue(
+                    severity="ok",
+                    message="Generic MCP config: ccr (sqlite backend)",
+                )
+            )
+        else:
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="Generic MCP server not pinned to CCR_STORAGE_BACKEND=sqlite",
+                    fix="Run: ccr install-global --agents generic-mcp",
+                )
+            )
+        return issues

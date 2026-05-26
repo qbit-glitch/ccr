@@ -8,9 +8,16 @@ Ollama has no native MCP or hook support. CCR integrates via:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 
-from ccr.adapters import BaseAgentAdapter, InstallResult, UninstallResult, IntegrationLevel
+from ccr.adapters import (
+    BaseAgentAdapter,
+    HealthIssue,
+    InstallResult,
+    UninstallResult,
+    IntegrationLevel,
+)
 
 
 class OllamaAdapter(BaseAgentAdapter):
@@ -58,6 +65,85 @@ class OllamaAdapter(BaseAgentAdapter):
 
     def context_format(self) -> str:
         return "plain"
+
+    def health_check(self) -> list[HealthIssue]:
+        """Ollama health checks for the ~/.ccr/bin/ollama-ccr wrapper script."""
+        if not self.is_installed():
+            return [
+                HealthIssue(
+                    severity="info",
+                    message="Ollama not detected on this system",
+                    fix="Install Ollama (https://ollama.com), then run 'ccr install-global --agents ollama'",
+                )
+            ]
+
+        wrapper_path = os.path.join(self._BIN_DIR, "ollama-ccr")
+        issues: list[HealthIssue] = []
+
+        if not os.path.isfile(wrapper_path):
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message=f"Ollama CCR wrapper not installed: {wrapper_path}",
+                    fix="Run: ccr install-global --agents ollama",
+                )
+            )
+            return issues
+
+        if not os.access(wrapper_path, os.X_OK):
+            issues.append(
+                HealthIssue(
+                    severity="error",
+                    message=f"Ollama wrapper not executable: {wrapper_path}",
+                    fix=f"Run: chmod +x {wrapper_path}",
+                )
+            )
+
+        try:
+            with open(wrapper_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError as exc:
+            issues.append(HealthIssue(severity="error", message=f"Wrapper unreadable: {exc}"))
+            return issues
+
+        if not content.startswith("#!/"):
+            issues.append(
+                HealthIssue(
+                    severity="error",
+                    message="Ollama wrapper is missing a shebang",
+                    fix="Run: ccr install-global --agents ollama",
+                )
+            )
+
+        # Wrapper bakes the python path used to call `ccr.cli init`.
+        match = re.search(r"(\S+)\s+-m\s+ccr\.cli\s+init", content)
+        if match:
+            embedded_python = match.group(1).strip("'\"")
+            if not os.path.isfile(embedded_python):
+                issues.append(
+                    HealthIssue(
+                        severity="error",
+                        message=f"Wrapper python missing: {embedded_python}",
+                        fix="Re-run 'ccr install-global --agents ollama' after fixing the venv",
+                    )
+                )
+            else:
+                issues.append(
+                    HealthIssue(
+                        severity="ok",
+                        message=f"Ollama CCR wrapper: {wrapper_path}",
+                    )
+                )
+        else:
+            issues.append(
+                HealthIssue(
+                    severity="warn",
+                    message="Ollama wrapper does not call ccr.cli init — may be from an older CCR install",
+                    fix="Run: ccr install-global --agents ollama",
+                )
+            )
+
+        return issues
 
     def _wrapper_script(self, python_exe: str) -> str:
         import shlex

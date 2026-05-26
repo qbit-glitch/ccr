@@ -7,8 +7,6 @@ and context injection strategies behind a unified interface.
 from __future__ import annotations
 
 import dataclasses
-import os
-import shutil
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
@@ -31,6 +29,22 @@ class UninstallResult:
     message: str
     files_removed: list[str] = dataclasses.field(default_factory=list)
     files_modified: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(frozen=True)
+class HealthIssue:
+    """A single per-adapter health-check finding.
+
+    Severity levels:
+        "ok"    — informational, the check passed
+        "info"  — optional/notice; no action needed
+        "warn"  — degraded but functional; should fix soon
+        "error" — broken; the agent will not work correctly
+    """
+
+    severity: str
+    message: str
+    fix: str = ""
 
 
 class IntegrationLevel:
@@ -103,6 +117,7 @@ class BaseAgentAdapter(ABC):
         return {
             "command": python_exe,
             "args": ["-m", "ccr.mcp_server", "--project", "."],
+            "env": {"CCR_STORAGE_BACKEND": "sqlite"},
         }
 
     def context_format(self) -> str:
@@ -135,6 +150,50 @@ class BaseAgentAdapter(ABC):
             hooks_configured=self._is_hooks_configured(),
         )
 
+    def health_check(self) -> list[HealthIssue]:
+        """Run agent-specific health checks and return findings.
+
+        Default implementation reports installation, MCP, and hook state.
+        Subclasses should override and prepend agent-specific deeper checks
+        (e.g. config-file validity, hook command path existence).
+        """
+        issues: list[HealthIssue] = []
+        if not self.is_installed():
+            return [
+                HealthIssue(
+                    severity="info",
+                    message=f"{self.display_name} not detected on this system",
+                    fix=f"Install {self.display_name}, then run 'ccr install-global --agents {self.name}'",
+                )
+            ]
+        if self.supports_mcp():
+            if self._is_mcp_configured():
+                issues.append(
+                    HealthIssue(severity="ok", message=f"{self.display_name} MCP configured")
+                )
+            else:
+                issues.append(
+                    HealthIssue(
+                        severity="warn",
+                        message=f"{self.display_name} MCP not configured",
+                        fix=f"Run: ccr install-global --agents {self.name}",
+                    )
+                )
+        if self.supports_hooks():
+            if self._is_hooks_configured():
+                issues.append(
+                    HealthIssue(severity="ok", message=f"{self.display_name} hooks configured")
+                )
+            else:
+                issues.append(
+                    HealthIssue(
+                        severity="warn",
+                        message=f"{self.display_name} hooks not configured",
+                        fix=f"Run: ccr install-global --agents {self.name}",
+                    )
+                )
+        return issues
+
     # ------------------------------------------------------------------
     # Internal helpers subclasses may override
     # ------------------------------------------------------------------
@@ -157,6 +216,63 @@ class BaseAgentAdapter(ABC):
         return shlex.quote(path)
 
 
+def verify_hook_command_paths(command: str) -> list[HealthIssue]:
+    """Inspect a hook shell command for stale python/script paths.
+
+    Hook commands installed by CCR follow the shape::
+
+        ENV_VAR=val ENV_VAR=val python_exe script_path [extra args]
+
+    This helper splits the command, identifies the python and script paths
+    by scanning for the first non-VAR=val token (python) and the next .py
+    token (script), and reports any missing files.
+
+    Returns an empty list when all paths exist.
+    """
+    import shlex
+    import os as _os
+
+    if not command or "ccr" not in command.lower():
+        return []
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if not parts:
+        return []
+
+    python_exe = ""
+    script_path = ""
+    for token in parts:
+        if "=" in token and token.split("=")[0].isupper():
+            continue
+        if not python_exe:
+            python_exe = token
+            continue
+        if token.endswith(".py"):
+            script_path = token
+            break
+
+    issues: list[HealthIssue] = []
+    if python_exe and not _os.path.isfile(python_exe):
+        issues.append(
+            HealthIssue(
+                severity="error",
+                message=f"Hook python executable missing: {python_exe}",
+                fix="Re-run 'ccr install-global' to refresh hook paths after pip upgrade",
+            )
+        )
+    if script_path and not _os.path.isfile(script_path):
+        issues.append(
+            HealthIssue(
+                severity="error",
+                message=f"Hook script missing: {script_path}",
+                fix="Re-run 'ccr install-global' to refresh hook paths",
+            )
+        )
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Lazy adapter imports — avoid circular deps and heavy imports at module level
 # ---------------------------------------------------------------------------
@@ -171,12 +287,12 @@ def _load_adapter_classes() -> list[type[BaseAgentAdapter]]:
         return _ALL_ADAPTER_CLASSES
 
     # Import each adapter module to trigger class registration
-    from ccr.adapters import claude_code, continue_dev, generic_mcp, kimi, ollama, openai
+    from ccr.adapters import claude_code, codex, continue_dev, generic_mcp, kimi, ollama, openai
 
     # Collect all concrete BaseAgentAdapter subclasses
     import inspect
 
-    for mod in (claude_code, continue_dev, generic_mcp, kimi, ollama, openai):
+    for mod in (claude_code, codex, continue_dev, generic_mcp, kimi, ollama, openai):
         for _name, obj in inspect.getmembers(mod, inspect.isclass):
             if (
                 issubclass(obj, BaseAgentAdapter)

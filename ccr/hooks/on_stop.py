@@ -65,12 +65,57 @@ def _extract_text_from_content(content) -> str:
     if isinstance(content, list):
         parts = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") in ("text", "input_text", "output_text"):
                 text = block.get("text", "")
                 if text:
                     parts.append(text)
         return "\n".join(parts)
     return ""
+
+
+def _parse_codex_transcript_objects(objects: list[dict]) -> list[dict]:
+    """Parse Codex CLI JSONL transcript objects into Q&A turns."""
+    turns = []
+    pending_user: str | None = None
+
+    for obj in objects:
+        obj_type = obj.get("type", "")
+        payload = obj.get("payload", {})
+
+        if obj_type == "response_item" and isinstance(payload, dict):
+            if payload.get("type") != "message":
+                continue
+            role = payload.get("role", "")
+            text = _extract_text_from_content(payload.get("content", ""))
+            if role == "user" and text:
+                pending_user = text
+            elif role == "assistant" and text and pending_user is not None:
+                phase = payload.get("phase", "")
+                if phase in ("", "final_answer"):
+                    turns.append({
+                        "user_message": pending_user,
+                        "assistant_message": text,
+                    })
+                    pending_user = None
+
+        elif obj_type == "event_msg" and isinstance(payload, dict):
+            event_type = payload.get("type", "")
+            if event_type == "user_message":
+                message = payload.get("message", "")
+                if isinstance(message, str) and message.strip():
+                    pending_user = message
+            elif event_type == "agent_message" and pending_user is not None:
+                if payload.get("phase") != "final_answer":
+                    continue
+                message = payload.get("message", "")
+                if isinstance(message, str) and message.strip():
+                    turns.append({
+                        "user_message": pending_user,
+                        "assistant_message": message,
+                    })
+                    pending_user = None
+
+    return turns
 
 
 def _parse_transcript(transcript_path: str) -> list[dict]:
@@ -98,6 +143,10 @@ def _parse_transcript(transcript_path: str) -> list[dict]:
             objects.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    codex_turns = _parse_codex_transcript_objects(objects)
+    if codex_turns:
+        return codex_turns
 
     # Walk through objects pairing user → assistant
     turns = []
@@ -328,7 +377,7 @@ def _auto_baseline_commit(mem: object, state: object, store: object, session_id:
             author="[auto-baseline]",
         )
         print(f"[CCR] Auto-baseline: {fields['title']}")
-    except Exception as exc:
+    except Exception:
         import traceback as _tb
         _log_hook_error(f"Auto-baseline commit failed: {_tb.format_exc()}")
 
