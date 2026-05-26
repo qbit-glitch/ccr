@@ -6,7 +6,6 @@ Methods: log_ota, _format_ota_log, _get_next_ota_id, _get_ota_slice_since_last_c
 from __future__ import annotations
 
 import logging
-import os
 import re
 from datetime import datetime, timezone
 

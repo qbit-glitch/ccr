@@ -13,7 +13,6 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from ccr.context.embeddings import quick_cosine
 from ccr.core.types import CommitLink
 
 __all__ = ["LinkComputeMixin", "LINK_TYPES"]

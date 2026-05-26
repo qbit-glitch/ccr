@@ -10,18 +10,16 @@ works on tasks, using execution feedback (not ground truth labels).
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ccr.ace.agents import ACECurator, ACEDeduplicator, ACEGenerator, ACEReflector
-from ccr.core.exceptions import ModelError, PlaybookError, PlaybookIOError
+from ccr.core.exceptions import ModelError, PlaybookError
 from ccr.ace.playbook import (
     DeltaOperation,
     Playbook,
-    PlaybookStats,
     create_empty_playbook,
     parse_delta_operations,
 )

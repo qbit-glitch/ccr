@@ -581,11 +581,11 @@ def ace_evolve_from_failures(
 
             if lessons_text:
                 result_parts.append(
-                    f"\n---\n# Optional: Caller-driven synthesis (SkillRL §4.2)\n"
-                    f"For higher-quality skill synthesis, review these failure lessons and call\n"
-                    f"ace_evolve_from_failures again with synthesized_skills=[\n"
-                    f'  {{"content": "skill text", "when_to_apply": "condition", "scope": "general"}}\n'
-                    f"]\n\n" + "\n".join(lessons_text)
+                    "\n---\n# Optional: Caller-driven synthesis (SkillRL §4.2)\n"
+                    "For higher-quality skill synthesis, review these failure lessons and call\n"
+                    "ace_evolve_from_failures again with synthesized_skills=[\n"
+                    '  {"content": "skill text", "when_to_apply": "condition", "scope": "general"}\n'
+                    "]\n\n" + "\n".join(lessons_text)
                 )
 
             text = "\n".join(result_parts) if result_parts else "No skills evolved."

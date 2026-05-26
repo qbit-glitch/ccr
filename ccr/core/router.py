@@ -21,7 +21,6 @@ from ccr.utils.parsing import extract_json_string
 from ccr.core.types import (
     CCRRequest,
     ComplexityTier,
-    ContextPack,
     RouteDecision,
     RouterConfig,
     TaskClassification,

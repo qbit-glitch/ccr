@@ -8,7 +8,6 @@ temporal age decay (F2), and adaptive beam pruning (F3).
 from __future__ import annotations
 
 import heapq
-import re
 from typing import Any
 
 from ccr.context.embeddings import get_embedding_model, quick_cosine

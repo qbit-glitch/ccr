@@ -17,7 +17,6 @@ import httpx
 
 from ccr.core.engine import CCREngine
 from ccr.core.exceptions import CCRError, ModelAuthError
-from ccr.core.types import CCREngineConfig, CCRResponse, TokenUsage
 from ccr.utils.parsing import (
     format_anthropic_error,
     format_anthropic_response,

@@ -9,7 +9,6 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from ccr.core.types import CommitLink
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +108,7 @@ class CommitMixin:
                     "commit-reject", f"Rejected: {title}", "REJECTED",
                     observation=f"Admission control: score={score['score']:.2f}, sim={score['similarity']:.2f} ({reason})",
                     thought=f"Score {score['score']:.2f} below rejection threshold {rejection_threshold:.2f} — low value",
-                    action=f"Commit rejected, not stored",
+                    action="Commit rejected, not stored",
                 ))
                 return f"[REJECTED] {title} (score={score['score']:.2f}, below threshold {rejection_threshold:.2f})"
 
@@ -483,7 +482,7 @@ class CommitMixin:
             )
             if section_match:
                 existing = section_match.group(2).strip()
-                lines = [l for l in existing.split("\n") if l.strip() and l.strip() != "(none yet)"]
+                lines = [line for line in existing.split("\n") if line.strip() and line.strip() != "(none yet)"]
                 lines.insert(0, new_entry)
                 lines = lines[: self.config.milestones_kept]
                 new_section = section_match.group(1) + "\n".join(lines) + "\n"

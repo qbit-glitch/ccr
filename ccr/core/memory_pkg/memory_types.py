@@ -7,26 +7,10 @@ EvolvedSummary dataclass live at module level (not in a class).
 
 from __future__ import annotations
 
-import heapq
-import json
 import logging
-import math
-import os
-import re
-import subprocess
-import tempfile
-import threading
-from collections import defaultdict
-from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any
 
-import yaml
 
-from ccr.context.embeddings import get_embedding_model, load_embeddings, quick_cosine, save_embeddings
-from ccr.core.types import CCRConfig, CommitLink
-from ccr.utils.parsing import extract_json_string
 
 logger = logging.getLogger(__name__)
 

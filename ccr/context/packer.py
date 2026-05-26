@@ -8,10 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
 
 from ccr.context.indexer import RepoIndex
-from ccr.core.exceptions import ModelError, PackingError
+from ccr.core.exceptions import ModelError
 from ccr.utils.parsing import extract_json_string
 from ccr.context.prompts import (
     CONTEXT_PACKING_SYSTEM,

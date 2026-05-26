@@ -10,7 +10,7 @@ import json
 import os
 from typing import Any
 
-from ccr.ace.playbook_types import Bullet, DeltaOperation, FailureLesson, _get_slug
+from ccr.ace.playbook_types import Bullet, FailureLesson, _get_slug
 
 
 class MutationsMixin:

@@ -93,15 +93,15 @@ class Playbook(AnalyticsMixin, SchemaMixin, MutationsMixin):
             if bid in pb._id_index:
                 pb._id_index[bid].failure_lessons = [
                     FailureLesson(
-                        failure_point=l.get("failure_point", ""),
-                        flawed_reasoning=l.get("flawed_reasoning", ""),
-                        counterfactual=l.get("counterfactual", ""),
-                        prevention_principle=l.get("prevention_principle", ""),
-                        task_context=l.get("task_context", ""),
-                        timestamp=l.get("timestamp", ""),
-                        evolved=bool(l.get("evolved", False)),
+                        failure_point=lesson.get("failure_point", ""),
+                        flawed_reasoning=lesson.get("flawed_reasoning", ""),
+                        counterfactual=lesson.get("counterfactual", ""),
+                        prevention_principle=lesson.get("prevention_principle", ""),
+                        task_context=lesson.get("task_context", ""),
+                        timestamp=lesson.get("timestamp", ""),
+                        evolved=bool(lesson.get("evolved", False)),
                     )
-                    for l in lessons
+                    for lesson in lessons
                 ]
         return pb
 
@@ -196,8 +196,8 @@ class Playbook(AnalyticsMixin, SchemaMixin, MutationsMixin):
                     continue
                 db_lessons = existing_lessons.get(bullet.id, [])
                 db_keys = {
-                    (l.get("failure_point", ""), l.get("timestamp", ""))
-                    for l in db_lessons
+                    (lesson.get("failure_point", ""), lesson.get("timestamp", ""))
+                    for lesson in db_lessons
                 }
                 mem_any_evolved = False
                 mem_evolved_keys: set[tuple[str, str]] = set()
@@ -224,7 +224,7 @@ class Playbook(AnalyticsMixin, SchemaMixin, MutationsMixin):
                 # DB lessons as evolved. (The existing API is per-bullet, not per-
                 # lesson; accept this coarser granularity.)
                 if mem_any_evolved and any(
-                    not bool(l.get("evolved", False)) for l in db_lessons
+                    not bool(lesson.get("evolved", False)) for lesson in db_lessons
                 ):
                     if has_nc and c is not None and hasattr(
                         backend, "_failure_lessons_mark_evolved_nc"

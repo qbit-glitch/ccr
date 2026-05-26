@@ -373,9 +373,9 @@ def ace_evolve_schema(
 
             parts = [
                 f"# Schema Health Report (v{schema.version})",
-                f"",
-                f"| Metric | Value |",
-                f"|--------|-------|",
+                "",
+                "| Metric | Value |",
+                "|--------|-------|",
                 f"| Section Balance | {metrics.section_balance:.3f} |",
                 f"| Utilization Rate | {metrics.utilization_rate:.3f} |",
                 f"| Harmful Ratio | {metrics.harmful_ratio:.3f} |",
@@ -396,7 +396,7 @@ def ace_evolve_schema(
                 bl = schema.baseline_metrics
                 delta = metrics.overall_health - bl.overall_health
                 parts.extend([
-                    f"",
+                    "",
                     f"## Baseline Comparison (v{schema.version} adopted at {bl.overall_health:.3f})",
                     f"Health delta: {delta:+.3f}",
                 ])
@@ -410,8 +410,8 @@ def ace_evolve_schema(
 
             # Schema parameters
             parts.extend([
-                f"",
-                f"## Schema Parameters",
+                "",
+                "## Schema Parameters",
                 f"- Decay rate: {schema.decay_rate}",
                 f"- Prune min harmful: {schema.prune_min_harmful}",
                 f"- Evolution threshold: {schema.evolution_threshold}",
@@ -425,18 +425,18 @@ def ace_evolve_schema(
 
             # Proposals
             if proposals:
-                parts.extend([f"", f"## Proposals"])
+                parts.extend(["", "## Proposals"])
                 for i, p in enumerate(proposals, 1):
                     parts.append(
                         f"  {i}. **{p.change_type}** (confidence: {p.confidence:.2f})\n"
                         f"     {p.description}"
                     )
                 parts.append(
-                    f"\nCall `ace_evolve_schema(apply_proposal=N)` to apply, "
-                    f"or `ace_evolve_schema(rollback=True)` to revert."
+                    "\nCall `ace_evolve_schema(apply_proposal=N)` to apply, "
+                    "or `ace_evolve_schema(rollback=True)` to revert."
                 )
             else:
-                parts.append(f"\n## No proposals — playbook schema is healthy.")
+                parts.append("\n## No proposals — playbook schema is healthy.")
 
             text = "\n".join(parts)
             return AceEvolveSchemaResult(

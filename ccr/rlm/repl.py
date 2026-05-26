@@ -26,8 +26,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from ccr.core.types import REPLResult
-from ccr.rlm.repl_security import (
+from ccr.core.types import REPLResult  # noqa: E402
+from ccr.rlm.repl_security import (  # noqa: E402
     _BoundedStringIO,
     _DEFAULT_TIMEOUT_SECONDS,
     _RESERVED_NAMES,

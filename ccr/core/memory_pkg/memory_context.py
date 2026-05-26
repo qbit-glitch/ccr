@@ -7,11 +7,8 @@ import logging
 import math
 import os
 import re
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any
 
-from ccr.context.embeddings import get_embedding_model, quick_cosine
+from ccr.context.embeddings import get_embedding_model
 
 logger = logging.getLogger(__name__)
 

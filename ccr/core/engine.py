@@ -9,29 +9,21 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any
 
 from ccr.context.indexer import RepoIndex
 from ccr.context.packer import ContextPacker
 from ccr.core.exceptions import (
-    ConfigError,
     ModelAuthError,
-    ModelConnectionError,
     ModelError,
-    PackingError,
     PlaybookError,
-    RoutingError,
 )
 from ccr.core.memory import MemoryManager
 from ccr.core.router import TaskRouter
 from ccr.core.hooks import HookManager, create_default_hooks
 from ccr.core.types import (
-    CCRConfig,
     CCREngineConfig,
     CCRRequest,
     CCRResponse,
-    ComplexityTier,
-    ContextPack,
     HookEvent,
     RouteDecision,
     TokenUsage,
@@ -42,7 +34,6 @@ from ccr.models.openai_compat import OpenAICompatClient
 from ccr.rlm.orchestrator import CCRRlm
 from ccr.utils.costs import CostTracker
 from ccr.utils.parsing import build_messages_with_context
-from ccr.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
 

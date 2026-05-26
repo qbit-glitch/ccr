@@ -77,7 +77,6 @@ class LinksMixin(LinkComputeMixin, LinkTraversalMixin, LinkClusterMixin):
         model = get_embedding_model()
         if model is None:
             return None
-        import numpy as np  # soft dep -- only reachable when ONNX available
         try:
             vec = model.embed_query(text)
 

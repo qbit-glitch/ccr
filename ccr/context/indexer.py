@@ -17,8 +17,6 @@ from ccr.context.indexer_types import (
     SYMBOL_PATTERNS,
     LANGUAGE_MAP,
     DEFAULT_IGNORES,
-    _AUTO_QUESTION_WORDS,
-    _AUTO_SYMBOL_RE,
     _detect_mode,
     ChunkEntry,
     FileEntry,

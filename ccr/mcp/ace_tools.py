@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -12,7 +11,7 @@ from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ccr.ace.playbook import DeltaOperation, Playbook, parse_delta_operations
-from ccr.core.types import PlaybookSchema, SchemaMetrics
+from ccr.core.types import PlaybookSchema
 from ccr.mcp.server import mcp
 import ccr.mcp.server as _srv
 
@@ -43,17 +42,13 @@ def _get_playbook_dir(scope: str) -> str:
     return os.path.join(_srv._project_root, ".ccr")
 
 
-from ccr.mcp_types import (
+from ccr.mcp_types import (  # noqa: E402
     AceApplyDeltaResult,
-    AceEvolveFromFailuresResult,
-    AceEvolveSchemaResult,
     AceFindSimilarResult,
-    AceGenerateBulletsResult,
     AcePlaybookResult,
     AcePruneResult,
     AceUpdateCountersResult,
 )
-from ccr.utils.parsing import extract_json_string
 
 
 # ===========================================================================

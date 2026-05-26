@@ -13,7 +13,6 @@ import os
 import platform
 import shutil
 import sys
-import sysconfig
 
 logger = logging.getLogger(__name__)
 

@@ -51,7 +51,6 @@ def _parse_discussion_blocks(text: str) -> list[dict[str, Any]]:
     while idx + 2 < len(parts):
         disc_id = parts[idx]
         disc_date = parts[idx + 1]
-        topic_and_rest = parts[idx + 2]
         idx += 3
 
         # First line of body after the header is already consumed by the split group

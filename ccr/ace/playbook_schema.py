@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from ccr.ace.playbook_types import _normalize_section, _SLUG_MAP
 
 if TYPE_CHECKING:
-    from ccr.ace.playbook_types import Bullet
+    from ccr.core.types import PlaybookSchema, SchemaMetrics, SchemaProposal
 
 
 class SchemaMixin:

@@ -191,7 +191,7 @@ def stats(project: str, multiplier: float, last: int) -> None:
         click.echo(f"  Avg session duration:  {avg_dur:.0f} min")
 
     click.echo()
-    click.echo(f"30-session projection")
+    click.echo("30-session projection")
     avg_overhead_per_session = total_overhead / total_sessions if total_sessions else 0
     projected_gross = avg_tokens * 30 * multiplier
     projected_overhead = avg_overhead_per_session * 30
@@ -207,7 +207,7 @@ def stats(project: str, multiplier: float, last: int) -> None:
     click.echo()
     # Show overhead column only when at least one session has reminder data
     if has_overhead_data:
-        click.echo(f"Recent sessions")
+        click.echo("Recent sessions")
         click.echo(f"  {'Date':<12} {'Context':>8}  {'Overhead':>9}  {'Net saved':>10}  {'Duration':>10}")
         click.echo(f"  {'-'*12} {'-'*8}  {'-'*9}  {'-'*10}  {'-'*10}")
         for s in reversed(sessions[-10:]):
@@ -222,7 +222,7 @@ def stats(project: str, multiplier: float, last: int) -> None:
             dur_str = f"{dur:.0f} min" if dur else "  --  "
             click.echo(f"  {dt:<12} {ctx:>8,}  {ovhd:>9,}  {net:>10,}  {dur_str:>10}")
     else:
-        click.echo(f"Recent sessions")
+        click.echo("Recent sessions")
         click.echo(f"  {'Date':<12} {'Context':>8}  {'Avoided':>9}  {'Duration':>10}")
         click.echo(f"  {'-'*12} {'-'*8}  {'-'*9}  {'-'*10}")
         for s in reversed(sessions[-10:]):
@@ -238,15 +238,15 @@ def stats(project: str, multiplier: float, last: int) -> None:
 
     click.echo()
     click.echo(
-        f"* Est. context injected = hook output length \u00f7 4 chars/token (heuristic estimate)."
+        "* Est. context injected = hook output length \u00f7 4 chars/token (heuristic estimate)."
     )
     click.echo(
         f"  Gross savings = context injected \u00d7{multiplier:.0f} (speculative: assumes you'd "
         f"re-type that much context without CCR — use --multiplier 1 to see measured only)."
     )
     click.echo(
-        f"  Net savings = gross savings \u2212 per-turn reminder overhead (~32 tokens/turn on tool-use turns; 0 on Q&A-only turns)."
+        "  Net savings = gross savings \u2212 per-turn reminder overhead (~32 tokens/turn on tool-use turns; 0 on Q&A-only turns)."
     )
     click.echo(
-        f"  Pass --multiplier N to adjust (--multiplier 1 = measured only, no speculation)."
+        "  Pass --multiplier N to adjust (--multiplier 1 = measured only, no speculation)."
     )

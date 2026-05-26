@@ -384,7 +384,7 @@ class CCRRlm:
 
         parts = [
             "## Task",
-            f"A task prompt has been loaded into your REPL as `task_prompt` (string variable).",
+            "A task prompt has been loaded into your REPL as `task_prompt` (string variable).",
             f"- Length: {len(prompt)} chars (~{token_est} tokens)",
             f'- Preview: "{prefix}"',
             "",

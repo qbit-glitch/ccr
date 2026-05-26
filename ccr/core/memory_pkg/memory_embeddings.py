@@ -9,8 +9,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+from typing import TYPE_CHECKING
 
 from ccr.context.embeddings import get_embedding_model, load_embeddings, save_embeddings
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,6 @@ class EmbeddingsMixin:
         model = get_embedding_model()
         if model is None:
             return None
-        import numpy as np  # soft dep -- only reachable when ONNX available
         try:
             # embed_query is expensive ONNX inference — run outside the lock
             vec = model.embed_query(text)

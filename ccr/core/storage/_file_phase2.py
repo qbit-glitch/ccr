@@ -275,9 +275,9 @@ class FilePhase2Mixin:
                 return 0
             lessons = entry.get("lessons", []) if isinstance(entry, dict) else entry
             count = 0
-            for l in lessons:
-                if not l.get("evolved", False):
-                    l["evolved"] = True
+            for lesson in lessons:
+                if not lesson.get("evolved", False):
+                    lesson["evolved"] = True
                     count += 1
             if isinstance(entry, dict):
                 entry["lessons"] = lessons

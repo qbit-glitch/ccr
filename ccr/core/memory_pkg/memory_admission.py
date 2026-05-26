@@ -10,16 +10,11 @@ Methods:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import os
-import re
 from datetime import datetime, timezone
 from typing import Any
 
-from ccr.context.embeddings import quick_cosine
-from ccr.core.types import CCRConfig
 
 logger = logging.getLogger(__name__)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # (input_cost_per_1M, output_cost_per_1M) in USD
 MODEL_COSTS: dict[str, tuple[float, float]] = {

@@ -219,8 +219,8 @@ def _format_comparison_table(records: list[dict]) -> str:
     )
 
     lines = [
-        f"## Experiment Comparison",
-        f"",
+        "## Experiment Comparison",
+        "",
         f"| Field | {a['commit_id']} ({exp_a.get('id', '?')}) | {b['commit_id']} ({exp_b.get('id', '?')}) |",
         f"|-------|{'---|' * 2}",
         f"| Date  | {a['date']} | {b['date']} |",

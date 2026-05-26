@@ -46,7 +46,7 @@ def main():
         action="Triggered pre-compact reminder",
     )
 
-    from ccr.hooks.canonical import HookPayload, format_reminder, ContextFormat
+    from ccr.hooks.canonical import HookPayload, format_reminder
 
     payload = HookPayload.from_stdin()
     fmt = payload.format

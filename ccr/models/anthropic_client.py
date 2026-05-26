@@ -14,7 +14,7 @@ from ccr.core.exceptions import (
     ModelRateLimitError,
     ModelTimeoutError,
 )
-from ccr.core.types import TokenUsage, SessionUsage, ContextPack
+from ccr.core.types import TokenUsage, SessionUsage
 from ccr.models.base import BaseLMClient
 from ccr.models.retry import RetryConfig, retry_with_backoff
 from ccr.utils.costs import calculate_cost

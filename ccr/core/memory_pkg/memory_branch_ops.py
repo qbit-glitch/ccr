@@ -122,7 +122,6 @@ class BranchOpsMixin:
 
         os.makedirs(branch_dir, exist_ok=True)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        now_full = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
         # Write commits.md with header
         self._write_file(
@@ -244,7 +243,7 @@ class BranchOpsMixin:
             "merge", f"\u2192 main ({outcome})", "OK",
             observation=f"Branch '{branch_name}' ready for merge",
             thought=f"Outcome: {outcome}. {conclusion}",
-            action=f"Merged into main, switching back",
+            action="Merged into main, switching back",
         ))
         self._append_log("main", self._format_ota_log(
             "merge", f"\u2190 {branch_name} ({outcome})", "OK",

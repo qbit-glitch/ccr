@@ -7,7 +7,6 @@ import sys as _sys
 import os
 import re
 import subprocess
-import tempfile
 import threading
 from contextlib import contextmanager
 
@@ -57,8 +56,12 @@ class FileIOMixin:
                 ["git", "add", ".ccr/"],
                 cwd=self.project_root, capture_output=True, timeout=10,
             )
+            # No --allow-empty: .ccr/ is gitignored, so when nothing is staged
+            # git refuses the commit (returncode != 0) and we make no commit.
+            # --allow-empty would otherwise mint an empty commit on every memory
+            # write, polluting the host repo's history with misleading markers.
             result = subprocess.run(
-                ["git", "commit", "-m", message, "--allow-empty"],
+                ["git", "commit", "-m", message],
                 cwd=self.project_root, capture_output=True, timeout=10,
             )
             return result.returncode == 0
