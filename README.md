@@ -34,11 +34,12 @@ That's it. Your agent will automatically load project memory on every session st
 
 ### What CCR Does
 
-CCR is an MCP server that gives AI agents three capabilities they don't have natively:
+CCR is an MCP server that gives AI agents capabilities they don't have natively:
 
 1. **Persistent Memory (GCC)** — Git-style version-controlled memory that survives across sessions. Branch, merge, and search your project's decision history.
 2. **Self-Evolving Playbooks (ACE)** — Strategy bullets that track what works and what doesn't, with temporal decay and automatic pruning.
 3. **Sandboxed REPL (RLM)** — An isolated Python environment for iterative analysis, with repo search and structured output.
+4. **Project Task Queue (TODO)** — Durable, branch-aware task lists that persist across sessions. Create, update, and review tasks with priorities, due dates, labels, and blockers.
 
 All core tools run with minimal overhead. The AI agent itself provides the reasoning; CCR provides the memory layer.
 
@@ -154,6 +155,23 @@ Then in your session, call `gcc_context(level=2)` to load memory and `gcc_commit
 - **ONNX embeddings**: Optional dense embeddings (all-MiniLM-L6-v2, 384-dim)
 - **Zero-config**: Works immediately; semantic search available with `pip install ccr-memory[semantic]`
 
+### Project Task Queue (TODO)
+
+A durable, branch-aware task list stored in `.ccr/` alongside project memory. Unlike ephemeral in-session task tools, TODOs survive across sessions and can be reviewed at session start via `gcc_todo_digest`. Supports priorities, statuses, labels, due dates, parent tasks, and blockers.
+
+```python
+# Common flow
+gcc_todo_add("Refactor auth module", priority="high", due_at="2026-08-15")
+gcc_todos()                        # list active TODOs
+gcc_todo_update("TODO-1", status="in_progress")
+gcc_todo_done("TODO-1", note="Completed in PR #42")
+gcc_todo_digest()                  # compact digest for session start
+```
+
+### Evidence-First Recall
+
+`gcc_recall` returns structured evidence for a query — ranked commit snippets, relevant facts, and linked discussions — in a single call designed for agent prompts. `gcc_facts` manages discrete factual assertions (entity, relation, value, confidence) that persist across sessions.
+
 ### Session Logger
 
 Every Q&A turn (user message + the agent's response) is persisted to `.ccr/sessions.db` (SQLite). Use it to replay any past session, debug unexpected agent behaviour, or export conversation pairs for fine-tuning. Logging is automatic when hooks are active — the agent calls `session_log_turn` after each response. See [docs/session-logger.md](https://github.com/qbit-glitch/ccr/blob/main/docs/session-logger.md) for the full reference.
@@ -162,13 +180,15 @@ Every Q&A turn (user message + the agent's response) is persisted to `.ccr/sessi
 
 ```
 AI Agent ──stdio──> CCR MCP Server
-                         ├── GCC Memory    (.ccr/commits, branches, patterns)
+                         ├── GCC Memory    (.ccr/memory.db — commits, branches, patterns, facts)
                          ├── ACE Playbook  (.ccr/playbook.txt, failure_lessons.json)
+                         ├── TODO Queue    (.ccr/memory.db — durable task list, branch-scoped)
+                         ├── Session Log   (.ccr/sessions.db — Q&A turn history)
                          ├── RLM Sandbox   (isolated Python subprocess)
-                         └── Repo Index    (.ccr/index.json, embeddings)
+                         └── Repo Index    (.ccr/index.db — keyword + BM25 + ONNX embeddings)
 ```
 
-CCR stores all data in a `.ccr/` directory within your project (like `.git/`). Global strategies live in `~/.ccr/`.
+CCR stores all data in a `.ccr/` directory within your project (like `.git/`). Global strategies live in `~/.ccr/`. The default storage backend is SQLite (`CCR_STORAGE_BACKEND=sqlite`), which is set automatically by `ccr install-global`.
 
 ## Tools
 
@@ -192,10 +212,23 @@ CCR stores all data in a `.ccr/` directory within your project (like `.git/`). G
 | `gcc_patterns` | Query transferable patterns |
 | `gcc_scratchpad` | Ephemeral working memory |
 | `gcc_consolidate` | Generate hierarchical summaries |
+| `gcc_recall` | Evidence-first retrieval — ranked commits, facts, and discussions in one call |
+| `gcc_facts` | Manage discrete factual assertions (entity/relation/value) across sessions |
 | `ace_find_similar` | Find duplicate strategies |
 | `ace_prune` | Remove harmful strategies |
 | `rlm_init` / `rlm_execute` / `rlm_finalize` | Sandboxed REPL |
 | `index_build` / `index_search` | Repo search |
+
+### Project Task Queue
+
+| Tool | Purpose |
+|------|---------|
+| `gcc_todos` | List durable project TODOs with status/branch filters |
+| `gcc_todo_add` | Create a TODO with priority, due date, labels, and blockers |
+| `gcc_todo_update` | Update fields on an existing TODO |
+| `gcc_todo_done` | Mark a TODO complete with an optional note |
+| `gcc_todo_delete` | Soft-cancel or hard-delete a TODO |
+| `gcc_todo_digest` | Compact active-TODO summary for session start context |
 
 ### Session Logger
 
@@ -262,8 +295,15 @@ pip install ccr-memory[full]      # Both of the above
 | Variable | Purpose |
 |----------|---------|
 | `CCR_PROJECT_ROOT` | Override project root detection |
+| `CCR_STORAGE_BACKEND` | `sqlite` (default, set by `ccr install-global`) or `file` (legacy flat-file) |
 | `CCR_OLLAMA_MODEL` | Enable Ollama sub-model (e.g., `qwen2.5:7b`) |
 | `ANTHROPIC_API_KEY_SUB` | Enable Anthropic Haiku sub-model |
+| `CCR_ENCRYPTION_KEY` | AES-GCM at-rest encryption key (hex) for `.ccr/` data |
+| `CCR_ENCRYPTION_PASSPHRASE` | Derive encryption key from passphrase (alternative to `CCR_ENCRYPTION_KEY`) |
+| `CCR_RERANKER` | Enable recall reranking: `bm25`, `cross_encoder`, or `rrf` |
+| `CCR_RERANKER_MODEL` | Cross-encoder model name for `cross_encoder` reranker |
+| `CCR_MCP_VERBOSE` | Set to `1` to enable verbose MCP server logging |
+| `CCR_OTEL_ENABLED` | Set to `1` to enable OpenTelemetry tracing for hook performance |
 
 Sub-models are optional — they enable LLM-powered features like rolling summary synthesis and automatic bullet generation.
 
