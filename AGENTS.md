@@ -63,9 +63,9 @@ tests/unit/         # ~1993 tests
 
 ## Key Patterns
 
-- **34 MCP tools** always active (gcc×16, ace×8, rlm×3, index×3, session×4)
-  (Note: `grep "@mcp.tool" ccr/mcp/*.py` counts 37 — 3 extra hits are in comment strings
-  in `__init__.py` and `server.py`. Actual tool-function count = 34.)
+- **44 MCP tools** always active (gcc×26, ace×8, rlm×3, index×3, session×4)
+  (Note: broad `@mcp.tool` text searches also match comment/docstring mentions.
+  Actual registered tool-function count = 44.)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
 - **Two-tier playbook**: Global (~/.ccr/global.db) + project (.ccr/memory.db) via SQLite; `scope="global"|"project"` on ACE tools. WAL locking makes concurrent Codex sessions on different projects safe for global-scope writes.

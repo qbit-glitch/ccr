@@ -59,6 +59,15 @@ from ccr.mcp.gcc_tools import (  # noqa: F401
     gcc_search,
 )
 
+from ccr.mcp.gcc_todo_tools import (  # noqa: F401
+    gcc_todos,
+    gcc_todo_add,
+    gcc_todo_update,
+    gcc_todo_done,
+    gcc_todo_delete,
+    gcc_todo_digest,
+)
+
 # Re-export all ACE tool functions and helpers
 from ccr.mcp.ace_tools import (  # noqa: F401
     ace_get_playbook,

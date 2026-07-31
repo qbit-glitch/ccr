@@ -21,6 +21,8 @@ class GccCommitResult(TypedDict):
     admission_decision: str  # "created" | "merged" | "rejected"
     message: str
     trigger_suggestions: NotRequired[list[dict]]  # ERL-style trigger/action pairs (F7)
+    todo_updates: NotRequired[list[dict]]
+    todo_digest: NotRequired[dict]
 
 
 class GccBranchResult(TypedDict):
@@ -94,6 +96,21 @@ class GccScratchpadResult(TypedDict):
     mode: str  # "get" | "set" | "clear"
     key: NotRequired[str]
     cleared: NotRequired[int]
+    message: str
+
+
+class GccTodoResult(TypedDict):
+    action: str
+    count: int
+    todos: list[dict]
+    message: str
+
+
+class GccTodoDigestResult(TypedDict):
+    count: int
+    overdue: int
+    blocked: int
+    todos: list[dict]
     message: str
 
 

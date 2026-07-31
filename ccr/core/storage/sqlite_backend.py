@@ -12,6 +12,7 @@ Method implementations are split across phase-specific mixin files:
   _sqlite_phase3a.py — commits, rolling summaries, branches
   _sqlite_phase3b.py — links, patterns, triples, evolved summaries, clusters
   _sqlite_phase3c.py — discussions, session/phase summaries, summary meta, project state
+  _sqlite_phase3d.py — project todos
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from ccr.core.storage._sqlite_phase2 import Phase2Mixin
 from ccr.core.storage._sqlite_phase3a import Phase3aMixin
 from ccr.core.storage._sqlite_phase3b import Phase3bMixin
 from ccr.core.storage._sqlite_phase3c import Phase3cMixin
+from ccr.core.storage._sqlite_phase3d import Phase3dMixin
 from ccr.core.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
@@ -238,6 +240,36 @@ CREATE TABLE IF NOT EXISTS project_state (
 );
 """
 
+_PHASE3D_TABLES = """
+CREATE TABLE IF NOT EXISTS todos (
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'todo',
+    priority         TEXT NOT NULL DEFAULT 'normal',
+    order_index      INTEGER NOT NULL DEFAULT 1000,
+    branch           TEXT NOT NULL DEFAULT 'main',
+    scope            TEXT NOT NULL DEFAULT 'project',
+    parent_id        TEXT NOT NULL DEFAULT '',
+    blocked_by_json  TEXT NOT NULL DEFAULT '[]',
+    labels_json      TEXT NOT NULL DEFAULT '[]',
+    assignee         TEXT NOT NULL DEFAULT '',
+    due_at           TEXT NOT NULL DEFAULT '',
+    started_at       TEXT NOT NULL DEFAULT '',
+    completed_at     TEXT NOT NULL DEFAULT '',
+    completion_note  TEXT NOT NULL DEFAULT '',
+    percent_complete INTEGER NOT NULL DEFAULT 0,
+    source           TEXT NOT NULL DEFAULT 'manual',
+    source_commit    TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
+CREATE INDEX IF NOT EXISTS idx_todos_branch ON todos(branch);
+CREATE INDEX IF NOT EXISTS idx_todos_due ON todos(due_at);
+CREATE INDEX IF NOT EXISTS idx_todos_parent ON todos(parent_id);
+"""
+
 _PHASE2_TABLES = """
 CREATE TABLE IF NOT EXISTS playbook_bullets (
     id                  TEXT PRIMARY KEY,
@@ -376,6 +408,7 @@ class SqliteConnectionManager:
 
 class SqliteStorageBackend(
     Phase1Mixin, Phase2Mixin, Phase3aMixin, Phase3bMixin, Phase3cMixin,
+    Phase3dMixin,
     StorageBackend,
 ):
     """SQLite-backed storage for CCR data."""
@@ -396,6 +429,7 @@ class SqliteStorageBackend(
         self._ensure_phase3a_tables()
         self._ensure_phase3b_tables()
         self._ensure_phase3c_tables()
+        self._ensure_phase3d_tables()
         self._sync_flat_file_commits()
 
         # Phase 2: install FTS5 virtual tables + triggers (graceful if FTS5 missing)
@@ -502,6 +536,9 @@ class SqliteStorageBackend(
 
     def _ensure_phase3c_tables(self) -> None:
         self.memory_conn.executescript(_PHASE3C_TABLES)
+
+    def _ensure_phase3d_tables(self) -> None:
+        self.memory_conn.executescript(_PHASE3D_TABLES)
 
     def _get_scoped_conn(self, scope: str) -> sqlite3.Connection:
         if scope == "global":

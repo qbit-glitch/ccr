@@ -25,6 +25,7 @@ from ccr.core.memory_pkg.memory_commit import CommitMixin
 from ccr.core.memory_pkg.memory_branch_ops import BranchOpsMixin
 from ccr.core.memory_pkg.memory_consolidation import ConsolidationMixin
 from ccr.core.memory_pkg.memory_context import ContextMixin
+from ccr.core.memory_pkg.memory_todos import TodoMixin
 from ccr.core.memory_pkg.memory_experiments import ExperimentsMixin
 from ccr.core.memory_pkg.memory_discussions import DiscussionsMixin
 
@@ -50,6 +51,7 @@ __all__ = [
     "BranchOpsMixin",
     "ConsolidationMixin",
     "ContextMixin",
+    "TodoMixin",
     "ExperimentsMixin",
     "DiscussionsMixin",
 ]

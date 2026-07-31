@@ -144,6 +144,28 @@ class TestHandleSessionStartEmptyProject(unittest.TestCase):
         self.assertNotIn("MANDATORY_CCR_ACTIONS", output)
         self.assertNotIn("This raw context should not be printed", output)
 
+    def test_codex_project_with_noisy_auto_focus_suppresses_it(self):
+        class FakeMemNoisyCodex(FakeMemWithCommits):
+            def get_context(self, level: int = 1) -> str:
+                return (
+                    "## Current Focus\n"
+                    "[auto] status ??. Next:\n\n"
+                    "## Recent Milestones\n"
+                    "- [2026-05-26 06:09] (main) [auto] status ??\n"
+                    "- [2026-05-26 05:49] (main) Useful milestone\n\n"
+                    "## Recent Commits\n"
+                    "## [C124] 2026-04-26 16:31 | branch:main | [auto] status ??\n"
+                )
+
+        mem = FakeMemNoisyCodex(self.tmp)
+        with patch.dict(os.environ, {"CCR_HOOK_AGENT": "codex"}):
+            output = self._run_session_start(mem)
+
+        self.assertIn("CCR retrieved full memory", output)
+        self.assertIn("Useful milestone", output)
+        self.assertNotIn("[auto] status", output)
+        self.assertNotIn("Next:Use", output.replace("\n", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

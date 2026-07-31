@@ -114,6 +114,9 @@ def gcc_commit(
     author: str = "",
     ci_context: dict | None = None,
     experiment: dict | None = None,
+    related_todos: list[str] | None = None,
+    complete_todos: list[str] | None = None,
+    create_todo_from_next_step: bool = False,
 ) -> GccCommitResult:
     """Commit progress to project memory.
 
@@ -149,6 +152,11 @@ def gcc_commit(
             {"id": "exp-042", "hypothesis": "LoRA r=16 matches full FT",
              "metrics": {"val_loss": 0.23, "accuracy": 0.87},
              "conclusion": "Confirmed — 98% perf at 12% params"}
+        related_todos: Optional TODO IDs related to this commit. Stored in the
+            result only for now; use complete_todos to close TODOs.
+        complete_todos: Optional TODO IDs to mark done after a successful commit.
+        create_todo_from_next_step: If True, create a TODO from clean next_step
+            text after a successful commit.
     """
     # Import ace_tools module (not function) to allow test patching via setattr
     import ccr.mcp.ace_tools as _ace_mod
@@ -285,6 +293,32 @@ def gcc_commit(
             result += "\n\n[Warnings: " + " ".join(_warnings) + "]"
 
         branch = mem.get_active_branch()
+        todo_updates: list[dict] = []
+        todo_digest: dict = {}
+        if result and not result.startswith("Error") and not result.startswith("[REJECTED]"):
+            for todo_id in complete_todos or []:
+                completed = mem.todo_done(todo_id, source_commit=cid)
+                if completed:
+                    todo_updates.append({"action": "done", "todo": completed})
+            if create_todo_from_next_step and next_step.strip():
+                try:
+                    created_todo = mem.todo_add(
+                        title=next_step.strip(),
+                        source="commit_next_step",
+                        source_commit=cid,
+                    )
+                    todo_updates.append({"action": "add", "todo": created_todo})
+                except ValueError:
+                    pass
+            for todo_id in related_todos or []:
+                todo = mem.todo_get(todo_id)
+                if todo:
+                    todo_updates.append({"action": "related", "todo": todo})
+            todo_digest = mem.todo_digest(limit=3, branch=branch)
+            todo_text = mem.format_todo_digest(limit=3, branch=branch, max_chars=420)
+            if todo_text:
+                result += "\n\n" + todo_text
+
         # F7: extract ERL trigger/action suggestions from patterns
         trigger_suggestions: list[dict] = []
         if patterns_learned:
@@ -308,6 +342,8 @@ def gcc_commit(
             admission_decision=admission_decision,
             message=result,
             trigger_suggestions=trigger_suggestions,
+            todo_updates=todo_updates,
+            todo_digest=todo_digest,
         )
     except ValueError:
         raise  # User input validation — let MCP propagate
@@ -492,6 +528,19 @@ def gcc_status(project: str | None = None) -> GccStatusResult:
     # Level-1 context (overview)
     overview = mem.get_context(level=1)
     parts.append(overview)
+
+    try:
+        counts = mem.todo_counts(branch=branch)
+        if counts.get("open", 0):
+            parts.append(
+                "TODOs: "
+                f"{counts.get('in_progress', 0)} in progress, "
+                f"{counts.get('blocked', 0)} blocked, "
+                f"{counts.get('todo', 0)} todo, "
+                f"{counts.get('overdue', 0)} overdue"
+            )
+    except Exception:
+        pass
 
     # Count total commits via cached index (O(1) after first build)
     total_commits = len(mem._build_commit_index(branch))
@@ -843,4 +892,12 @@ from ccr.mcp.gcc_search_tools import (  # noqa: E402,F401
     gcc_discuss,
     gcc_discussions,
     gcc_search,
+)
+from ccr.mcp.gcc_todo_tools import (  # noqa: E402,F401
+    gcc_todos,
+    gcc_todo_add,
+    gcc_todo_update,
+    gcc_todo_done,
+    gcc_todo_delete,
+    gcc_todo_digest,
 )

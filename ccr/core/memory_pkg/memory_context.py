@@ -85,6 +85,13 @@ class ContextMixin:
         if overview:
             parts.append(f"# Project Summary\n{overview}")
 
+        try:
+            todo_digest = self.format_todo_digest(limit=5, branch=branch)
+            if todo_digest:
+                parts.append(todo_digest)
+        except Exception:
+            pass
+
         if level >= 2:
             # Level 2: rolling summary + session summary + recent commits
             rolling = self._get_rolling_summary(branch)

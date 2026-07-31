@@ -6,6 +6,7 @@ Methods are grouped by subsystem and added phase-by-phase:
   Phase 3a: commits, rolling_summaries, branches
   Phase 3b: links, patterns, triples, evolved_summaries, clusters
   Phase 3c: discussions, session_summaries, phase_summaries, summary_meta, project_state
+  Phase 3d: project todos
   Phase 4: index (future)
 """
 
@@ -405,6 +406,48 @@ class StorageBackend(ABC):
     @abstractmethod
     def project_state_set(self, key: str, value: str) -> None:
         """Set a project state value."""
+
+    # ── Phase 3d: TODOs ─────────────────────────────────────────
+
+    @abstractmethod
+    def todo_insert(self, data: dict) -> dict:
+        """Insert a structured TODO item and return the stored record."""
+
+    @abstractmethod
+    def todo_get(self, todo_id: str) -> dict | None:
+        """Get a TODO by ID."""
+
+    @abstractmethod
+    def todo_list(
+        self,
+        status: str | None = None,
+        branch: str | None = None,
+        include_done: bool = False,
+        limit: int = 20,
+    ) -> list[dict]:
+        """List TODOs, sorted for active-work display."""
+
+    @abstractmethod
+    def todo_update(self, todo_id: str, updates: dict) -> bool:
+        """Update a TODO. Returns True if it existed."""
+
+    @abstractmethod
+    def todo_delete(self, todo_id: str) -> bool:
+        """Hard-delete a TODO. Returns True if it existed."""
+
+    @abstractmethod
+    def todo_get_next_id(self) -> str:
+        """Return the next TODO ID, e.g. T001."""
+
+    @abstractmethod
+    def todo_reorder(
+        self,
+        todo_id: str,
+        before_id: str | None = None,
+        after_id: str | None = None,
+        order_index: int | None = None,
+    ) -> bool:
+        """Update TODO ordering. Returns True if the TODO existed."""
 
     # ── Lifecycle ────────────────────────────────────────────────
 

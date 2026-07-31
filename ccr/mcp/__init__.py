@@ -8,6 +8,7 @@ from ccr.mcp.server import main, mcp  # noqa: F401
 # Import tool modules to trigger @mcp.tool decorator registration
 import ccr.mcp.gcc_branch_tools  # noqa: F401
 import ccr.mcp.gcc_search_tools  # noqa: F401
+import ccr.mcp.gcc_todo_tools  # noqa: F401
 import ccr.mcp.gcc_tools  # noqa: F401
 import ccr.mcp.ace_tools  # noqa: F401
 import ccr.mcp.ace_llm_tools  # noqa: F401  (ace_generate_bullets, ace_evolve_schema)

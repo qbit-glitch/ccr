@@ -682,6 +682,7 @@ def main():
     _TOOL_MODULES = [
         ("ccr.mcp.gcc_branch_tools", "GCC branch management tools"),
         ("ccr.mcp.gcc_search_tools", "GCC search and query tools"),
+        ("ccr.mcp.gcc_todo_tools", "GCC TODO tools"),
         ("ccr.mcp.gcc_tools", "GCC core memory tools"),
         ("ccr.mcp.ace_tools", "ACE core playbook tools"),
         ("ccr.mcp.ace_llm_tools", "ACE LLM pipeline tools"),

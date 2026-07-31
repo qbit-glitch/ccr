@@ -10,6 +10,7 @@ Method implementations are split across phase-specific mixin files:
   _file_phase3a.py — commits, rolling summaries, branches
   _file_phase3b.py — links, patterns, triples, evolved summaries, clusters
   _file_phase3c.py — discussions, session/phase summaries, summary meta, project state
+  _file_phase3d.py — project todos
 """
 
 from __future__ import annotations
@@ -22,13 +23,15 @@ from ccr.core.storage._file_phase2 import FilePhase2Mixin
 from ccr.core.storage._file_phase3a import FilePhase3aMixin
 from ccr.core.storage._file_phase3b import FilePhase3bMixin
 from ccr.core.storage._file_phase3c import FilePhase3cMixin
+from ccr.core.storage._file_phase3d import FilePhase3dMixin
 from ccr.core.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
 
 
 class FileStorageBackend(
-    FilePhase1Mixin, FilePhase2Mixin, FilePhase3aMixin, FilePhase3bMixin, FilePhase3cMixin,
+    FilePhase1Mixin, FilePhase2Mixin, FilePhase3aMixin, FilePhase3bMixin,
+    FilePhase3cMixin, FilePhase3dMixin,
     StorageBackend,
 ):
     """Delegates to flat-file I/O (existing .ccr/ layout)."""

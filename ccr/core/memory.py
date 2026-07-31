@@ -33,6 +33,7 @@ from ccr.core.memory_pkg import (
     PatternsMixin,
     RegistryMixin,
     RollingSummaryMixin,
+    TodoMixin,
 )
 from ccr.core.types import CCRConfig
 
@@ -50,6 +51,7 @@ class MemoryManager(
     AdmissionMixin,
     LinksMixin,
     RollingSummaryMixin,
+    TodoMixin,
     CommitMixin,
     BranchOpsMixin,
     ConsolidationMixin,

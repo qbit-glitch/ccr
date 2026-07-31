@@ -217,6 +217,30 @@ def _squash_line(text: str, max_chars: int = 220) -> str:
     return text[: max_chars - 1].rstrip() + "..."
 
 
+def _clean_summary_item(text: str) -> str:
+    """Normalize a single visible Codex hook summary candidate."""
+    text = _squash_line(text, 300)
+    text = re.sub(r"\s*\.?\s*Next:\s*$", "", text).strip()
+    return text
+
+
+def _is_noisy_summary_item(text: str) -> bool:
+    """Return True for auto-generated entries that should not headline startup."""
+    text = _clean_summary_item(text)
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in {"(auto-populated after first commit)", "(none yet)"}:
+        return True
+    if lowered.startswith("[auto]") or lowered.startswith("auto-commit:"):
+        return True
+    if lowered.startswith("<subagent_notification"):
+        return True
+    if re.fullmatch(r"status\s*\?+", lowered):
+        return True
+    return False
+
+
 def _context_section(context: str, heading: str) -> str:
     match = re.search(
         rf"(?ms)^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)",
@@ -230,10 +254,22 @@ def _first_recent_item(context: str) -> str:
         r"(?m)^-\s+\[[^\]]+\]\s+\([^)]+\)\s+(.+)$",
         r"(?m)^##\s+\[C\d+\].*?\|\s+branch:[^|]+\s+\|\s+(.+)$",
     ):
-        match = re.search(pattern, context or "")
-        if match:
-            return match.group(1).strip()
+        for match in re.finditer(pattern, context or ""):
+            item = _clean_summary_item(match.group(1))
+            if not _is_noisy_summary_item(item):
+                return item
     return ""
+
+
+def _todo_count_note(counts: dict | None) -> str:
+    if not counts or not counts.get("open"):
+        return ""
+    parts = [f"{counts.get('open', 0)} active"]
+    if counts.get("blocked"):
+        parts.append(f"{counts['blocked']} blocked")
+    if counts.get("overdue"):
+        parts.append(f"{counts['overdue']} overdue")
+    return "TODOs: " + ", ".join(parts)
 
 
 def _codex_session_summary(
@@ -241,10 +277,13 @@ def _codex_session_summary(
     global_text: str = "",
     playbook_text: str = "",
     was_stale: bool = False,
+    todo_counts: dict | None = None,
 ) -> str:
     """Summarize full CCR context into the short stdout Codex exposes."""
     focus = _context_section(context, "Current Focus")
-    focus = focus.splitlines()[0].strip() if focus else ""
+    focus = _clean_summary_item(focus.splitlines()[0]) if focus else ""
+    if _is_noisy_summary_item(focus):
+        focus = ""
     recent = _first_recent_item(context)
     bullet_count = len(re.findall(r"(?m)^\[[a-z]+-\d+\]", f"{global_text}\n{playbook_text}"))
 
@@ -260,6 +299,9 @@ def _codex_session_summary(
         line1 += "."
 
     line2 = "Use gcc_context/gcc_search only for deeper recall; save with gcc_commit only after meaningful milestones or when asked."
+    todo_note = _todo_count_note(todo_counts)
+    if todo_note:
+        line2 = f"{todo_note}. " + line2
     if focus and recent and recent not in focus:
         line2 = f"Recent: {_squash_line(recent, 120)}. " + line2
     return f"{line1}\n{line2}"
@@ -376,11 +418,17 @@ def _handle_session_start(
 
     # Build output parts using the agent's preferred format
     if _is_codex_agent():
+        todo_counts = None
+        try:
+            todo_counts = mem.todo_counts()
+        except Exception:
+            pass
         output = _codex_session_summary(
             context,
             global_text=global_text,
             playbook_text=playbook_text,
             was_stale=was_stale,
+            todo_counts=todo_counts,
         )
         print(output)
         try:
