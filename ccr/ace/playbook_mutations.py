@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from ccr.ace.playbook_types import Bullet, FailureLesson, _get_slug
+from ccr.utils.fs import replace_file
 
 
 class MutationsMixin:
@@ -244,7 +245,7 @@ class MutationsMixin:
                 json.dump(data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            replace_file(tmp_path, path)
         except BaseException:
             try:
                 os.unlink(tmp_path)

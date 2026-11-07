@@ -14,6 +14,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from ccr.utils.fs import replace_file
 
 
 _STOP_WORDS = {
@@ -44,7 +45,7 @@ def _atomic_json_write(path: str, data: dict[str, Any]) -> None:
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
+        replace_file(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)

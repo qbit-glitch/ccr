@@ -16,6 +16,7 @@ import gzip
 import json
 import logging
 import os
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,7 @@ if SEMANTIC_AVAILABLE:
                     with open(tmp, "wb") as f:
                         for chunk in r.iter_bytes(chunk_size=65536):
                             f.write(chunk)
-                os.replace(tmp, dest)
+                replace_file(tmp, dest)
             except Exception:
                 if os.path.isfile(tmp):
                     os.unlink(tmp)
@@ -193,7 +194,7 @@ def save_embeddings(embeddings: dict[str, list[float]], path: str) -> None:
         data = json.dumps(embeddings, separators=(",", ":"))
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
             f.write(data)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except Exception:
         if os.path.isfile(tmp):
             os.unlink(tmp)

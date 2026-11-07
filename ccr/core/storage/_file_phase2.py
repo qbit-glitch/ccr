@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from ccr.core.storage._sqlite_utils import _utcnow
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ class FilePhase2Mixin:
             f.write("\n".join(lines))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def _load_failure_lessons_json(self, scope: str) -> dict[str, Any]:
         path = self._failure_lessons_path(scope)
@@ -135,7 +136,7 @@ class FilePhase2Mixin:
             json.dump(data, f, indent=2, default=str)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def bullet_get(self, bullet_id: str, scope: str = "project") -> dict | None:
         with self._lock:

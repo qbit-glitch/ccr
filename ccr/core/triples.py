@@ -11,6 +11,7 @@ import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ class TripleStore:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, self._path)
+        replace_file(tmp_path, self._path)
 
     def extract_from_commit(
         self, commit_id: str, title: str, what: str, why: str, files: list[str]

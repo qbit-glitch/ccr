@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from ccr.core.storage._sqlite_utils import _utcnow
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class FilePhase3bMixin:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def link_insert_batch(self, source_id: str, links: list[dict]) -> None:
         with self._lock:
@@ -129,7 +130,7 @@ class FilePhase3bMixin:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def pattern_load_all(self) -> dict:
         with self._lock:
@@ -194,7 +195,7 @@ class FilePhase3bMixin:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def triple_insert_batch(self, triples: list[dict]) -> int:
         with self._lock:
@@ -270,7 +271,7 @@ class FilePhase3bMixin:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def evolved_summary_get(self, commit_id: str) -> dict | None:
         data = self._load_evolved_json()
@@ -312,7 +313,7 @@ class FilePhase3bMixin:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def cluster_save(self, clusters: list[dict]) -> None:
         with self._lock:

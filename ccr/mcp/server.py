@@ -26,6 +26,7 @@ from ccr.core.triples import TripleStore
 from ccr.core.types import CCRConfig, PlaybookSchema
 from ccr.mcp.audit import configure_audit_log
 from ccr.utils.parsing import extract_json_string
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ _global_playbook: Playbook | None = None
 _global_playbook_path: str = ""
 _global_failure_lessons_path: str = ""
 _repo_index: RepoIndex | None = None
+_repo_index_thread = None  # background builder started by _init()
 _repl: object | None = None  # CCRRepl when initialized (backward-compat single session)
 _repl_sessions: dict[str, object] = {}
 _repl_session_ttl: dict[str, float] = {}
@@ -254,51 +256,74 @@ def _init(project_root: str | None = None) -> None:
     except Exception:
         _index_db = None
 
-    # Build repo index — try SQLite load first, then JSON cache, then full build
+    # Build the repo index in a background thread. On large repos (and on slow
+    # filesystems such as NTFS on Windows) a cold build takes minutes, and
+    # Claude Code's 30 s MCP connect timeout fires before the handshake.
+    # Memory/gcc tools answer immediately; _ensure_index() waits for the build.
+    global _repo_index_thread
     _repo_index = None
-    if _index_db is not None:
+    _bg_root, _bg_mem, _bg_db_path = _project_root, _memory, _index_db_path
+    _bg_emb, _bg_chunk = _embeddings_path, _chunk_embeddings_path
+
+    def _build_repo_index_bg() -> None:
+        global _repo_index
+        idx = None
+        db = None
         try:
-            cached = RepoIndex.from_db(_project_root, _index_db)
-            if cached is not None:
-                live_sig = cached._compute_mtime_sig()
-                if live_sig == cached._mtime_sig and cached._mtime_sig:
-                    _repo_index = cached
+            from ccr.context.index_db import IndexDB
+            db = IndexDB(_bg_db_path)  # own connection: sqlite connections are thread-bound
         except Exception:
-            pass
-    if _repo_index is None:
-        try:
-            cache_json = _memory.load_index()
-            if cache_json:
-                cached = RepoIndex.from_cache(_project_root, cache_json)
+            db = None
+        # Try SQLite load first, then JSON cache, then full build
+        if db is not None:
+            try:
+                cached = RepoIndex.from_db(_bg_root, db)
                 if cached is not None:
                     live_sig = cached._compute_mtime_sig()
                     if live_sig == cached._mtime_sig and cached._mtime_sig:
-                        _repo_index = cached
-        except Exception:
-            pass
-    if _repo_index is None:
-        _repo_index = RepoIndex.build(_project_root)
+                        idx = cached
+            except Exception:
+                pass
+        if idx is None:
+            try:
+                cache_json = _bg_mem.load_index()
+                if cache_json:
+                    cached = RepoIndex.from_cache(_bg_root, cache_json)
+                    if cached is not None:
+                        live_sig = cached._compute_mtime_sig()
+                        if live_sig == cached._mtime_sig and cached._mtime_sig:
+                            idx = cached
+            except Exception:
+                pass
+        if idx is None:
+            idx = RepoIndex.build(_bg_root)
 
-    # Load cached embeddings if available
-    if os.path.isfile(_embeddings_path):
-        _repo_index.load_embeddings(_embeddings_path)
+        # Load cached embeddings if available
+        if os.path.isfile(_bg_emb):
+            idx.load_embeddings(_bg_emb)
+        # Load cached chunk embeddings if available (A-RAG §3.1 sentence-level chunks)
+        if os.path.isfile(_bg_chunk):
+            idx.load_chunk_embeddings(_bg_chunk)
 
-    # Load cached chunk embeddings if available (A-RAG §3.1 sentence-level chunks)
-    if os.path.isfile(_chunk_embeddings_path):
-        _repo_index.load_chunk_embeddings(_chunk_embeddings_path)
+        # Save index to IndexDB (always, so FTS5 is populated for search)
+        if db is not None:
+            try:
+                idx.save_to_db(db)
+            except Exception:
+                pass
+        # Save JSON cache (only when freshly built — loaded-from-cache already has valid JSON)
+        if not (hasattr(idx, "_mtime_sig") and idx._mtime_sig):
+            try:
+                _bg_mem.save_index(idx.to_json())
+            except Exception:
+                pass
+        _repo_index = idx
 
-    # Save index to IndexDB (always, so FTS5 is populated for search)
-    if _index_db is not None:
-        try:
-            _repo_index.save_to_db(_index_db)
-        except Exception:
-            pass
-    # Save JSON cache (only when freshly built — loaded-from-cache already has valid JSON)
-    if not (hasattr(_repo_index, "_mtime_sig") and _repo_index._mtime_sig):
-        try:
-            _memory.save_index(_repo_index.to_json())
-        except Exception:
-            pass
+    import threading
+    _repo_index_thread = threading.Thread(
+        target=_build_repo_index_bg, name="ccr-repo-index", daemon=True
+    )
+    _repo_index_thread.start()
 
     # Configure audit logging
     ccr_root = os.path.join(_project_root, ".ccr")
@@ -368,7 +393,7 @@ def _atomic_write(path: str, content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        replace_file(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -584,8 +609,10 @@ def _ensure_playbook() -> Playbook:
 
 
 def _ensure_index() -> RepoIndex:
-    if _repo_index is None:
+    if _repo_index is None and _repo_index_thread is None:
         _init()
+    if _repo_index is None and _repo_index_thread is not None:
+        _repo_index_thread.join()  # wait for the background build
     if _repo_index is None:
         raise RuntimeError("RepoIndex failed to initialize")
     return _repo_index

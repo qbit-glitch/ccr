@@ -356,25 +356,27 @@ def install(project: str, preset: str) -> None:
     # CCR_PROJECT_ROOT is baked in at install time so hooks work regardless of
     # which directory Claude Code is launched from.
     # Paths are shell-quoted so spaces in project/python paths work correctly.
+    # PYTHONUTF8/PYTHONIOENCODING: Windows consoles default to cp1252, which cannot
+    # encode the hooks' non-ASCII output and misreads UTF-8 memory files.
     _q = shlex.quote
     _project_q = _q(project)
     _python_q = _q(python_exe)
     hook_config = {
         "UserPromptSubmit": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {_python_q} {_q(os.path.join(hooks_dir, 'on_session_start.py'))}",
         }],
         "PostToolUse": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {_python_q} {_q(os.path.join(hooks_dir, 'on_tool_use.py'))}",
         }],
         "Stop": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {_python_q} {_q(os.path.join(hooks_dir, 'on_stop.py'))}",
         }],
         "PreCompact": [{
             "type": "command",
-            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite {_python_q} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
+            "command": f"CCR_PROJECT_ROOT={_project_q} CCR_STORAGE_BACKEND=sqlite PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {_python_q} {_q(os.path.join(hooks_dir, 'on_compact.py'))}",
         }],
     }
 

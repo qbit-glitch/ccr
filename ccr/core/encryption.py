@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ccr.core.events import atomic_write_json
 from ccr.core.governance import append_audit
+from ccr.utils.fs import replace_file
 
 
 ALGORITHM = "AES-256-GCM"
@@ -99,7 +100,7 @@ def _atomic_write_bytes(path: str, data: bytes, mode: int | None = None) -> None
             os.fsync(fh.fileno())
         if mode is not None:
             os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
+        replace_file(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)

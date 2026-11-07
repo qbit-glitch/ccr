@@ -2111,6 +2111,7 @@ class TestEnsureRaisesRuntimeError:
     def test_ensure_index_raises_runtime_error(self, monkeypatch):
         import ccr.mcp.server as srv
         monkeypatch.setattr(srv, "_repo_index", None)
+        monkeypatch.setattr(srv, "_repo_index_thread", None)
         monkeypatch.setattr(srv, "_init", lambda *a, **kw: None)
         with pytest.raises(RuntimeError, match="RepoIndex failed"):
             srv._ensure_index()
@@ -2191,3 +2192,24 @@ class TestIdempotencyKeyCap:
         # Neither should say "Already applied"
         assert "Already applied" not in result1.get("message", "")
         assert "Already applied" not in result2.get("message", "")
+
+
+class TestRepoIndexBackgroundBuild:
+    def test_ensure_index_waits_for_background_build(self, monkeypatch):
+        """_init() starts the index build in a thread; _ensure_index() joins it."""
+        import threading
+        import time
+        import ccr.mcp.server as srv
+
+        sentinel = object()
+
+        def slow_build():
+            time.sleep(0.2)
+            srv._repo_index = sentinel
+
+        t = threading.Thread(target=slow_build, daemon=True)
+        monkeypatch.setattr(srv, "_repo_index", None)
+        monkeypatch.setattr(srv, "_repo_index_thread", t)
+        monkeypatch.setattr(srv, "_init", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not re-init")))
+        t.start()
+        assert srv._ensure_index() is sentinel

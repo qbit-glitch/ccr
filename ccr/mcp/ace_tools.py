@@ -49,6 +49,7 @@ from ccr.mcp_types import (  # noqa: E402
     AcePruneResult,
     AceUpdateCountersResult,
 )
+from ccr.utils.fs import replace_file
 
 
 # ===========================================================================
@@ -300,7 +301,7 @@ def ace_apply_delta(
             tmp_path = history_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(existing, fh, indent=2)
-            os.replace(tmp_path, history_path)
+            replace_file(tmp_path, history_path)
         except Exception:
             pass  # Never fail the apply operation
 
@@ -686,7 +687,7 @@ def ace_prune(scope: str = "project", archive: bool = True) -> AcePruneResult:
                 tmp_archive_path = archive_path + ".tmp"
                 with open(tmp_archive_path, "w", encoding="utf-8") as fh:
                     json.dump(existing_archive, fh, indent=2)
-                os.replace(tmp_archive_path, archive_path)
+                replace_file(tmp_archive_path, archive_path)
             except Exception:
                 pass  # Never fail the prune operation
 

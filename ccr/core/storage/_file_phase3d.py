@@ -6,6 +6,7 @@ import json
 import os
 
 from ccr.core.storage._sqlite_utils import _utcnow
+from ccr.utils.fs import replace_file
 
 
 _DONE_STATUSES = {"done", "canceled"}
@@ -54,7 +55,7 @@ class FilePhase3dMixin:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     @staticmethod
     def _next_num_from_todos(todos: list[dict]) -> int:

@@ -10,6 +10,7 @@ import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class Scratchpad:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, self._path)
+        replace_file(tmp_path, self._path)
 
     def set(self, key: str, value: str, ttl_seconds: int | None = None) -> ScratchpadEntry:
         """Set a working memory key-value pair. Creates or updates.

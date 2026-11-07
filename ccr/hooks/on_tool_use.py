@@ -13,6 +13,13 @@ import json
 import os
 import sys
 
+# Windows consoles default to cp1252; CCR hook output contains non-ASCII text.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def _log_hook_error(error_text: str) -> None:
     """Write error to .ccr/.hook_errors.log — non-fatal, never raises."""

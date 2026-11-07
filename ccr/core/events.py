@@ -12,6 +12,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from ccr.utils.fs import replace_file
 
 
 def utc_now() -> str:
@@ -137,7 +138,7 @@ def atomic_write_json(path: str, data: dict[str, Any]) -> None:
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)

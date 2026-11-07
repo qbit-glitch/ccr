@@ -165,7 +165,7 @@ class TestClaudeCodeAdapter:
         assert not any("/old/python" in command for command in all_commands)
         sqlite_commands = [c for c in all_commands if "on_session_start.py" in c]
         assert sqlite_commands == [
-            "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite /usr/bin/python3 /fake/hooks/on_session_start.py"
+            "CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite PYTHONUTF8=1 PYTHONIOENCODING=utf-8 /usr/bin/python3 /fake/hooks/on_session_start.py"
         ]
 
 

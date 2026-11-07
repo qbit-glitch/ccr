@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ccr.core.storage._sqlite_utils import _utcnow
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ class FilePhase1Mixin:
             json.dump({"version": 1, "entries": entries}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
     def scratchpad_set(
         self, key: str, value: str, ttl_seconds: int | None = None,

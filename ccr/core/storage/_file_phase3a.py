@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from typing import Any
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ class FilePhase3aMixin:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
 
     def commit_get(self, branch: str, commit_id: str) -> dict | None:
         for c in self._parse_all_commits(branch):
@@ -200,7 +201,7 @@ class FilePhase3aMixin:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
 
     # ── Branches (Phase 3a) ────────────────────────────────────
 

@@ -9,6 +9,7 @@ import re
 import subprocess
 import threading
 from contextlib import contextmanager
+from ccr.utils.fs import replace_file
 
 if _sys.platform != "win32":
     import fcntl as _fcntl
@@ -137,7 +138,7 @@ class FileIOMixin:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            replace_file(tmp_path, path)
         except BaseException:
             try:
                 os.unlink(tmp_path)

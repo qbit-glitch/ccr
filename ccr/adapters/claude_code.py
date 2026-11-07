@@ -350,9 +350,12 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
 
         _q = shlex.quote
         _py = _q(python_exe)
+        # Windows consoles default to cp1252: hook output with non-ASCII text (e.g. "⚡")
+        # raises UnicodeEncodeError, and open() without an encoding misreads UTF-8 memory files.
+        _utf8_env = "PYTHONUTF8=1 PYTHONIOENCODING=utf-8"
 
         def _hook_entry(script_file: str) -> dict:
-            cmd = f"CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {_py} {_q(os.path.join(hooks_dir, script_file))}"
+            cmd = f"CCR_AUTO_INIT=1 CCR_STORAGE_BACKEND=sqlite {_utf8_env} {_py} {_q(os.path.join(hooks_dir, script_file))}"
             return {"matcher": "", "hooks": [{"type": "command", "command": cmd}]}
 
         ccr_hooks = {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from ccr.utils.fs import replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class FilePhase3cMixin:
                 f.write(new_content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
 
     def discussion_list(
         self, branch: str, search: str | None = None,
@@ -220,7 +221,7 @@ class FilePhase3cMixin:
                 f.write(new_content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
 
     def session_summary_list(self, branch: str, count: int = 3) -> list[dict]:
         records = self._parse_session_summaries(branch)
@@ -313,7 +314,7 @@ class FilePhase3cMixin:
                 f.write(new_content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
 
     def phase_summary_list(self, count: int = 3) -> list[dict]:
         records = self._parse_phase_summaries()
@@ -363,7 +364,7 @@ class FilePhase3cMixin:
                 yaml.dump(data, f, default_flow_style=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
         except Exception:
             pass
 
@@ -393,4 +394,4 @@ class FilePhase3cMixin:
                 f.write(value)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            replace_file(tmp, path)
