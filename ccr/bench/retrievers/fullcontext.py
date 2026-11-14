@@ -14,6 +14,7 @@ class FullContextRetriever:
 
     name = "full_context"
     max_k: int | None = None
+    ranks_docs = False  # returns everything; recall/nDCG would be meaningless
 
     def __init__(self) -> None:
         self.empty_count = 0

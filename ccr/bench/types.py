@@ -43,3 +43,4 @@ class BenchConfig:
     sample_fraction: float
     chunk_tokens: int
     cache_dir: str
+    reader_k: int = 5
