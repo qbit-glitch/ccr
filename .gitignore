@@ -39,3 +39,7 @@ htmlcov/
 .worktrees/
 .claude/worktrees/
 .claude/
+
+# benchmark outputs and executor scratch
+bench_out/
+.superpowers/
