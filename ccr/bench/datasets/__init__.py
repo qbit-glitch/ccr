@@ -24,5 +24,6 @@ def default_sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:
 # Importing each adapter registers it in ADAPTERS (and SAMPLERS/GAINS if needed).
 from ccr.bench.datasets import locomo as _locomo  # noqa: E402,F401
 from ccr.bench.datasets import longmemeval as _longmemeval  # noqa: E402,F401
+from ccr.bench.datasets import beir as _beir  # noqa: E402,F401
 
 __all__ = ["ADAPTERS", "GAINS", "SAMPLERS", "Adapter", "GainsFor", "Sampler", "default_sampler"]
