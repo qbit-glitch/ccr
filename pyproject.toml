@@ -51,6 +51,9 @@ semantic = [
 vector = [
     "sqlite-vec>=0.1.0",
 ]
+bench = [
+    "pyarrow>=15",
+]
 watch = [
     "watchdog>=4.0.0",
 ]
