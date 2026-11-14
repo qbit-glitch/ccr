@@ -10,7 +10,7 @@ set -u
 PY="${PY:-.venv-bench/bin/python}"
 OUT="${OUT:-bench_out/full}"
 PHASE="${1:-all}"
-FULLCTX_NUM_CTX="${FULLCTX_NUM_CTX:-65536}"
+FULLCTX_NUM_CTX="${FULLCTX_NUM_CTX:-49152}"
 MEM_SYSTEMS="bm25,dense_minilm,ccr_memory,ccr_index_bm25"
 FILE_SYSTEMS="bm25,dense_minilm,ccr_index_bm25,ccr_index_hybrid,ccr_memory"
 READER_SYSTEMS="bm25,dense_minilm,ccr_memory,ccr_index_bm25"
@@ -26,7 +26,8 @@ phase_a() {
 }
 phase_b() {
   run locomo --systems "$READER_SYSTEMS" --reader -o "$OUT/locomo-reader"
-  # A whole LoCoMo conversation is 17k-38k tokens, so full_context needs a big window.
+  # A whole LoCoMo conversation is 19k-36.5k Qwen tokens (measured, about 1.1x tiktoken),
+  # so full_context needs a window above the 16384 default.
   run locomo --systems full_context --reader --num-ctx "$FULLCTX_NUM_CTX" -o "$OUT/locomo-reader-fullctx"
 }
 phase_mab() {
