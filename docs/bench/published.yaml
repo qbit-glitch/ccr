@@ -1,0 +1,5 @@
+# Numbers reported by dataset or system authors, shown in Table 2 of each report.
+# Rule: copy each value from the authors' own judge-free table, never from memory.
+# Every entry needs: system, dataset, metric, value, source (paper), locator
+# (table/figure/page), protocol_note (how their setup differs from ours).
+entries: []
