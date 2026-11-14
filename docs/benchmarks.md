@@ -66,6 +66,17 @@ tmux new -d -s ccr-bench 'bash scripts/bench_pilot.sh all 2>&1 | tee bench_out/p
 reader pilot (`b`), and, only when asked, the MemoryAgentBench reader pilot
 (`mab`).
 
+### Measured reader speed
+
+On an M4 Pro 48 GB, `qwen3.8:27b` through Ollama answered 573 LoCoMo questions
+(3 systems x 191, about 5 retrieved turns each) in 29 minutes, roughly 3 s per
+answer. A full LoCoMo run is about 1,540 non-adversarial questions, so about
+4 hours for the three retrieval systems (an estimate from that rate).
+`full_context` needs about 27.6k tokens per LoCoMo conversation, which exceeds
+the default 16384 window, so the pilot reports it `not_run` (tokens only). Rerun
+it with `--num-ctx 32768` to get its accuracy; expect slower, larger prompts.
+MemoryAgentBench contexts are far longer, which is why its reader pilot is opt-in.
+
 ## Pilot versus full
 
 `--pilot` (the default) samples 10% of whole worlds with a fixed seed: one
@@ -85,6 +96,14 @@ is contained in the full run for the same seed. Pilot reports are titled
   in MTEB's published set, so lexical overlap is high by design.
 - MemoryAgentBench has no evidence labels. Chunks are about 512 tokens (4
   characters per token), and only substring/exact-match sources are loaded.
+- `ccr_memory` measures `gcc_recall` as shipped, and it is built for short
+  project notes, not natural-language questions. Commit search first tries the
+  whole query as an exact phrase (or an FTS match on every term), and its
+  semantic fallback returns at most 5 commits, so recall is flat from k=5 to
+  k=25 and some queries return nothing (`empty%`, 18.8% on the NFCorpus
+  pilot). This is a property of the product, not a harness bug; the pilot
+  numbers show it, and `ccr_index_*` is the better fit for question-style
+  retrieval.
 - Reader answers are short phrases; scores depend on the reader, so compare
   systems against each other, not against papers that used other readers.
 - Published numbers go in `docs/bench/published.yaml` and appear in a separate
