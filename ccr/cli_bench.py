@@ -18,6 +18,7 @@ from ccr.bench.report import build_report, load_published
 from ccr.bench.results import ResultStore
 from ccr.bench.retrievers import REGISTRY, RetrieverUnavailable
 from ccr.bench.runner import run_world
+from ccr.bench.stats import DEFAULT_BOOT, metrics_present, ranking_markdown
 from ccr.bench.types import BenchConfig
 
 logger = logging.getLogger(__name__)
@@ -181,3 +182,21 @@ def report_cmd(directory: str) -> None:
         meta = json.load(fh)
     _write_report(directory, ResultStore(os.path.join(directory, "results.jsonl")), meta)
     click.echo(f"report rewritten in {directory}")
+
+
+@bench.command("compare")
+@click.argument("directory")
+@click.option("--metrics", default="", help="Comma-separated metrics (default: headline ones).")
+@click.option("--boot", default=DEFAULT_BOOT, type=int, help="Bootstrap resamples.")
+@click.option("--seed", default=0, type=int)
+def compare_cmd(directory: str, metrics: str, boot: int, seed: int) -> None:
+    """Rank systems with 95% bootstrap CIs and paired tests; writes ranking.md."""
+    path = os.path.join(directory, "results.jsonl")
+    if not os.path.isfile(path):
+        raise click.ClickException(f"no results.jsonl in {directory}")
+    rows = ResultStore(path).all()
+    chosen = [m for m in metrics.split(",") if m] or metrics_present(rows)
+    text = f"# Ranking: {os.path.basename(os.path.normpath(directory))}\n\n"
+    text += ranking_markdown(rows, chosen, boot, seed)
+    _write(os.path.join(directory, "ranking.md"), text)
+    click.echo(f"ranking written to {directory}/ranking.md")

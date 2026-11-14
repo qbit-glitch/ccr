@@ -104,3 +104,18 @@ def test_dataset_without_evidence_labels_requires_reader(tmp_path, monkeypatch) 
     result, _ = _run(tmp_path, "--systems", "bm25", "--no-reader")
     assert result.exit_code != 0
     assert "--reader" in result.output
+
+
+def test_compare_writes_ranking_with_confidence_intervals(tmp_path) -> None:
+    result, out = _run(tmp_path, "--systems", "bm25,full_context", "--full", "--no-reader")
+    assert result.exit_code == 0, result.output
+    cmp = CliRunner().invoke(cli, ["bench", "compare", str(out), "--boot", "50"])
+    assert cmp.exit_code == 0, cmp.output
+    text = (out / "ranking.md").read_text()
+    assert "### ndcg@10" in text and "95% CI" in text and "bm25" in text
+    assert "full_context" not in text  # it ranks nothing, so it has no retrieval row
+
+
+def test_compare_rejects_a_directory_without_results(tmp_path) -> None:
+    cmp = CliRunner().invoke(cli, ["bench", "compare", str(tmp_path)])
+    assert cmp.exit_code != 0 and "results.jsonl" in cmp.output
