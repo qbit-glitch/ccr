@@ -28,5 +28,6 @@ from ccr.bench.datasets import locomo as _locomo  # noqa: E402,F401
 from ccr.bench.datasets import longmemeval as _longmemeval  # noqa: E402,F401
 from ccr.bench.datasets import beir as _beir  # noqa: E402,F401
 from ccr.bench.datasets import mab as _mab  # noqa: E402,F401
+from ccr.bench.datasets import code as _code  # noqa: E402,F401
 
 __all__ = ["ADAPTERS", "GAINS", "NEEDS_READER", "SAMPLERS", "Adapter", "GainsFor", "Sampler", "default_sampler"]
