@@ -19,7 +19,7 @@ _NON_WORD = re.compile(r"[^\w\s]")
 
 @register("ccr_memory")
 class CcrMemoryRetriever:
-    """Ingest each doc as a commit titled with its id, retrieve via recall.
+    """Ingest each doc as a commit titled with an opaque handle, retrieve via recall.
 
     Commit admission merging is disabled (threshold 1.0) so no gold evidence is
     merged away. Only commit-sourced evidence is mapped back to doc ids because
@@ -33,12 +33,17 @@ class CcrMemoryRetriever:
         self.empty_count = 0
         self._mem: MemoryManager | None = None
         self._engine: RecallEngine | None = None
+        self._ids: dict[str, str] = {}
 
     def index(self, docs: Sequence[Doc], workdir: str) -> None:
         self._mem = MemoryManager(workdir)
-        for doc in docs:
+        # Titles are opaque: real doc ids can encode gold labels (e.g. LongMemEval
+        # ``answer_*``) and commit titles are searchable text.
+        self._ids = {}
+        for n, doc in enumerate(docs):
+            self._ids[f"doc-{n}"] = doc.id
             self._mem.commit(
-                title=doc.id,
+                title=f"doc-{n}",
                 what=doc.text,
                 why="bench",
                 files_changed=[],
@@ -76,9 +81,10 @@ class CcrMemoryRetriever:
         seen: set[str] = set()
         ranked: list[str] = []
         for ev in result.evidence:
-            if ev.source == "commit" and ev.title not in seen:
-                seen.add(ev.title)
-                ranked.append(ev.title)
+            doc_id = self._ids.get(ev.title)
+            if ev.source == "commit" and doc_id is not None and doc_id not in seen:
+                seen.add(doc_id)
+                ranked.append(doc_id)
         return ranked
 
     def close(self) -> None:

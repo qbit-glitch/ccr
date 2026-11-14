@@ -16,6 +16,8 @@ SAMPLERS: dict[str, Sampler] = {}
 GAINS: dict[str, GainsFor] = {}
 # Datasets with no evidence labels: only answer metrics exist, so a reader is required.
 NEEDS_READER: set[str] = set()
+# Per-dataset load statistics (dropped/excluded counts), copied into the run meta.
+STATS: dict[str, dict[str, int]] = {}
 
 
 def default_sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:

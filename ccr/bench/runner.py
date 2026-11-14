@@ -23,6 +23,9 @@ from ccr.bench.types import BenchConfig, Query, World
 
 logger = logging.getLogger(__name__)
 
+_READER_COUNTERS = ("timeout_count", "empty_count", "truncated_count")
+_READER_FLAGS = ("reader_timeout", "reader_empty", "reader_truncated")
+
 GainsFor = Callable[[str], dict[str, dict[str, int]]]
 
 
@@ -47,7 +50,7 @@ def _run_query(
     context_limit_tokens: int | None, ingest_share: float,
 ) -> QueryResult:
     started = time.perf_counter()
-    ranked = list(retriever.retrieve(query.text, max(cfg.ks)))
+    ranked = list(dict.fromkeys(retriever.retrieve(query.text, max(cfg.ks))))
     retrieve_s = time.perf_counter() - started
     ranks = getattr(retriever, "ranks_docs", True)
     scores: dict[str, float] = {}
@@ -65,7 +68,12 @@ def _run_query(
         if context_limit_tokens is not None and tokens > context_limit_tokens:
             scores["not_run"] = 1.0
         elif reader is not None:
+            before = tuple(getattr(reader, n, 0) for n in _READER_COUNTERS)
             answer = reader.answer(query.text, context)
+            after = tuple(getattr(reader, n, 0) for n in _READER_COUNTERS)
+            for flag, b, a in zip(_READER_FLAGS, before, after):
+                if a > b:
+                    scores[flag] = 1.0
             scores.update(_answer_scores(answer, [query.answer, *query.alt_answers]))
     return QueryResult(
         query.id, world.id, retriever.name, query.category,
@@ -87,7 +95,8 @@ def run_world(
     runnable: list[Query] = []
     for query in world.queries:
         key = _key(world, retriever.name, query, tag)
-        if store.has(key):
+        done = store.get(key)
+        if done is not None and "reader_timeout" not in done.scores:
             continue
         if not query.gold_ids and query.answer is None:
             store.add(key, _excluded(world, retriever.name, query))

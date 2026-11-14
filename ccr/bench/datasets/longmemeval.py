@@ -35,15 +35,21 @@ def _session_text(date: str, turns: list[dict[str, Any]]) -> str:
 def parse_longmemeval(data: list[dict[str, Any]]) -> list[World]:
     """Convert raw LongMemEval records into worlds and refresh ``LOAD_STATS``."""
     LOAD_STATS.clear()
-    LOAD_STATS.update({"abstention_excluded": 0, "dropped_gold_ids": 0})
+    LOAD_STATS.update({"abstention_excluded": 0, "dropped_gold_ids": 0, "duplicate_session_ids": 0})
     worlds: list[World] = []
     for item in data:
-        docs = tuple(
-            Doc(sid, _session_text(date, turns))
-            for sid, date, turns in zip(
-                item["haystack_session_ids"], item["haystack_dates"], item["haystack_sessions"]
-            )
-        )
+        docs_list: list[Doc] = []
+        seen: set[str] = set()
+        for sid, date, turns in zip(
+            item["haystack_session_ids"], item["haystack_dates"], item["haystack_sessions"]
+        ):
+            doc_id = sid
+            while doc_id in seen:  # keep the first under its own id; suffix repeats
+                LOAD_STATS["duplicate_session_ids"] += 1
+                doc_id = f"{doc_id}#dup"
+            seen.add(doc_id)
+            docs_list.append(Doc(doc_id, _session_text(date, turns)))
+        docs = tuple(docs_list)
         known = {d.id for d in docs}
         qid = str(item["question_id"])
         if qid.endswith("_abs"):
@@ -72,4 +78,5 @@ def sample_by_type(worlds: list[World], cfg: BenchConfig) -> list[World]:
 
 
 datasets.ADAPTERS["longmemeval"] = load_longmemeval
+datasets.STATS["longmemeval"] = LOAD_STATS
 datasets.SAMPLERS["longmemeval"] = sample_by_type

@@ -22,9 +22,9 @@ accuracy, MemoryAgentBench's LongMemEval, summarization and recsys sources.
 All systems see the same documents, the same top-k, and (with a reader) the same
 retrieved text.
 
-- `ccr_memory`: every document becomes one commit titled with its id (commit
-  merging disabled) and is recalled with `RecallEngine` using commit evidence only.
-  Limited to k <= 25 by the recall engine.
+- `ccr_memory`: every document becomes one commit titled with an opaque
+  handle so ids cannot be searched (commit merging disabled) and is recalled with
+  `RecallEngine` using commit evidence only. Limited to k <= 25 by the recall engine.
 - `ccr_index_bm25`, `ccr_index_hybrid`, `ccr_index_keyword`: `RepoIndex` over one
   `.txt` file per document. Hybrid needs the ONNX embeddings and is skipped
   without them. Keyword mode matches the query as one substring, which suits
@@ -52,6 +52,15 @@ and `sample.json` into `bench_out/<dataset>/`. The meta records the git sha,
 seed, reader tag, whether ONNX embeddings were active, and any `k` values
 dropped for a system's cap.
 
+Each output directory is pinned to one configuration (`fingerprint.json`:
+dataset, pilot/full, seed, `ks`, `reader_k`, reader, `num_ctx`, tokenizer, ONNX
+state). Resuming with the same settings continues; any other setting is
+refused, so use a new `--output`. Reader timeouts are flagged and retried on
+resume. Reports list excluded, not-run and answered counts, reader timeouts,
+empty answers and possibly truncated prompts, and the run meta carries the
+dataset's dropped/excluded counts (`load.*`) and the tokenizer used for token
+figures (`tiktoken-cl100k` or `chars/4`).
+
 ### Reader runs
 
 The reader is a local Ollama model, `qwen3.8:27b` by default (`--model`),
@@ -73,8 +82,9 @@ On an M4 Pro 48 GB, `qwen3.8:27b` through Ollama answered 573 LoCoMo questions
 answer. A full LoCoMo run is about 1,540 non-adversarial questions, so about
 4 hours for the three retrieval systems (an estimate from that rate).
 `full_context` needs about 27.6k tokens per LoCoMo conversation, which exceeds
-the default 16384 window, so the pilot reports it `not_run` (tokens only). Rerun
-it with `--num-ctx 32768` to get its accuracy; expect slower, larger prompts.
+the default 16384 window, so at that size it is reported `not_run` (tokens only).
+The pilot script therefore runs it separately with `--num-ctx 32768`; expect
+slower, larger prompts.
 MemoryAgentBench contexts are far longer, which is why its reader pilot is opt-in.
 
 ## Pilot versus full

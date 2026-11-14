@@ -7,6 +7,7 @@ import re
 import string
 from collections import Counter
 
+from ccr.utils.tokens import _get_tiktoken_encoding
 from ccr.utils.tokens import count_tokens as _count_tokens
 
 _ARTICLES = re.compile(r"\b(a|an|the)\b")
@@ -18,6 +19,11 @@ def count_tokens(text: str) -> int:
     if not text:
         return 0
     return _count_tokens(text)
+
+
+def tokenizer_name() -> str:
+    """Label of the tokenizer behind every token figure (recorded in report meta)."""
+    return "tiktoken-cl100k" if _get_tiktoken_encoding() is not None else "chars/4"
 
 
 def _normalize(text: str) -> str:

@@ -84,5 +84,6 @@ def _sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:
 
 
 datasets.ADAPTERS[NAME] = load_code
+datasets.STATS[NAME] = LOAD_STATS
 datasets.SAMPLERS[NAME] = _sampler
 datasets.GAINS[NAME] = world_gains

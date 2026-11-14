@@ -11,7 +11,7 @@ OUT="${OUT:-bench_out/pilot}"
 PHASE="${1:-all}"
 MEM_SYSTEMS="bm25,dense_minilm,ccr_memory,ccr_index_bm25"
 FILE_SYSTEMS="bm25,dense_minilm,ccr_index_bm25,ccr_index_hybrid,ccr_memory"
-READER_SYSTEMS="bm25,dense_minilm,ccr_memory,full_context"
+READER_SYSTEMS="bm25,dense_minilm,ccr_memory"
 
 run() { echo "=== $(date '+%F %T') ccr bench run $*"; "$PY" -m ccr.cli bench run "$@" --pilot; }
 
@@ -22,7 +22,11 @@ phase_a() {
   run beir-nfcorpus --systems "$FILE_SYSTEMS" --no-reader -o "$OUT/beir-nfcorpus"
   run code --systems "$FILE_SYSTEMS" --no-reader -o "$OUT/code"
 }
-phase_b() { run locomo --systems "$READER_SYSTEMS" --reader -o "$OUT/locomo-reader"; }
+phase_b() {
+  run locomo --systems "$READER_SYSTEMS" --reader -o "$OUT/locomo-reader"
+  # A whole LoCoMo conversation is ~28k tokens, so full_context needs a bigger window.
+  run locomo --systems full_context --reader --num-ctx 32768 -o "$OUT/locomo-reader-fullctx"
+}
 phase_mab() {
   run memoryagentbench --systems "bm25,ccr_memory,ccr_index_bm25,dense_minilm,full_context" \
     --reader -o "$OUT/memoryagentbench-reader"

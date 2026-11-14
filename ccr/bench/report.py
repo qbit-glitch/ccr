@@ -13,7 +13,7 @@ import yaml
 
 from ccr.bench.results import QueryResult
 
-_FLAGS = {"excluded", "not_run"}
+_FLAGS = {"excluded", "not_run", "reader_timeout", "reader_empty", "reader_truncated"}
 _ORDER = re.compile(r"^(recall|ndcg)@(\d+)$")
 
 
@@ -23,6 +23,10 @@ class SystemSummary:
     n_queries: int
     n_excluded: int
     n_not_run: int
+    n_answered: int
+    n_reader_timeout: int
+    n_reader_empty: int
+    n_reader_truncated: int
     empty_rate: float
     mean_tokens: float
     ingest_s: float
@@ -62,6 +66,10 @@ def _summarize(system: str, rows: Sequence[QueryResult]) -> SystemSummary:
         n_queries=n,
         n_excluded=len(rows) - n,
         n_not_run=sum(1 for r in scored if "not_run" in r.scores),
+        n_answered=sum(1 for r in scored if "f1" in r.scores),
+        n_reader_timeout=sum(1 for r in scored if "reader_timeout" in r.scores),
+        n_reader_empty=sum(1 for r in scored if "reader_empty" in r.scores),
+        n_reader_truncated=sum(1 for r in scored if "reader_truncated" in r.scores),
         empty_rate=sum(r.empty for r in scored) / n if n else 0.0,
         mean_tokens=sum(r.retrieved_tokens for r in scored) / n if n else 0.0,
         ingest_s=sum(r.ingest_s for r in scored),
@@ -88,19 +96,35 @@ class BenchReport:
             {"meta": self.meta, "systems": [asdict(s) for s in self.systems]}, indent=2
         )
 
+    def _notes(self) -> list[str]:
+        notes: list[str] = []
+        for s in self.systems:
+            if s.n_not_run:
+                notes.append(f"- {s.system}: not run: exceeds reader context "
+                             f"({s.n_not_run}/{s.n_queries}); answer metrics cover the "
+                             f"{s.n_answered} answered questions only")
+            for label, count in (("reader timeouts", s.n_reader_timeout),
+                                 ("empty reader answers", s.n_reader_empty),
+                                 ("possibly truncated prompts", s.n_reader_truncated)):
+                if count:
+                    notes.append(f"- {s.system}: {count} {label} (scored as given)")
+        return ["", "Notes:", *notes] if notes else []
+
     def to_markdown(self, published: Sequence[PublishedEntry] = ()) -> str:
         pilot = self.meta.get("pilot") == "true"
         title = f"# Benchmark: {self.meta.get('dataset', '?')}"
         title += " — pilot (10%)" if pilot else ""
         cols = sorted({m for s in self.systems for m in s.metrics}, key=_metric_sort)
-        head = ["system", "n", *cols, "tokens", "empty%"]
+        head = ["system", "n", "excluded", "not_run", "answered", *cols, "tokens", "empty%"]
         lines = [title, "", "## Table 1: measured under identical conditions", "",
                  "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for s in self.systems:
-            cells = [s.system, str(s.n_queries)]
+            cells = [s.system, str(s.n_queries), str(s.n_excluded), str(s.n_not_run),
+                     str(s.n_answered)]
             cells += [f"{s.metrics[c]:.3f}" if c in s.metrics else "-" for c in cols]
             cells += [f"{s.mean_tokens:.0f}", f"{100 * s.empty_rate:.1f}"]
             lines.append("| " + " | ".join(cells) + " |")
+        lines += self._notes()
         lines += ["", "Run details: " + ", ".join(f"{k}={v}" for k, v in self.meta.items())]
         dataset = self.meta.get("dataset")
         rows = [p for p in published if p.dataset == dataset]

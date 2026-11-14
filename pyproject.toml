@@ -53,6 +53,7 @@ vector = [
 ]
 bench = [
     "pyarrow>=15",
+    "tiktoken>=0.7.0",
 ]
 watch = [
     "watchdog>=4.0.0",

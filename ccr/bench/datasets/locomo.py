@@ -88,3 +88,4 @@ def load_locomo(cfg: BenchConfig) -> list[World]:
 
 
 datasets.ADAPTERS["locomo"] = load_locomo
+datasets.STATS["locomo"] = LOAD_STATS

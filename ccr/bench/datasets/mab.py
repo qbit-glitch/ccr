@@ -131,5 +131,6 @@ def sample_by_family(worlds: list[World], cfg: BenchConfig) -> list[World]:
 
 
 datasets.ADAPTERS["memoryagentbench"] = load_mab
+datasets.STATS["memoryagentbench"] = LOAD_STATS
 datasets.SAMPLERS["memoryagentbench"] = sample_by_family
 datasets.NEEDS_READER.add("memoryagentbench")

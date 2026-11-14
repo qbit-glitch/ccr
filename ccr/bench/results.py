@@ -52,6 +52,9 @@ class ResultStore:
     def has(self, key: str) -> bool:
         return key in self._items
 
+    def get(self, key: str) -> QueryResult | None:
+        return self._items.get(key)
+
     def add(self, key: str, result: QueryResult) -> None:
         self._items[key] = result
         with open(self.path, "a", encoding="utf-8") as fh:

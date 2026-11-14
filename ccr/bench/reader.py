@@ -65,6 +65,7 @@ class OllamaReader:
         self._post = transport or _post_json(timeout_s)
         self.empty_count = 0
         self.timeout_count = 0
+        self.truncated_count = 0
 
     @property
     def tag(self) -> str:
@@ -104,6 +105,9 @@ class OllamaReader:
                 f"cannot reach Ollama at {self.host} ({exc}); "
                 "start it with `ollama serve` and pull the model"
             ) from exc
+        if int(body.get("prompt_eval_count") or 0) >= self.num_ctx - self.num_predict:
+            self.truncated_count += 1
+            logger.warning("prompt may have been truncated at num_ctx=%d", self.num_ctx)
         text = str(body.get("response", "")).strip()
         if not text:
             self.empty_count += 1

@@ -12,6 +12,7 @@ import click
 
 import ccr.context.embeddings as embeddings
 from ccr.bench import datasets
+from ccr.bench.metrics import tokenizer_name
 from ccr.bench.reader import DEFAULT_MODEL, OllamaReader, ReaderUnavailable
 from ccr.bench.report import build_report, load_published
 from ccr.bench.results import ResultStore
@@ -43,6 +44,30 @@ def _write(path: str, text: str) -> None:
 
 def _published() -> list:
     return load_published(PUBLISHED) if os.path.isfile(PUBLISHED) else []
+
+
+_FINGERPRINT_KEYS = ("dataset", "pilot", "seed", "reader", "ks", "reader_k", "sample_size",
+                     "num_ctx", "tokenizer", "semantic_active")
+
+
+def _pin_configuration(output: str, meta: dict[str, str]) -> None:
+    """Refuse to mix results from different settings in one output directory."""
+    pinned = {k: meta[k] for k in _FINGERPRINT_KEYS}
+    path = os.path.join(output, "fingerprint.json")
+    results = os.path.join(output, "results.jsonl")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            old = json.load(fh)
+        if old != pinned:
+            diff = ", ".join(f"{k}: {old.get(k)} -> {pinned[k]}"
+                             for k in _FINGERPRINT_KEYS if old.get(k) != pinned[k])
+            raise click.ClickException(
+                f"{output} holds results from a different configuration ({diff}); "
+                "use another --output directory")
+    elif os.path.isfile(results) and os.path.getsize(results) > 0:
+        raise click.ClickException(
+            f"{output} has results but no recorded configuration; use another --output directory")
+    _write(path, json.dumps(pinned, indent=2))
 
 
 def _write_report(output: str, store: ResultStore, meta: dict[str, str]) -> None:
@@ -106,7 +131,11 @@ def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
         "reader": ollama.tag if ollama else "none", "git_sha": _git_sha(),
         "semantic_active": str(embeddings.SEMANTIC_AVAILABLE), "ks": ks,
         "reader_k": str(reader_k), "sample_size": str(len(sample)),
+        "num_ctx": str(num_ctx) if ollama else "-", "tokenizer": tokenizer_name(),
     }
+    for stat, value in datasets.STATS.get(dataset, {}).items():
+        meta[f"load.{stat}"] = str(value)
+    _pin_configuration(output, meta)
     _write(os.path.join(output, "sample.json"),
            json.dumps({"world_ids": [w.id for w in sample]}))
     store = ResultStore(os.path.join(output, "results.jsonl"))
