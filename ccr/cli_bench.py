@@ -82,6 +82,10 @@ def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
     if dataset not in datasets.ADAPTERS:
         known = ", ".join(sorted(datasets.ADAPTERS)) or "(none)"
         raise click.ClickException(f"unknown dataset {dataset!r}; known: {known}")
+    if dataset in datasets.NEEDS_READER and not reader:
+        raise click.ClickException(
+            f"{dataset} has no evidence labels, so only answer metrics exist: rerun with --reader"
+        )
     names = [s for s in systems.split(",") if s] or sorted(REGISTRY)
     unknown = [n for n in names if n not in REGISTRY]
     if unknown:

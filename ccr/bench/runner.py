@@ -35,13 +35,10 @@ def _excluded(world: World, system: str, query: Query) -> QueryResult:
                        {"excluded": 1.0}, False, 0.0, 0.0)
 
 
-def _answer_scores(pred: str, gold: str) -> dict[str, float]:
-    return {
-        "f1": token_f1(pred, gold),
-        "em": exact_match(pred, gold),
-        "sub_em": sub_exact_match(pred, gold),
-        "bleu1": bleu1(pred, gold),
-    }
+def _answer_scores(pred: str, golds: list[str]) -> dict[str, float]:
+    """Score against every acceptable gold answer and keep the best per metric."""
+    metrics = {"f1": token_f1, "em": exact_match, "sub_em": sub_exact_match, "bleu1": bleu1}
+    return {name: max(fn(pred, g) for g in golds) for name, fn in metrics.items()}
 
 
 def _run_query(
@@ -69,7 +66,7 @@ def _run_query(
             scores["not_run"] = 1.0
         elif reader is not None:
             answer = reader.answer(query.text, context)
-            scores.update(_answer_scores(answer, query.answer))
+            scores.update(_answer_scores(answer, [query.answer, *query.alt_answers]))
     return QueryResult(
         query.id, world.id, retriever.name, query.category,
         tuple(ranked[: max(cfg.ks)]) if ranks else (), tokens, answer, scores,

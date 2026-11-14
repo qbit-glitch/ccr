@@ -22,6 +22,7 @@ class Query:
     gold_ids: frozenset[str]
     answer: str | None
     category: str
+    alt_answers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -146,3 +146,12 @@ def test_retriever_is_closed_even_when_retrieval_fails(tmp_path) -> None:
     with pytest.raises(RuntimeError):
         run_world(_world(), r, CFG, None, ResultStore(str(tmp_path / "r.jsonl")), None)
     assert r.closed == 1
+
+
+def test_alternative_gold_answers_take_the_best_score(tmp_path) -> None:
+    world = World("w", (Doc("d1", "alpha"),),
+                  (Query("q", "city?", frozenset(), "Paris", "c", alt_answers=("City of Paris",)),), "g")
+    store = ResultStore(str(tmp_path / "r.jsonl"))
+    run_world(world, FakeRetriever(["d1"]), CFG, FakeReader("City of Paris"), store, None)
+    res = store.all()[0]
+    assert res.scores["em"] == 1.0 and res.scores["sub_em"] == 1.0

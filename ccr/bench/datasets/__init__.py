@@ -14,6 +14,8 @@ GainsFor = Callable[[str], dict[str, dict[str, int]]]
 ADAPTERS: dict[str, Adapter] = {}
 SAMPLERS: dict[str, Sampler] = {}
 GAINS: dict[str, GainsFor] = {}
+# Datasets with no evidence labels: only answer metrics exist, so a reader is required.
+NEEDS_READER: set[str] = set()
 
 
 def default_sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:
@@ -25,5 +27,6 @@ def default_sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:
 from ccr.bench.datasets import locomo as _locomo  # noqa: E402,F401
 from ccr.bench.datasets import longmemeval as _longmemeval  # noqa: E402,F401
 from ccr.bench.datasets import beir as _beir  # noqa: E402,F401
+from ccr.bench.datasets import mab as _mab  # noqa: E402,F401
 
-__all__ = ["ADAPTERS", "GAINS", "SAMPLERS", "Adapter", "GainsFor", "Sampler", "default_sampler"]
+__all__ = ["ADAPTERS", "GAINS", "NEEDS_READER", "SAMPLERS", "Adapter", "GainsFor", "Sampler", "default_sampler"]

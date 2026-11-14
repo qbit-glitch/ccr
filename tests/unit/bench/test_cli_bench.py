@@ -96,3 +96,11 @@ def test_meta_records_reader_and_environment(tmp_path) -> None:
     meta = json.loads((out / "meta.json").read_text())
     assert meta["dataset"] == "fake" and meta["reader"] == "none"
     assert meta["seed"] == "42" and "semantic_active" in meta and "git_sha" in meta
+
+
+def test_dataset_without_evidence_labels_requires_reader(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(datasets.ADAPTERS, "fake", _fake_worlds)
+    monkeypatch.setattr(datasets, "NEEDS_READER", {"fake"})
+    result, _ = _run(tmp_path, "--systems", "bm25", "--no-reader")
+    assert result.exit_code != 0
+    assert "--reader" in result.output
