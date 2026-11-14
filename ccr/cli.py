@@ -929,6 +929,9 @@ cli.add_command(stats)
 cli.add_command(install_global)
 cli.add_command(uninstall_global)
 cli.add_command(agents)
+from ccr.cli_bench import bench as _bench_group  # noqa: E402
+
+cli.add_command(_bench_group)
 
 
 @cli.command()

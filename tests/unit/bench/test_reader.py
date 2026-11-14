@@ -30,6 +30,13 @@ def test_request_pins_deterministic_non_thinking_generation() -> None:
     assert body["think"] is False
     assert body["options"]["temperature"] == 0
     assert body["options"]["num_predict"] == 64
+    assert body["options"]["num_ctx"] == 16384
+
+
+def test_num_ctx_is_set_explicitly_and_overridable() -> None:
+    t = FakeTransport({"response": "x"})
+    OllamaReader(host="http://h:1", transport=t, num_ctx=8192).answer("q", "c")
+    assert t.calls[0][1]["options"]["num_ctx"] == 8192
 
 
 def test_prompt_contains_instruction_context_and_question() -> None:

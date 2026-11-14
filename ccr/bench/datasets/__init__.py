@@ -1,0 +1,24 @@
+"""Dataset adapters. Each registers a loader (and optionally a sampler or gains)."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from ccr.bench.sampling import sample_worlds
+from ccr.bench.types import BenchConfig, World
+
+Adapter = Callable[[BenchConfig], list[World]]
+Sampler = Callable[[list[World], BenchConfig], list[World]]
+GainsFor = Callable[[str], dict[str, dict[str, int]]]
+
+ADAPTERS: dict[str, Adapter] = {}
+SAMPLERS: dict[str, Sampler] = {}
+GAINS: dict[str, GainsFor] = {}
+
+
+def default_sampler(worlds: list[World], cfg: BenchConfig) -> list[World]:
+    """Sample whole worlds with the config's seed and fraction."""
+    return sample_worlds(worlds, cfg.sample_fraction, cfg.seed)
+
+
+__all__ = ["ADAPTERS", "GAINS", "SAMPLERS", "Adapter", "GainsFor", "Sampler", "default_sampler"]

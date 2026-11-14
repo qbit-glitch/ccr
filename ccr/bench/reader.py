@@ -19,6 +19,8 @@ INSTRUCTION = (
     "If the context does not contain the answer, say unknown."
 )
 
+PROMPT_MARGIN = 256  # tokens reserved for instruction and question
+
 Transport = Callable[[str, dict], dict]
 
 
@@ -52,12 +54,14 @@ class OllamaReader:
         model: str = DEFAULT_MODEL,
         host: str | None = None,
         num_predict: int = 64,
+        num_ctx: int = 16384,
         timeout_s: float = 600.0,
         transport: Transport | None = None,
     ) -> None:
         self.model = model
         self.host = _resolve_host(host).rstrip("/")
         self.num_predict = num_predict
+        self.num_ctx = num_ctx
         self._post = transport or _post_json(timeout_s)
         self.empty_count = 0
         self.timeout_count = 0
@@ -67,6 +71,11 @@ class OllamaReader:
         """Model tag recorded in cache keys and reports."""
         return self.model
 
+    @property
+    def context_limit_tokens(self) -> int:
+        """Largest context the reader can take without Ollama silently truncating."""
+        return self.num_ctx - self.num_predict - PROMPT_MARGIN
+
     def answer(self, question: str, context: str) -> str:
         """Return the model's short answer; empty string on empty output or timeout."""
         prompt = f"{INSTRUCTION}\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
@@ -75,7 +84,11 @@ class OllamaReader:
             "prompt": prompt,
             "stream": False,
             "think": False,
-            "options": {"temperature": 0, "num_predict": self.num_predict},
+            "options": {
+                "temperature": 0,
+                "num_predict": self.num_predict,
+                "num_ctx": self.num_ctx,
+            },
         }
         try:
             body = self._post(f"{self.host}/api/generate", payload)
