@@ -12,11 +12,28 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ccr.core.commit_recall import ranked_commits
 from ccr.core.facts import FactLedger, FactRecord, lexical_score, tokenize
 from ccr.core.observability import ccr_span
 from ccr.core.replay import RecallTraceStore
 from ccr.core.rerankers import get_reranker
 from ccr.core.temporal_graph import TemporalGraphStore
+
+
+COMMIT_SEARCH_MODES = ("hybrid", "bm25", "dense", "legacy")
+
+
+@dataclass(frozen=True)
+class RecallOptions:
+    """Retrieval switches. ``legacy`` keeps the original exact-phrase commit search."""
+
+    commit_search: str = "hybrid"
+    rerank: bool = True
+
+    def __post_init__(self) -> None:
+        if self.commit_search not in COMMIT_SEARCH_MODES:
+            raise ValueError(
+                f"commit_search must be one of {COMMIT_SEARCH_MODES}, got {self.commit_search!r}")
 
 
 @dataclass
@@ -121,8 +138,9 @@ class RecallResult:
 class RecallEngine:
     """Deterministic, local-first recall engine."""
 
-    def __init__(self, memory_manager: Any):
+    def __init__(self, memory_manager: Any, options: RecallOptions | None = None):
         self.mem = memory_manager
+        self.options = options or RecallOptions()
         self.ledger = FactLedger(memory_manager.ccr_root)
         self.graph = TemporalGraphStore(memory_manager.ccr_root)
         self.traces = RecallTraceStore(memory_manager.ccr_root)
@@ -176,9 +194,12 @@ class RecallEngine:
             evidence = self._dedupe_and_rank(evidence, limit=max(limit * 3, limit))
             candidate_snapshot = [ev.to_dict() for ev in evidence]
             with ccr_span("ccr.memory.rerank", project_root=project_root, attributes={"candidates": len(evidence)}):
-                reranker = get_reranker()
-                plan.reranker = reranker.provider
-                evidence = reranker.rerank(query, evidence)[:limit]
+                if self.options.rerank:
+                    reranker = get_reranker()
+                    plan.reranker = reranker.provider
+                    evidence = reranker.rerank(query, evidence)[:limit]
+                else:
+                    evidence = evidence[:limit]
             stale_notes = self._stale_notes(evidence)
             conflict_notes = self._conflict_notes(query)
             confidence = self._confidence(evidence, conflict_notes)
@@ -336,7 +357,37 @@ class RecallEngine:
             ))
         return evidence
 
+    def _hybrid_commit_evidence(self, query: str, limit: int) -> list[RecallEvidence]:
+        """Exact full-text hits first, then BM25 + dense fused hits; no overlap filter."""
+        branch = self.mem.get_active_branch()
+        try:
+            exact = self.mem._storage.commit_search_text(branch, query, max_results=limit)
+        except Exception:
+            exact = []
+        scored = [(hit, 0.9 - 0.01 * rank) for rank, hit in enumerate(exact)]
+        seen = {str(hit.get("id", "")) for hit in exact}
+        mode = self.options.commit_search
+        scored += [(hit, 0.75 * score)
+                   for hit, score in ranked_commits(self.mem, branch, query, limit, mode)
+                   if str(hit.get("id", "")) not in seen]
+        return [
+            RecallEvidence(
+                id=str(hit.get("id", "")) or "?",
+                source="commit",
+                title=str(hit.get("title", "")) or str(hit.get("id", "")) or "commit",
+                snippet=_compact_snippet(
+                    str(hit.get("what", "") or hit.get("raw_block", "") or hit.get("why", "")),
+                    query),
+                score=score,
+                timestamp=str(hit.get("timestamp", "")),
+                metadata={"branch": branch, "files": hit.get("files", [])},
+            )
+            for hit, score in scored[: limit * 3]
+        ]
+
     def _commit_evidence(self, query: str, limit: int) -> list[RecallEvidence]:
+        if self.options.commit_search != "legacy":
+            return self._hybrid_commit_evidence(query, limit)
         branch = self.mem.get_active_branch()
         raw_hits: list[dict[str, Any]] = []
         try:
