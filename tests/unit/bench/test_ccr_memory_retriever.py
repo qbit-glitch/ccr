@@ -98,3 +98,23 @@ def test_run_writes_only_inside_workdir(isolated) -> None:
 
 def test_registered_under_expected_name() -> None:
     assert REGISTRY["ccr_memory"]().name == "ccr_memory"
+
+
+def test_variants_are_registered_with_their_own_names_and_options() -> None:
+    assert {"ccr_memory", "ccr_memory_legacy", "ccr_memory_bm25", "ccr_memory_dense",
+            "ccr_memory_norerank"} <= set(REGISTRY)
+    legacy = REGISTRY["ccr_memory_legacy"]()
+    assert legacy.name == "ccr_memory_legacy" and legacy.options.commit_search == "legacy"
+    assert REGISTRY["ccr_memory"]().options.commit_search == "hybrid"
+    assert REGISTRY["ccr_memory_norerank"]().options.rerank is False
+
+
+def test_hybrid_variant_answers_a_question_the_legacy_variant_caps(isolated) -> None:
+    _, _, work = isolated
+    docs = [Doc(f"d{n}", f"Weekly lake maintenance chores report number {n}.") for n in range(12)]
+    docs.append(Doc("target", "Caroline asked the adoption agency about the process."))
+    hybrid = REGISTRY["ccr_memory"]()
+    hybrid.index(docs, str(work))
+    ids = hybrid.retrieve("What did Caroline ask the adoption agency?", 10)
+    hybrid.close()
+    assert ids[0] == "target"
