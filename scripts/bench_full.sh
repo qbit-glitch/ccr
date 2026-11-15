@@ -11,9 +11,11 @@ PY="${PY:-.venv-bench/bin/python}"
 OUT="${OUT:-bench_out/full}"
 PHASE="${1:-all}"
 FULLCTX_NUM_CTX="${FULLCTX_NUM_CTX:-49152}"
-MEM_SYSTEMS="bm25,dense_minilm,ccr_memory,ccr_index_bm25"
-FILE_SYSTEMS="bm25,dense_minilm,ccr_index_bm25,ccr_index_hybrid,ccr_memory"
-READER_SYSTEMS="bm25,dense_minilm,ccr_memory,ccr_index_bm25"
+# System lists can be overridden per run (the v2 run compares the new ccr_memory with legacy).
+MEM_SYSTEMS="${MEM_SYSTEMS:-bm25,dense_minilm,ccr_memory,ccr_index_bm25}"
+FILE_SYSTEMS="${FILE_SYSTEMS:-bm25,dense_minilm,ccr_index_bm25,ccr_index_hybrid,ccr_memory}"
+READER_SYSTEMS="${READER_SYSTEMS:-bm25,dense_minilm,ccr_memory,ccr_index_bm25}"
+RUN_FULLCTX="${RUN_FULLCTX:-1}"
 
 run() { echo "=== $(date '+%F %T') ccr bench run $*"; "$PY" -m ccr.cli bench run "$@" --full; }
 
@@ -28,6 +30,7 @@ phase_b() {
   run locomo --systems "$READER_SYSTEMS" --reader -o "$OUT/locomo-reader"
   # A whole LoCoMo conversation is 19k-36.5k Qwen tokens (measured, about 1.1x tiktoken),
   # so full_context needs a window above the 16384 default.
+  [ "$RUN_FULLCTX" = 1 ] || return 0
   run locomo --systems full_context --reader --num-ctx "$FULLCTX_NUM_CTX" -o "$OUT/locomo-reader-fullctx"
 }
 phase_mab() {
