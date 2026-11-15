@@ -129,3 +129,36 @@ def test_rerank_off_keeps_the_fused_order(mem) -> None:
 def test_unknown_commit_search_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="commit_search"):
         RecallOptions(commit_search="magic")
+
+
+def _file_commit(mem: MemoryManager, title: str, what: str, files: list[str]) -> None:
+    mem.commit(title=title, what=what, why="note", files_changed=files, next_step="",
+               admission_threshold=1.0, rejection_threshold=0.0)
+
+
+@pytest.fixture
+def linked(tmp_path) -> MemoryManager:
+    manager = MemoryManager(str(tmp_path))
+    _file_commit(manager, "design", "Chose the quokka scheduler for nightly jobs.",
+                 ["src/sched.py", "src/queue.py"])
+    _file_commit(manager, "followup", "Retry budget raised after the incident review.",
+                 ["src/sched.py", "src/queue.py"])
+    _file_commit(manager, "unrelated", "Updated the office coffee machine rota.", ["docs/rota.md"])
+    return manager
+
+
+def test_link_expansion_pulls_in_commits_linked_to_a_top_hit(linked) -> None:
+    ask = "quokka scheduler"
+    base = RecallEngine(linked).recall(ask, limit=5, sources=["commits"], include_sessions=False)
+    assert "followup" not in _titles(base)
+    expanded = RecallEngine(linked, options=RecallOptions(link_expansion=True)).recall(
+        ask, limit=5, sources=["commits"], include_sessions=False)
+    titles = _titles(expanded)
+    assert titles[0] == "design" and "followup" in titles and "unrelated" not in titles
+
+
+def test_link_expansion_ranks_linked_commits_below_direct_hits(linked) -> None:
+    result = RecallEngine(linked, options=RecallOptions(link_expansion=True)).recall(
+        "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
+    scores = {ev.title: ev.score for ev in result.evidence}
+    assert scores["design"] > scores["followup"]

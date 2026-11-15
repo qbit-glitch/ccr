@@ -29,6 +29,7 @@ class RecallOptions:
 
     commit_search: str = "hybrid"
     rerank: bool = True
+    link_expansion: bool = False  # A-MEM: add commits linked to the top hits
 
     def __post_init__(self) -> None:
         if self.commit_search not in COMMIT_SEARCH_MODES:
@@ -366,9 +367,8 @@ class RecallEngine:
             exact = []
         scored = [(hit, 0.9 - 0.01 * rank) for rank, hit in enumerate(exact)]
         seen = {str(hit.get("id", "")) for hit in exact}
-        mode = self.options.commit_search
         scored += [(hit, 0.75 * score)
-                   for hit, score in ranked_commits(self.mem, branch, query, limit, mode)
+                   for hit, score in ranked_commits(self.mem, branch, query, limit, self.options)
                    if str(hit.get("id", "")) not in seen]
         return [
             RecallEvidence(
