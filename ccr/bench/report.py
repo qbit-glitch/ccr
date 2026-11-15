@@ -113,7 +113,8 @@ class BenchReport:
     def to_markdown(self, published: Sequence[PublishedEntry] = ()) -> str:
         pilot = self.meta.get("pilot") == "true"
         title = f"# Benchmark: {self.meta.get('dataset', '?')}"
-        title += " — pilot (10%)" if pilot else ""
+        pct = f"{100 * float(self.meta.get('fraction', '0.1')):g}"
+        title += f" — pilot ({pct}%)" if pilot else ""
         cols = sorted({m for s in self.systems for m in s.metrics}, key=_metric_sort)
         head = ["system", "n", "excluded", "not_run", "answered", *cols, "tokens", "empty%"]
         lines = [title, "", "## Table 1: measured under identical conditions", "",

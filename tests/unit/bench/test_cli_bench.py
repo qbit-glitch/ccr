@@ -119,3 +119,22 @@ def test_compare_writes_ranking_with_confidence_intervals(tmp_path) -> None:
 def test_compare_rejects_a_directory_without_results(tmp_path) -> None:
     cmp = CliRunner().invoke(cli, ["bench", "compare", str(tmp_path)])
     assert cmp.exit_code != 0 and "results.jsonl" in cmp.output
+
+
+def test_fraction_option_samples_that_share_and_labels_the_report(tmp_path) -> None:
+    result, out = _run(tmp_path, "--systems", "bm25", "--no-reader", "--fraction", "0.5")
+    assert result.exit_code == 0, result.output
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["sample_size"] == "5" and meta["fraction"] == "0.5"
+    assert "pilot (50%)" in (out / "report.md").read_text()
+
+
+def test_fraction_conflicts_with_full(tmp_path) -> None:
+    result, _ = _run(tmp_path, "--systems", "bm25", "--no-reader", "--full", "--fraction", "0.3")
+    assert result.exit_code != 0 and "cannot be used with --full" in result.output
+
+
+def test_default_pilot_still_reports_ten_percent(tmp_path) -> None:
+    result, out = _run(tmp_path, "--systems", "bm25", "--no-reader")
+    assert result.exit_code == 0, result.output
+    assert "pilot (10%)" in (out / "report.md").read_text()

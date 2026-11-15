@@ -47,7 +47,7 @@ def _published() -> list:
     return load_published(PUBLISHED) if os.path.isfile(PUBLISHED) else []
 
 
-_FINGERPRINT_KEYS = ("dataset", "pilot", "seed", "reader", "ks", "reader_k", "sample_size",
+_FINGERPRINT_KEYS = ("dataset", "pilot", "fraction", "seed", "reader", "ks", "reader_k", "sample_size",
                      "num_ctx", "tokenizer", "semantic_active")
 
 
@@ -93,6 +93,8 @@ def list_cmd() -> None:
 @click.argument("dataset")
 @click.option("--systems", default="", help="Comma-separated systems (default: all).")
 @click.option("--pilot/--full", default=True, help="10% sample (default) or everything.")
+@click.option("--fraction", default=0.0, type=float,
+              help="Sample this share of worlds instead of 10% (development runs).")
 @click.option("--reader/--no-reader", default=False, help="Answer with the local Ollama reader.")
 @click.option("--output", "-o", default="", help="Output dir (default bench_out/<dataset>).")
 @click.option("--cache-dir", default=DEFAULT_CACHE, help="Dataset download cache.")
@@ -101,7 +103,7 @@ def list_cmd() -> None:
 @click.option("--reader-k", default=5, type=int, help="Docs given to the reader.")
 @click.option("--model", default=DEFAULT_MODEL, help="Ollama model tag for the reader.")
 @click.option("--num-ctx", default=16384, type=int, help="Reader context window.")
-def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
+def run_cmd(dataset: str, systems: str, pilot: bool, fraction: float, reader: bool, output: str,
             cache_dir: str, seed: int, ks: str, reader_k: int, model: str,
             num_ctx: int) -> None:
     """Run DATASET against the selected systems and write a report."""
@@ -112,6 +114,9 @@ def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
         raise click.ClickException(
             f"{dataset} has no evidence labels, so only answer metrics exist: rerun with --reader"
         )
+    if fraction and (not pilot or not 0.0 < fraction < 1.0):
+        raise click.ClickException("--fraction must be between 0 and 1 and cannot be used with --full")
+    share = fraction or (PILOT_FRACTION if pilot else 1.0)
     names = [s for s in systems.split(",") if s] or sorted(REGISTRY)
     unknown = [n for n in names if n not in REGISTRY]
     if unknown:
@@ -120,7 +125,7 @@ def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
     os.makedirs(output, exist_ok=True)
     cfg = BenchConfig(
         ks=tuple(int(k) for k in ks.split(",")), seed=seed,
-        sample_fraction=PILOT_FRACTION if pilot else 1.0, chunk_tokens=512,
+        sample_fraction=share, chunk_tokens=512,
         cache_dir=os.path.expanduser(cache_dir), reader_k=reader_k,
     )
     worlds = datasets.ADAPTERS[dataset](cfg)
@@ -128,7 +133,8 @@ def run_cmd(dataset: str, systems: str, pilot: bool, reader: bool, output: str,
     sample = sampler(worlds, cfg)
     ollama = OllamaReader(model=model, num_ctx=num_ctx) if reader else None
     meta = {
-        "dataset": dataset, "pilot": "true" if pilot else "false", "seed": str(seed),
+        "dataset": dataset, "pilot": "true" if pilot else "false", "fraction": f"{share:g}",
+        "seed": str(seed),
         "reader": ollama.tag if ollama else "none", "git_sha": _git_sha(),
         "semantic_active": str(embeddings.SEMANTIC_AVAILABLE), "ks": ks,
         "reader_k": str(reader_k), "sample_size": str(len(sample)),
