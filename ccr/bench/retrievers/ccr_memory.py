@@ -101,6 +101,9 @@ VARIANTS: dict[str, RecallOptions] = {
     "ccr_memory_bm25": RecallOptions(commit_search="bm25"),
     "ccr_memory_dense": RecallOptions(commit_search="dense"),
     "ccr_memory_norerank": RecallOptions(rerank=False),
+    "ccr_memory_w05": RecallOptions(dense_weight=0.5),
+    "ccr_memory_w03": RecallOptions(dense_weight=0.3),
+    "ccr_memory_w015": RecallOptions(dense_weight=0.15),
     "ccr_memory+links": RecallOptions(link_expansion=True),
     "ccr_memory+scenes": RecallOptions(scene_expansion=True),
 }

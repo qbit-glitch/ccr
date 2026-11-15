@@ -54,13 +54,16 @@ def tokenize(text: str) -> list[str]:
     return [t for t in _WORD.findall(text.lower()) if len(t) > 1 and t not in _STOP]
 
 
-def rrf(rankings: Sequence[Sequence[str]], k: int = RRF_K) -> list[tuple[str, float]]:
-    """Reciprocal-rank fusion; ties keep the order of first appearance."""
+def rrf(
+    rankings: Sequence[Sequence[str]], k: int = RRF_K, weights: Sequence[float] | None = None,
+) -> list[tuple[str, float]]:
+    """Weighted reciprocal-rank fusion; ties keep the order of first appearance."""
     scores: dict[str, float] = defaultdict(float)
     first_seen: dict[str, int] = {}
-    for ranking in rankings:
+    for n, ranking in enumerate(rankings):
+        weight = weights[n] if weights else 1.0
         for rank, item in enumerate(ranking, 1):
-            scores[item] += 1.0 / (k + rank)
+            scores[item] += weight / (k + rank)
             first_seen.setdefault(item, len(first_seen))
     return sorted(scores.items(), key=lambda kv: (-kv[1], first_seen[kv[0]]))
 
@@ -107,7 +110,9 @@ class CommitSearchIndex:
         if fresh or stale:
             self._rebuild_matrix()
 
-    def search(self, query: str, k: int, mode: str = "hybrid") -> list[tuple[str, float]]:
+    def search(
+        self, query: str, k: int, mode: str = "hybrid", dense_weight: float = 1.0,
+    ) -> list[tuple[str, float]]:
         """Top ``k`` ``(commit_id, score)`` pairs, best first."""
         if k <= 0 or not self._order:
             return []
@@ -118,7 +123,8 @@ class CommitSearchIndex:
             return lexical[:k]
         if mode == "dense":
             return dense[:k]
-        return rrf([[c for c, _ in lexical], [c for c, _ in dense]])[:k]
+        return rrf([[c for c, _ in lexical], [c for c, _ in dense]],
+                   weights=[1.0, dense_weight])[:k]
 
     def save(self) -> None:
         """Persist vectors atomically so a restart does not re-embed."""

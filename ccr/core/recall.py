@@ -29,6 +29,7 @@ class RecallOptions:
 
     commit_search: str = "hybrid"
     rerank: bool = True
+    dense_weight: float = 1.0  # weight of the dense ranking in hybrid fusion (BM25 = 1)
     link_expansion: bool = False  # A-MEM: add commits linked to the top hits
     scene_expansion: bool = False  # EverMemOS: add the best scene mates of the top hits
 

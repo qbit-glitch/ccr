@@ -145,3 +145,28 @@ def test_every_mode_returns_scored_pairs_best_first(mode) -> None:
     hits = idx.search("caroline adoption", 4, mode=mode)
     scores = [s for _, s in hits]
     assert hits and scores == sorted(scores, reverse=True)
+
+
+def test_rrf_weights_let_one_ranking_count_less() -> None:
+    lexical, dense = ["a", "b"], ["b", "a"]
+    even = [i for i, _ in rrf([lexical, dense])]
+    assert even == ["a", "b"]  # tie on score, first seen wins
+    light_dense = [i for i, _ in rrf([lexical, dense], weights=[1.0, 0.3])]
+    heavy_dense = [i for i, _ in rrf([lexical, dense], weights=[0.3, 1.0])]
+    assert light_dense == ["a", "b"] and heavy_dense == ["b", "a"]
+
+
+def test_search_dense_weight_changes_the_hybrid_order() -> None:
+    class Opposed(FakeEmbedder):
+        """BM25 prefers L (alpha twice); this embedder makes D the dense neighbor."""
+
+        def _vec(self, text: str) -> np.ndarray:
+            v = np.zeros(DIM, dtype=np.float32)
+            v[0 if ("beta" in text or text == "alpha beta") else 1] = 1.0
+            return v
+
+    idx = CommitSearchIndex(embedder=Opposed())
+    idx.sync([("L", "alpha alpha"), ("D", "beta")])
+    low = [c for c, _ in idx.search("alpha beta", 2, dense_weight=0.05)]
+    high = [c for c, _ in idx.search("alpha beta", 2, dense_weight=3.0)]
+    assert low == ["L", "D"] and high == ["D", "L"]

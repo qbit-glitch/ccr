@@ -34,6 +34,7 @@ class SearchOptions(Protocol):
     commit_search: str
     link_expansion: bool
     scene_expansion: bool
+    dense_weight: float
 
 _CACHE_ATTR = "_commit_search_cache"
 
@@ -109,7 +110,8 @@ def ranked_commits(
     entry = _entry(mem, branch)
     try:
         _refresh(mem, branch, entry)
-        hits = entry["index"].search(query, limit, mode=options.commit_search)
+        hits = entry["index"].search(query, limit, mode=options.commit_search,
+                                     dense_weight=options.dense_weight)
     except Exception as exc:  # storage or embedding failure must not break recall
         logger.warning("hybrid commit search failed: %s", exc)
         return []
@@ -120,7 +122,8 @@ def ranked_commits(
     if options.link_expansion:
         scaled = _expand_links(scaled, entry["adjacency"])[:limit]
     if options.scene_expansion:
-        everything = entry["index"].search(query, len(entry["index"]), mode=options.commit_search)
+        everything = entry["index"].search(query, len(entry["index"]), mode=options.commit_search,
+                                         dense_weight=options.dense_weight)
         peak = everything[0][1] if everything else 1.0
         relevance = {cid: score / (peak or 1.0) for cid, score in everything}
         scaled = expand_scenes(scaled, entry["scenes"], relevance)[:limit]
