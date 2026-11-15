@@ -105,7 +105,8 @@ def test_variants_are_registered_with_their_own_names_and_options() -> None:
             "ccr_memory_norerank"} <= set(REGISTRY)
     legacy = REGISTRY["ccr_memory_legacy"]()
     assert legacy.name == "ccr_memory_legacy" and legacy.options.commit_search == "legacy"
-    assert REGISTRY["ccr_memory"]().options.commit_search == "hybrid"
+    assert REGISTRY["ccr_memory"]().options.commit_search == "bm25"
+    assert REGISTRY["ccr_memory_hybrid"]().options.commit_search == "hybrid"
     assert REGISTRY["ccr_memory_norerank"]().options.rerank is False
 
 

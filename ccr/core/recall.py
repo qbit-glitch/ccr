@@ -27,7 +27,7 @@ COMMIT_SEARCH_MODES = ("hybrid", "bm25", "dense", "legacy")
 class RecallOptions:
     """Retrieval switches. ``legacy`` keeps the original exact-phrase commit search."""
 
-    commit_search: str = "hybrid"
+    commit_search: str = "bm25"  # dev-sample winner; "hybrid" adds dense vectors (ONNX)
     rerank: bool = True
     dense_weight: float = 1.0  # weight of the dense ranking in hybrid fusion (BM25 = 1)
     link_expansion: bool = False  # A-MEM: add commits linked to the top hits

@@ -93,21 +93,24 @@ class CcrMemoryRetriever:
         self._mem = None
 
 
-# One system per retrieval configuration. ``ccr_memory`` is the shipped default;
-# the others exist so a report can show before/after and each ablation.
+# One system per retrieval configuration. ``ccr_memory`` is the shipped default (BM25).
+# The dev-sample runs measured every flag on top of hybrid search, so those variants
+# pin ``commit_search="hybrid"`` explicitly and keep their meaning if the default moves.
+_HYBRID = {"commit_search": "hybrid"}
 VARIANTS: dict[str, RecallOptions] = {
     "ccr_memory": RecallOptions(),
     "ccr_memory_legacy": RecallOptions(commit_search="legacy"),
     "ccr_memory_bm25": RecallOptions(commit_search="bm25"),
+    "ccr_memory_hybrid": RecallOptions(**_HYBRID),
     "ccr_memory_dense": RecallOptions(commit_search="dense"),
-    "ccr_memory_norerank": RecallOptions(rerank=False),
-    "ccr_memory_w05": RecallOptions(dense_weight=0.5),
-    "ccr_memory_w03": RecallOptions(dense_weight=0.3),
-    "ccr_memory_w015": RecallOptions(dense_weight=0.15),
-    "ccr_memory+links": RecallOptions(link_expansion=True),
-    "ccr_memory+scenes": RecallOptions(scene_expansion=True),
-    "ccr_memory+triples": RecallOptions(triple_boost=True),
-    "ccr_memory+chunks": RecallOptions(chunk_dense=True),
+    "ccr_memory_norerank": RecallOptions(**_HYBRID, rerank=False),
+    "ccr_memory_w05": RecallOptions(**_HYBRID, dense_weight=0.5),
+    "ccr_memory_w03": RecallOptions(**_HYBRID, dense_weight=0.3),
+    "ccr_memory_w015": RecallOptions(**_HYBRID, dense_weight=0.15),
+    "ccr_memory+links": RecallOptions(**_HYBRID, link_expansion=True),
+    "ccr_memory+scenes": RecallOptions(**_HYBRID, scene_expansion=True),
+    "ccr_memory+triples": RecallOptions(**_HYBRID, triple_boost=True),
+    "ccr_memory+chunks": RecallOptions(**_HYBRID, chunk_dense=True),
 }
 
 for _name, _options in VARIANTS.items():

@@ -64,11 +64,12 @@ def _vecs_path(mem: Any, branch: str, chunk_words: int) -> str:
     return os.path.join(mem.ccr_root, f"commit_search_vecs.{safe}{suffix}.npz")
 
 
-def _entry(mem: Any, branch: str, chunk_words: int = 0) -> dict[str, Any]:
+def _entry(mem: Any, branch: str, chunk_words: int = 0, dense: bool = True) -> dict[str, Any]:
     cache = mem.__dict__.setdefault(_CACHE_ATTR, {})
-    key = (branch, chunk_words)
+    key = (branch, chunk_words, dense)
     if key not in cache:
-        index = CommitSearchIndex(embedder=get_embedding_model(), chunk_words=chunk_words,
+        index = CommitSearchIndex(embedder=get_embedding_model() if dense else None,
+                                  chunk_words=chunk_words,
                                   vecs_path=_vecs_path(mem, branch, chunk_words))
         cache[key] = {"index": index, "stamp": None, "commits": {}, "adjacency": {},
                       "scenes": {}, "entities": {}}
@@ -144,7 +145,8 @@ def ranked_commits(
     mem: Any, branch: str, query: str, limit: int, options: SearchOptions,
 ) -> list[tuple[dict[str, Any], float]]:
     """Top ``limit`` commits for ``query`` as ``(commit, score)``, score scaled to (0, 1]."""
-    entry = _entry(mem, branch, CHUNK_WORDS if options.chunk_dense else 0)
+    dense = options.commit_search in ("hybrid", "dense")
+    entry = _entry(mem, branch, CHUNK_WORDS if options.chunk_dense else 0, dense)
     try:
         _refresh(mem, branch, entry)
         hits = entry["index"].search(query, limit, mode=options.commit_search,

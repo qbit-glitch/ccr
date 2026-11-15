@@ -103,17 +103,19 @@ def test_dense_hits_without_shared_words_are_not_filtered_out(mem, monkeypatch) 
 
     monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: Synonyms())
     # "dawn" never appears in any commit; the dense side still maps it to "sunrise".
-    result = RecallEngine(mem).recall("dawn", limit=3, sources=["commits"],
-                                      include_sessions=False)
+    result = RecallEngine(mem, options=RecallOptions(commit_search="hybrid")).recall(
+        "dawn", limit=3, sources=["commits"], include_sessions=False)
     assert "doc-1" in _titles(result)
 
 
 def test_engines_on_one_manager_share_the_index_and_embed_once(mem, monkeypatch) -> None:
     model = FakeModel()
     monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: model)
-    RecallEngine(mem).recall("lake", sources=["commits"], include_sessions=False)
+    hybrid = RecallOptions(commit_search="hybrid")
+    RecallEngine(mem, options=hybrid).recall("lake", sources=["commits"], include_sessions=False)
     first = model.embedded
-    RecallEngine(mem).recall("adoption", sources=["commits"], include_sessions=False)
+    RecallEngine(mem, options=hybrid).recall("adoption", sources=["commits"],
+                                             include_sessions=False)
     assert first >= 12 and model.embedded == first
 
 
@@ -227,3 +229,21 @@ def test_candidate_triples_extracts_pairs_and_file_triples() -> None:
     got = candidate_triples("C9", "t", "Migrated billing to postgres.", "", ["a.py"])
     assert {(t.subject, t.predicate, t.object) for t in got} >= {
         ("billing", "migrated_to", "postgres"), ("a.py", "modified_in", "C9")}
+
+
+def test_default_recall_is_bm25_only_and_never_touches_the_embedding_model(mem, monkeypatch) -> None:
+    def boom():
+        raise AssertionError("embedding model must not load for the default mode")
+
+    monkeypatch.setattr(commit_recall, "get_embedding_model", boom)
+    result = RecallEngine(mem).recall("adoption agency", sources=["commits"], include_sessions=False)
+    assert RecallOptions().commit_search == "bm25"
+    assert _titles(result)[0] == "doc-0"
+
+
+def test_hybrid_mode_is_still_available_on_request(mem, monkeypatch) -> None:
+    model = FakeModel()
+    monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: model)
+    RecallEngine(mem, options=RecallOptions(commit_search="hybrid")).recall(
+        "lake", sources=["commits"], include_sessions=False)
+    assert model.embedded >= 12
