@@ -200,3 +200,30 @@ def test_multiline_commit_text_is_searchable_beyond_its_first_line(tmp_path) -> 
         "name of the Spotify playlist", limit=3, sources=["commits"], include_sessions=False)
     assert _titles(result)[0] == "doc-a"
     assert "Spotify" in result.evidence[0].snippet
+
+
+def test_triple_boost_lifts_commits_whose_triples_name_the_query_entities(tmp_path) -> None:
+    manager = MemoryManager(str(tmp_path))
+    _commit(manager, "plain", "Notes on billing and postgres tuning for the quarter.")
+    _commit(manager, "triple", "Migrated billing to postgres. Also tuning notes for the quarter.")
+    ask = "billing postgres tuning"
+    branch = manager.get_active_branch()
+    base = dict((c["title"], s) for c, s in commit_recall.ranked_commits(
+        manager, branch, ask, 5, RecallOptions(commit_search="bm25")))
+    boosted = dict((c["title"], s) for c, s in commit_recall.ranked_commits(
+        manager, branch, ask, 5, RecallOptions(commit_search="bm25", triple_boost=True)))
+    assert boosted["triple"] > base["triple"] and boosted["plain"] == base["plain"]
+
+
+def test_triple_boost_is_a_no_op_for_commits_without_triples(mem) -> None:
+    branch = mem.get_active_branch()
+    a = commit_recall.ranked_commits(mem, branch, "lake", 5, RecallOptions())
+    b = commit_recall.ranked_commits(mem, branch, "lake", 5, RecallOptions(triple_boost=True))
+    assert [(c["title"], s) for c, s in a] == [(c["title"], s) for c, s in b]
+
+
+def test_candidate_triples_extracts_pairs_and_file_triples() -> None:
+    from ccr.core.triples import candidate_triples
+    got = candidate_triples("C9", "t", "Migrated billing to postgres.", "", ["a.py"])
+    assert {(t.subject, t.predicate, t.object) for t in got} >= {
+        ("billing", "migrated_to", "postgres"), ("a.py", "modified_in", "C9")}

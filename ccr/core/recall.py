@@ -32,6 +32,8 @@ class RecallOptions:
     dense_weight: float = 1.0  # weight of the dense ranking in hybrid fusion (BM25 = 1)
     link_expansion: bool = False  # A-MEM: add commits linked to the top hits
     scene_expansion: bool = False  # EverMemOS: add the best scene mates of the top hits
+    triple_boost: bool = False  # Memori: boost commits whose triples name the query entities
+    chunk_dense: bool = False  # A-RAG: score a commit by its best embedded chunk
 
     def __post_init__(self) -> None:
         if self.commit_search not in COMMIT_SEARCH_MODES:

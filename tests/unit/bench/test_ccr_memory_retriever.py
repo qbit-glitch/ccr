@@ -118,3 +118,12 @@ def test_hybrid_variant_answers_a_question_the_legacy_variant_caps(isolated) -> 
     ids = hybrid.retrieve("What did Caroline ask the adoption agency?", 10)
     hybrid.close()
     assert ids[0] == "target"
+
+
+def test_technique_variants_each_switch_on_exactly_one_flag() -> None:
+    flags = {"ccr_memory+links": "link_expansion", "ccr_memory+scenes": "scene_expansion",
+             "ccr_memory+triples": "triple_boost", "ccr_memory+chunks": "chunk_dense"}
+    for name, flag in flags.items():
+        options = REGISTRY[name]().options
+        assert getattr(options, flag) is True
+        assert [f for f in flags.values() if getattr(options, f)] == [flag]

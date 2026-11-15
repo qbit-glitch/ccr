@@ -75,15 +75,20 @@ def _digest(text: str) -> str:
 class CommitSearchIndex:
     """Searchable view over ``(commit_id, text)`` pairs, kept in sync incrementally."""
 
-    def __init__(self, embedder: Embedder | None = None, vecs_path: str | None = None) -> None:
+    def __init__(
+        self, embedder: Embedder | None = None, vecs_path: str | None = None, chunk_words: int = 0,
+    ) -> None:
+        """``chunk_words > 0`` embeds each commit as chunks and scores it by its best one (A-RAG)."""
         self._embedder = embedder
         self._vecs_path = vecs_path
+        self._chunk_words = max(0, chunk_words)
         self._order: list[str] = []
         self._hash: dict[str, str] = {}
         self._postings: dict[str, dict[int, int]] = defaultdict(dict)
         self._lengths: list[int] = []
-        self._vec: dict[str, tuple[str, np.ndarray]] = {}
+        self._vec: dict[str, tuple[str, np.ndarray]] = {}  # id -> (key, rows of shape n x dim)
         self._matrix: np.ndarray | None = None
+        self._owner: np.ndarray | None = None  # matrix row -> position in ``_order``
         self._dirty = False
         if embedder is not None and vecs_path:
             self._load()
@@ -130,14 +135,14 @@ class CommitSearchIndex:
         """Persist vectors atomically so a restart does not re-embed."""
         if not (self._vecs_path and self._dirty and self._vec):
             return
-        ids = list(self._vec)
+        ids = [cid for cid, (_, rows) in self._vec.items() for _ in range(len(rows))]
         directory = os.path.dirname(os.path.abspath(self._vecs_path))
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".vecs.", suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "wb") as fh:
                 np.savez(fh, ids=np.array(ids), hashes=np.array([self._vec[i][0] for i in ids]),
-                         matrix=np.stack([self._vec[i][1] for i in ids]))
+                         matrix=np.concatenate([rows for _, rows in self._vec.values()]))
             os.replace(tmp, self._vecs_path)
             self._dirty = False
         except OSError as exc:
@@ -174,28 +179,47 @@ class CommitSearchIndex:
         best = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:pool]
         return [(self._order[pos], score) for pos, score in best]
 
+    def _units(self, text: str) -> list[str]:
+        """The pieces of ``text`` that get their own vector."""
+        words = text.split()
+        if self._chunk_words <= 0 or len(words) <= self._chunk_words:
+            return [text]
+        step = self._chunk_words
+        return [" ".join(words[i:i + step]) for i in range(0, len(words), step)]
+
     def _embed_missing(self, commits: Sequence[tuple[str, str]], wanted: dict[str, str]) -> None:
+        key = {cid: f"{wanted[cid]}:{self._chunk_words}" for cid in wanted}
         todo = [(cid, text) for cid, text in commits
-                if cid not in self._vec or self._vec[cid][0] != wanted[cid]]
-        for start in range(0, len(todo), BATCH):
-            chunk = todo[start:start + BATCH]
-            vectors = np.asarray(self._embedder.embed_batch([t for _, t in chunk]),
+                if cid not in self._vec or self._vec[cid][0] != key[cid]]
+        pieces = [(cid, unit) for cid, text in todo for unit in self._units(text)]
+        rows: dict[str, list[np.ndarray]] = defaultdict(list)
+        for start in range(0, len(pieces), BATCH):
+            batch = pieces[start:start + BATCH]
+            vectors = np.asarray(self._embedder.embed_batch([u for _, u in batch]),
                                  dtype=np.float32)
-            for (cid, _), vec in zip(chunk, vectors):
-                self._vec[cid] = (wanted[cid], vec)
+            for (cid, _), vec in zip(batch, vectors):
+                rows[cid].append(vec)
+        for cid, vecs in rows.items():
+            self._vec[cid] = (key[cid], np.stack(vecs))
             self._dirty = True
         for gone in set(self._vec) - set(wanted):
             del self._vec[gone]
             self._dirty = True
 
     def _rebuild_matrix(self) -> None:
-        rows = [self._vec[cid][1] for cid in self._order if cid in self._vec]
-        self._matrix = np.stack(rows) if len(rows) == len(self._order) and rows else None
+        if not self._order or any(cid not in self._vec for cid in self._order):
+            self._matrix = self._owner = None
+            return
+        self._matrix = np.concatenate([self._vec[cid][1] for cid in self._order])
+        self._owner = np.concatenate([np.full(len(self._vec[cid][1]), pos, dtype=np.int64)
+                                      for pos, cid in enumerate(self._order)])
 
     def _dense(self, query: str, pool: int) -> list[tuple[str, float]]:
         if self._embedder is None or self._matrix is None or not query.strip():
             return []
-        sims = self._matrix @ np.asarray(self._embedder.embed_query(query), dtype=np.float32)
+        rows = self._matrix @ np.asarray(self._embedder.embed_query(query), dtype=np.float32)
+        sims = np.full(len(self._order), -np.inf, dtype=np.float32)
+        np.maximum.at(sims, self._owner, rows)
         top = np.argsort(-sims, kind="stable")[:pool]
         return [(self._order[int(i)], float(sims[i])) for i in top]
 
@@ -205,6 +229,9 @@ class CommitSearchIndex:
                 ids, hashes, matrix = data["ids"], data["hashes"], data["matrix"]
             if not (len(ids) == len(hashes) == len(matrix)):
                 return
-            self._vec = {str(i): (str(h), matrix[n]) for n, (i, h) in enumerate(zip(ids, hashes))}
+            grouped: dict[str, list[int]] = defaultdict(list)
+            for n, cid in enumerate(ids):
+                grouped[str(cid)].append(n)
+            self._vec = {cid: (str(hashes[at[0]]), matrix[at]) for cid, at in grouped.items()}
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile) as exc:
             logger.debug("ignoring unreadable vector file %s: %s", self._vecs_path, exc)

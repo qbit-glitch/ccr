@@ -170,3 +170,34 @@ def test_search_dense_weight_changes_the_hybrid_order() -> None:
     low = [c for c, _ in idx.search("alpha beta", 2, dense_weight=0.05)]
     high = [c for c, _ in idx.search("alpha beta", 2, dense_weight=3.0)]
     assert low == ["L", "D"] and high == ["D", "L"]
+
+
+FILLER = " ".join(f"filler{i}" for i in range(60))
+LONG = [("L1", f"{FILLER} zebra migration plan {FILLER}"), ("L2", f"{FILLER} tax forms {FILLER}")]
+
+
+def test_chunk_dense_finds_a_passage_buried_in_a_long_commit() -> None:
+    whole = CommitSearchIndex(embedder=FakeEmbedder())
+    whole.sync(LONG)
+    chunked = CommitSearchIndex(embedder=FakeEmbedder(), chunk_words=10)
+    chunked.sync(LONG)
+    q = "zebra migration"
+    top_whole = whole.search(q, 2, mode="dense")
+    top_chunk = chunked.search(q, 2, mode="dense")
+    assert top_chunk[0][0] == "L1"
+    assert top_chunk[0][1] > top_whole[0][1] * 2  # best chunk is far closer than the diluted whole
+
+
+def test_chunked_vectors_persist_and_a_chunk_size_change_reembeds(tmp_path) -> None:
+    path = str(tmp_path / "vecs.npz")
+    first = FakeEmbedder()
+    idx = CommitSearchIndex(embedder=first, vecs_path=path, chunk_words=10)
+    idx.sync(LONG)
+    idx.save()
+    assert first.texts_embedded > 2
+    again = FakeEmbedder()
+    CommitSearchIndex(embedder=again, vecs_path=path, chunk_words=10).sync(LONG)
+    assert again.texts_embedded == 0
+    other = FakeEmbedder()
+    CommitSearchIndex(embedder=other, vecs_path=path, chunk_words=20).sync(LONG)
+    assert other.texts_embedded > 0

@@ -13,7 +13,8 @@ import re
 from typing import Any, Protocol
 
 from ccr.context.embeddings import get_embedding_model
-from ccr.core.commit_search import CommitSearchIndex
+from ccr.core.commit_search import CommitSearchIndex, tokenize
+from ccr.core.triples import candidate_triples
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ SCENE_PER_SEED = 3
 SCENE_FLOOR = 0.5  # a scene mate with no query overlap still counts for half
 SCENE_MIN_LINK = 0.3
 SCENE_TYPES = ("entity", "semantic")
+TRIPLE_BOOST = 0.5  # a commit whose triples cover every query term scores 1.5x
+CHUNK_WORDS = 160  # about one MiniLM window (256 word pieces)
 
 
 class SearchOptions(Protocol):
@@ -34,6 +37,8 @@ class SearchOptions(Protocol):
     commit_search: str
     link_expansion: bool
     scene_expansion: bool
+    triple_boost: bool
+    chunk_dense: bool
     dense_weight: float
 
 _CACHE_ATTR = "_commit_search_cache"
@@ -53,19 +58,21 @@ def _commit_text(commit: dict[str, Any]) -> str:
                      str(commit.get("why") or ""), str(commit.get("next") or "")])
 
 
-def _vecs_path(mem: Any, branch: str) -> str:
+def _vecs_path(mem: Any, branch: str, chunk_words: int) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", branch) or "main"
-    return os.path.join(mem.ccr_root, f"commit_search_vecs.{safe}.npz")
+    suffix = f".c{chunk_words}" if chunk_words else ""
+    return os.path.join(mem.ccr_root, f"commit_search_vecs.{safe}{suffix}.npz")
 
 
-def _entry(mem: Any, branch: str) -> dict[str, Any]:
+def _entry(mem: Any, branch: str, chunk_words: int = 0) -> dict[str, Any]:
     cache = mem.__dict__.setdefault(_CACHE_ATTR, {})
-    if branch not in cache:
-        index = CommitSearchIndex(embedder=get_embedding_model(),
-                                  vecs_path=_vecs_path(mem, branch))
-        cache[branch] = {"index": index, "stamp": None, "commits": {}, "adjacency": {},
-                        "scenes": {}}
-    return cache[branch]
+    key = (branch, chunk_words)
+    if key not in cache:
+        index = CommitSearchIndex(embedder=get_embedding_model(), chunk_words=chunk_words,
+                                  vecs_path=_vecs_path(mem, branch, chunk_words))
+        cache[key] = {"index": index, "stamp": None, "commits": {}, "adjacency": {},
+                      "scenes": {}, "entities": {}}
+    return cache[key]
 
 
 def _refresh(mem: Any, branch: str, entry: dict[str, Any]) -> None:
@@ -79,9 +86,29 @@ def _refresh(mem: Any, branch: str, entry: dict[str, Any]) -> None:
     entry["commits"] = {str(c["id"]): c for c in commits}
     entry["index"].sync([(str(c["id"]), _commit_text(c)) for c in reversed(commits)])
     entry["index"].save()
+    entry["entities"] = {cid: _triple_terms(c) for cid, c in entry["commits"].items()}
     entry["adjacency"] = _adjacency(storage.link_get_all())
     entry["scenes"] = build_scenes(entry["adjacency"])
     entry["stamp"] = stamp
+
+
+def _triple_terms(commit: dict[str, Any]) -> frozenset[str]:
+    """Words of the entities in the commit's regex triples (file triples excluded)."""
+    triples = candidate_triples(str(commit.get("id", "")), str(commit.get("title", "")),
+                                full_what(commit), str(commit.get("why", "")), [])
+    return frozenset(t for tr in triples for t in tokenize(f"{tr.subject} {tr.object}"))
+
+
+def _boost_by_triples(
+    ranked: list[tuple[str, float]], entities: dict[str, frozenset[str]], query: str,
+) -> list[tuple[str, float]]:
+    """Memori: scale a commit by the share of query terms its triples mention."""
+    terms = set(tokenize(query))
+    if not terms:
+        return ranked
+    boosted = [(cid, score * (1 + TRIPLE_BOOST * len(terms & entities.get(cid, frozenset()))
+                              / len(terms))) for cid, score in ranked]
+    return sorted(boosted, key=lambda kv: -kv[1])
 
 
 def _adjacency(all_links: dict[str, Any]) -> dict[str, list[tuple[str, float, str]]]:
@@ -117,7 +144,7 @@ def ranked_commits(
     mem: Any, branch: str, query: str, limit: int, options: SearchOptions,
 ) -> list[tuple[dict[str, Any], float]]:
     """Top ``limit`` commits for ``query`` as ``(commit, score)``, score scaled to (0, 1]."""
-    entry = _entry(mem, branch)
+    entry = _entry(mem, branch, CHUNK_WORDS if options.chunk_dense else 0)
     try:
         _refresh(mem, branch, entry)
         hits = entry["index"].search(query, limit, mode=options.commit_search,
@@ -129,6 +156,8 @@ def ranked_commits(
         return []
     top = hits[0][1] or 1.0
     scaled = [(cid, score / top) for cid, score in hits]
+    if options.triple_boost:
+        scaled = _boost_by_triples(scaled, entry["entities"], query)
     if options.link_expansion:
         scaled = _expand_links(scaled, entry["adjacency"])[:limit]
     if options.scene_expansion:
