@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["ranked_commits"]
 
 LINK_SEEDS = 5
-LINK_DISCOUNT = 0.5
+LINK_DISCOUNT = 0.9  # fused scores are flat, so 0.5 would sink neighbours below the pool
 SCENE_DISCOUNT = 0.6
 SCENE_PER_SEED = 3
 SCENE_FLOOR = 0.5  # a scene mate with no query overlap still counts for half
@@ -39,8 +39,18 @@ class SearchOptions(Protocol):
 _CACHE_ATTR = "_commit_search_cache"
 
 
+_WHAT_BLOCK = re.compile(r"\*\*What\*\*:(.*?)\n\*\*Why\*\*:", re.DOTALL)
+
+
+def full_what(commit: dict[str, Any]) -> str:
+    """The whole ``What`` body; the parsed ``what`` field keeps only its first line."""
+    match = _WHAT_BLOCK.search(str(commit.get("raw_block") or ""))
+    return match.group(1).strip() if match else str(commit.get("what") or "")
+
+
 def _commit_text(commit: dict[str, Any]) -> str:
-    return " ".join(str(commit.get(k) or "") for k in ("title", "what", "why", "next"))
+    return " ".join([str(commit.get("title") or ""), full_what(commit),
+                     str(commit.get("why") or ""), str(commit.get("next") or "")])
 
 
 def _vecs_path(mem: Any, branch: str) -> str:
@@ -96,8 +106,8 @@ def _expand_links(
     """Add commits linked to the top hits, scored below the hit that led to them."""
     best = dict(ranked)
     for seed, seed_score in ranked[:LINK_SEEDS]:
-        for neighbor, _, _ in adjacency.get(seed, []):
-            candidate = seed_score * LINK_DISCOUNT
+        for neighbor, strength, _ in adjacency.get(seed, []):
+            candidate = seed_score * LINK_DISCOUNT * min(1.0, max(strength, 0.0))
             if candidate > best.get(neighbor, 0.0):
                 best[neighbor] = candidate
     return sorted(best.items(), key=lambda kv: -kv[1])
@@ -127,7 +137,8 @@ def ranked_commits(
         peak = everything[0][1] if everything else 1.0
         relevance = {cid: score / (peak or 1.0) for cid, score in everything}
         scaled = expand_scenes(scaled, entry["scenes"], relevance)[:limit]
-    return [(entry["commits"][cid], score) for cid, score in scaled if cid in entry["commits"]]
+    return [({**entry["commits"][cid], "what": full_what(entry["commits"][cid])}, score)
+            for cid, score in scaled if cid in entry["commits"]]
 
 
 def build_scenes(

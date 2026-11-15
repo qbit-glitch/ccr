@@ -149,12 +149,13 @@ def linked(tmp_path) -> MemoryManager:
 
 def test_link_expansion_pulls_in_commits_linked_to_a_top_hit(linked) -> None:
     ask = "quokka scheduler"
-    base = RecallEngine(linked).recall(ask, limit=5, sources=["commits"], include_sessions=False)
-    assert "followup" not in _titles(base)
     expanded = RecallEngine(linked, options=RecallOptions(link_expansion=True)).recall(
         ask, limit=5, sources=["commits"], include_sessions=False)
     titles = _titles(expanded)
-    assert titles[0] == "design" and "followup" in titles and "unrelated" not in titles
+    # "followup" shares no word with the query; only its link to "design" can lift it
+    # above the unlinked commit (dense search, when installed, returns everything).
+    assert titles[0] == "design" and "followup" in titles
+    assert "unrelated" not in titles or titles.index("followup") < titles.index("unrelated")
 
 
 def test_link_expansion_ranks_linked_commits_below_direct_hits(linked) -> None:
@@ -189,3 +190,13 @@ def test_scene_expansion_flag_runs_end_to_end(linked) -> None:
         "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
     titles = _titles(result)
     assert titles[0] == "design" and "followup" in titles
+
+
+def test_multiline_commit_text_is_searchable_beyond_its_first_line(tmp_path) -> None:
+    manager = MemoryManager(str(tmp_path))
+    _commit(manager, "doc-a", "[2023/05/20]\nuser: I made a playlist on Spotify\nassistant: Nice")
+    _commit(manager, "doc-b", "[2023/05/21]\nuser: Asked about tax forms\nassistant: Sure")
+    result = RecallEngine(manager, options=RecallOptions(commit_search="bm25")).recall(
+        "name of the Spotify playlist", limit=3, sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-a"
+    assert "Spotify" in result.evidence[0].snippet
