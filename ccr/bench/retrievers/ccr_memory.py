@@ -102,6 +102,7 @@ VARIANTS: dict[str, RecallOptions] = {
     "ccr_memory_dense": RecallOptions(commit_search="dense"),
     "ccr_memory_norerank": RecallOptions(rerank=False),
     "ccr_memory+links": RecallOptions(link_expansion=True),
+    "ccr_memory+scenes": RecallOptions(scene_expansion=True),
 }
 
 for _name, _options in VARIANTS.items():

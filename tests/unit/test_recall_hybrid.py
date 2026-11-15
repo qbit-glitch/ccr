@@ -162,3 +162,30 @@ def test_link_expansion_ranks_linked_commits_below_direct_hits(linked) -> None:
         "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
     scores = {ev.title: ev.score for ev in result.evidence}
     assert scores["design"] > scores["followup"]
+
+
+def test_scenes_are_connected_components_over_entity_and_semantic_links() -> None:
+    adjacency = {
+        "C1": [("C2", 0.9, "entity")], "C2": [("C1", 0.9, "entity"), ("C3", 0.5, "semantic")],
+        "C3": [("C2", 0.5, "semantic")],
+        "C4": [("C5", 0.9, "causal")], "C5": [("C4", 0.9, "causal")],
+        "C6": [("C7", 0.1, "entity")], "C7": [("C6", 0.1, "entity")],
+    }
+    scenes = commit_recall.build_scenes(adjacency, min_score=0.3)
+    assert scenes["C1"] == scenes["C3"] == frozenset({"C1", "C2", "C3"})
+    assert "C4" not in scenes and "C6" not in scenes
+
+
+def test_scene_expansion_adds_the_most_relevant_scene_mates_below_the_seed() -> None:
+    scenes = {c: frozenset({"C1", "C2", "C3", "C4"}) for c in ("C1", "C2", "C3", "C4")}
+    relevance = {"C1": 1.0, "C2": 0.2, "C3": 0.6, "C4": 0.1}
+    out = dict(commit_recall.expand_scenes([("C1", 1.0)], scenes, relevance, per_seed=2))
+    assert set(out) == {"C1", "C3", "C2"} and out["C1"] == 1.0
+    assert out["C3"] < 1.0 and out["C3"] > out["C2"]
+
+
+def test_scene_expansion_flag_runs_end_to_end(linked) -> None:
+    result = RecallEngine(linked, options=RecallOptions(scene_expansion=True)).recall(
+        "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
+    titles = _titles(result)
+    assert titles[0] == "design" and "followup" in titles

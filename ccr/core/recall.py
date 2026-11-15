@@ -30,6 +30,7 @@ class RecallOptions:
     commit_search: str = "hybrid"
     rerank: bool = True
     link_expansion: bool = False  # A-MEM: add commits linked to the top hits
+    scene_expansion: bool = False  # EverMemOS: add the best scene mates of the top hits
 
     def __post_init__(self) -> None:
         if self.commit_search not in COMMIT_SEARCH_MODES:
