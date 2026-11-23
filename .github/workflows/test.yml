@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           # no semantic/vector extras: several unit tests assume the embedding path is off
           pip install -e ".[models,bench,watch]"
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio numpy
 
       - name: Run tests
         run: pytest tests/unit/ tests/integration/ -x -q
