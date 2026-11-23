@@ -26,7 +26,8 @@ def test_bootstrap_ci_brackets_the_mean_and_is_seeded() -> None:
 
 
 def test_bootstrap_ci_of_constant_values_has_zero_width() -> None:
-    assert bootstrap_ci([0.7] * 20, n_boot=200, seed=1) == (0.7, 0.7, 0.7)
+    # approx: numpy sums differ in the last ulp between macOS ARM and Linux
+    assert bootstrap_ci([0.7] * 20, n_boot=200, seed=1) == pytest.approx((0.7, 0.7, 0.7))
 
 
 def test_bootstrap_ci_of_empty_is_nan_free_zero() -> None:
