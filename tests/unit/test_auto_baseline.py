@@ -21,6 +21,19 @@ from ccr.hooks.state_accumulator import SessionState, extract_baseline_summary
 # ---------------------------------------------------------------------------
 
 class TestExtractBaselineSummary:
+    def test_injected_system_reminder_is_stripped(self):
+        """Harness-injected blocks must not leak into the baseline commit."""
+        noisy = "<system-reminder>\nCodebase instructions...\n</system-reminder>\nfix the login bug"
+        result = extract_baseline_summary(SessionState(), self._make_turns([noisy]))
+        assert result["title"] == "[auto] fix the login bug"
+        assert "system-reminder" not in result["what"]
+
+    def test_injected_only_turn_is_ignored(self):
+        noisy = "<system-reminder>only injected text</system-reminder>"
+        result = extract_baseline_summary(SessionState(), self._make_turns([noisy]))
+        assert result["title"] == "[auto] Session baseline"
+        assert result["what"] == "Session with no logged turns"
+
     def _make_turns(self, messages: list[str]) -> list[dict]:
         return [{"user_message": m, "assistant_message": "ok"} for m in messages]
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,16 @@ from dataclasses import asdict, dataclass, field
 logger = logging.getLogger(__name__)
 
 _STATE_FILENAME = ".session_state.json"
+
+# Blocks the harness/hooks inject into user turns; they are not what the user said.
+_INJECTED_RE = re.compile(
+    r"<(system-reminder|gcc_context)>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+
+
+def strip_injected(text: str) -> str:
+    """Remove harness-injected blocks (system-reminder, gcc_context) from a user turn."""
+    return _INJECTED_RE.sub("", text or "").strip()
 
 
 @dataclass
@@ -186,10 +197,8 @@ def extract_baseline_summary(
     Returns:
         Dict with title, what, why, files_changed, next_step.
     """
-    user_msgs = [
-        t["user_message"] for t in session_turns[:10]
-        if t.get("user_message", "").strip()
-    ][:3]
+    cleaned = (strip_injected(t.get("user_message", "")) for t in session_turns[:10])
+    user_msgs = [m for m in cleaned if m][:3]
 
     files = list(dict.fromkeys(state.files_touched))[:20]
 

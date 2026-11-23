@@ -60,13 +60,15 @@ def _extract_text_from_content(content) -> str:
     Content may be a plain string or a list of content blocks.
     We only capture text-type blocks; tool_use and tool_result are skipped.
     """
+    from ccr.hooks.state_accumulator import strip_injected  # noqa: PLC0415
+
     if isinstance(content, str):
-        return content
+        return strip_injected(content)
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") in ("text", "input_text", "output_text"):
-                text = block.get("text", "")
+                text = strip_injected(block.get("text", ""))
                 if text:
                     parts.append(text)
         return "\n".join(parts)

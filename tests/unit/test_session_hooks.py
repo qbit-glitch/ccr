@@ -107,6 +107,17 @@ def _write_codex_transcript(path: str, turns: list[dict]) -> None:
 
 
 class TestExtractTextFromContent:
+    def test_strips_system_reminder_from_string(self):
+        text = "<system-reminder>\nnoise\n</system-reminder>real question"
+        assert _extract_text_from_content(text) == "real question"
+
+    def test_drops_block_that_is_only_injected_text(self):
+        content = [
+            {"type": "text", "text": "<system-reminder>noise</system-reminder>"},
+            {"type": "text", "text": "real question"},
+        ]
+        assert _extract_text_from_content(content) == "real question"
+
     def test_plain_string(self):
         assert _extract_text_from_content("hello world") == "hello world"
 
