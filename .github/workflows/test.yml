@@ -24,8 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # no semantic/vector extras: several unit tests assume the embedding path is off
-          pip install -e ".[models,bench,watch]"
+          pip install -e ".[full,bench,watch]"
           pip install pytest pytest-asyncio numpy
 
       - name: Run tests

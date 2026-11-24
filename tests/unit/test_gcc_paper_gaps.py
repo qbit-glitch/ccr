@@ -52,6 +52,8 @@ class TestLLMRollingSummary:
         assert "Compressed summary" in summary
         mock_client.completion.assert_called_once()
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_llm_summary_prompt_contains_previous_and_new(self, mem):
         mock_client = MagicMock()
         mock_client.completion.return_value = "Updated summary with both contributions."

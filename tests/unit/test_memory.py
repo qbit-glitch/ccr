@@ -1105,6 +1105,8 @@ class TestPatternBuffer:
         assert entry["occurrence_count"] == 1
         assert entry["promoted"] is False
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_sequential_pattern_ids(self, memory):
         """Patterns get P001, P002, P003 IDs sequentially."""
         import json
@@ -1167,6 +1169,8 @@ class TestPatternBuffer:
 
     # --- Occurrence Tracking ---
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_occurrence_increments_on_re_observation(self, memory):
         """Count goes 1 -> 2 -> 3 on successive commits with same pattern."""
         import json
@@ -1198,6 +1202,8 @@ class TestPatternBuffer:
         assert data["patterns"]["P001"]["commit_ids"] == ["C001", "C002", "C003"]
 
     # --- Promotion Suggestions ---
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_promotion_suggested_at_threshold(self, memory):
         """3 occurrences triggers promotion suggestion in return string."""
@@ -1246,6 +1252,8 @@ class TestPatternBuffer:
                            patterns_learned=[pat])
         data = json.loads(memory._read_file(memory._get_patterns_path()))
         assert len(data["patterns"]) == 3
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_eviction_preserves_high_occurrence(self, memory):
         """High-occurrence patterns survive eviction."""
@@ -1358,6 +1366,8 @@ class TestPatternBuffer:
         result = memory.get_patterns(search_term="kernel")
         assert result["matching"] == 1
         assert "kernel" in result["patterns"][0]["text"].lower()
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_get_patterns_sorted_by_occurrence(self, memory):
         """Results sorted by occurrence_count DESC."""
@@ -1762,6 +1772,8 @@ class TestCommitEmbeddings:
         _, kwargs = mock_cl.call_args
         assert kwargs.get("new_vec") is not None
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_embed_commit_not_called_on_amac_merge_path(self, memory):
         """When A-MAC takes the merge path (new_score > conflict_score -> early return),
         _embed_commit is not called -- it lives after the merge return point in commit().
@@ -2004,6 +2016,8 @@ class TestScanPendingPromotions:
         result = memory._scan_pending_promotions()
         assert result == []
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_at_threshold_returned(self, memory):
         """Pattern at exactly pattern_promotion_count is returned."""
         pat = "Always validate input parameters before processing data"
@@ -2014,6 +2028,8 @@ class TestScanPendingPromotions:
         assert len(result) == 1
         assert result[0]["text"] == pat
         assert result[0]["count"] == 3
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_above_threshold_returned(self, memory):
         """Pattern above threshold (more than 3 occurrences) is returned."""
@@ -2065,6 +2081,8 @@ class TestScanPendingPromotions:
         data = json.loads(memory._read_file(memory._get_patterns_path()))
         assert data["patterns"]["P001"]["promoted"] is False
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_result_shape_matches_process_patterns(self, memory):
         """Return dicts have pattern_id, text, count, commit_ids keys."""
         pat = "Always validate input parameters before processing data"
@@ -2093,6 +2111,8 @@ class TestScanPendingPromotions:
         result = memory._scan_pending_promotions()
         assert len(result) == 2
         assert result[0]["count"] >= result[1]["count"]
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_commit_without_patterns_surfaces_pending(self, memory):
         """A commit() with no patterns_learned auto-scans and suggests pending patterns."""
@@ -2504,6 +2524,8 @@ class TestAdaptiveTraversal:
         assert abs(by_id["C002"]["query_score"] - 0.35) < 1e-5
         assert abs(by_id["C003"]["query_score"] - 0.88) < 1e-5
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_bfs_fallback_when_onnx_unavailable(self, memory):
         """When quick_cosine returns None (no ONNX), BFS fallback works identically."""
         self._setup_links(memory, "C001", ["C002", "C003"])
@@ -2622,6 +2644,8 @@ class TestAdaptiveTraversal:
         ids = [r["id"] for r in results]
         assert ids.count("C001") == 0  # Starting node never in results
         assert ids.count("C002") == 1  # Visited exactly once
+
+    @pytest.mark.usefixtures("no_semantic")
 
     def test_quick_cosine_exception_falls_back_gracefully(self, memory):
         """If quick_cosine probe raises an exception, BFS fallback is used."""
