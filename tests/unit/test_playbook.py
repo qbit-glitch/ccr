@@ -2521,8 +2521,11 @@ class TestStochasticProposal:
         from ccr.mcp_server import _init
         from ccr.mcp_server import ace_evolve_schema
         import ccr.mcp_server as mcp_mod
+        import gc
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
+        # ignore_cleanup_errors: a leftover SQLite handle finalized by the GC can recreate
+        # WAL files while rmtree runs (seen as ENOTEMPTY on CI); this test is not about cleanup.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             fake_home = os.path.join(tmp, "global_ccr")
             os.makedirs(fake_home)
             orig = os.path.expanduser
@@ -2544,6 +2547,7 @@ class TestStochasticProposal:
                     mcp_mod._global_playbook = None
                     mcp_mod._repo_index = None
                     mcp_mod._repl = None
+                    gc.collect()  # finalize dropped handles before the temp dir is removed
 
 
 # ===========================================================================

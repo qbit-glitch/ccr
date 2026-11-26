@@ -315,6 +315,10 @@ ccr status   # Show memory state
 ccr context  # Print project context
 ```
 
+## Benchmarks
+
+`ccr bench` runs judge-free retrieval and memory benchmarks (LoCoMo, LongMemEval, MemoryAgentBench, BEIR, CodeSearchNet) against CCR and baseline systems under identical conditions, with a local open-source reader and no paid API. See [docs/benchmarks.md](docs/benchmarks.md) for datasets, systems and how to reproduce.
+
 ## Development
 
 ```bash

@@ -67,13 +67,15 @@ def _extract_text_from_content(content) -> str:
     Content may be a plain string or a list of content blocks.
     We only capture text-type blocks; tool_use and tool_result are skipped.
     """
+    from ccr.hooks.state_accumulator import strip_injected  # noqa: PLC0415
+
     if isinstance(content, str):
-        return content
+        return strip_injected(content)
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") in ("text", "input_text", "output_text"):
-                text = block.get("text", "")
+                text = strip_injected(block.get("text", ""))
                 if text:
                     parts.append(text)
         return "\n".join(parts)
@@ -161,12 +163,22 @@ def _parse_transcript(transcript_path: str) -> list[dict]:
 
     for obj in objects:
         obj_type = obj.get("type", "")
+        # Bookkeeping entries (api-request-blob, summary, ...) carry a message but are not turns.
+        # isMeta marks harness-injected user messages such as skill bodies.
+        if obj_type not in ("", "user", "human", "assistant") or obj.get("isMeta"):
+            continue
         message = obj.get("message", {})
         role = message.get("role", "")
 
         # Some transcript formats use "human" as role alias
         if obj_type in ("user", "human") or role in ("user", "human"):
             content = message.get("content", obj.get("content", ""))
+            # A user message carrying a tool_result is the harness answering a tool call; any
+            # text block beside it (e.g. "Tool loaded.") is not something the user said.
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            ):
+                continue
             text = _extract_text_from_content(content)
             # Skip empty or tool-result-only messages
             if text:

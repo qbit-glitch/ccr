@@ -1,0 +1,249 @@
+"""Hybrid commit recall: natural-language questions, no 5-cap, legacy mode kept."""
+
+from __future__ import annotations
+
+import hashlib
+
+import numpy as np
+import pytest
+
+import ccr.core.commit_recall as commit_recall
+from ccr.core.commit_search import tokenize
+from ccr.core.memory import MemoryManager
+from ccr.core.recall import RecallEngine, RecallOptions
+
+DIM = 64
+
+
+class FakeModel:
+    def __init__(self) -> None:
+        self.embedded = 0
+
+    def _vec(self, text: str) -> np.ndarray:
+        v = np.zeros(DIM, dtype=np.float32)
+        for tok in tokenize(text):
+            v[int(hashlib.md5(tok.encode()).hexdigest(), 16) % DIM] += 1.0
+        n = np.linalg.norm(v)
+        return v / n if n else v
+
+    def embed_batch(self, texts):
+        self.embedded += len(texts)
+        return np.stack([self._vec(t) for t in texts])
+
+    def embed_query(self, text):
+        return self._vec(text)
+
+
+def _commit(mem: MemoryManager, title: str, what: str) -> None:
+    mem.commit(title=title, what=what, why="note", files_changed=[], next_step="",
+               admission_threshold=1.0, rejection_threshold=0.0)
+
+
+@pytest.fixture
+def mem(tmp_path) -> MemoryManager:
+    manager = MemoryManager(str(tmp_path))
+    _commit(manager, "doc-0", "Caroline visited the adoption agency to ask about the process.")
+    _commit(manager, "doc-1", "Melanie painted a sunrise over the lake for the charity auction.")
+    _commit(manager, "doc-2", "The api gateway got a new rate limiting configuration.")
+    for n in range(3, 12):
+        _commit(manager, f"doc-{n}", f"Weekly status number {n} covering lake maintenance chores.")
+    return manager
+
+
+def _titles(result) -> list[str]:
+    return [ev.title for ev in result.evidence]
+
+
+def test_legacy_mode_keeps_the_five_result_cap(mem) -> None:
+    engine = RecallEngine(mem, options=RecallOptions(commit_search="legacy"))
+    question = "Which lake maintenance chores happened?"
+    result = engine.recall(question, limit=10, sources=["commits"], include_sessions=False)
+    assert 0 < len(result.evidence) <= 5
+    fused = RecallEngine(mem).recall(question, limit=10, sources=["commits"],
+                                     include_sessions=False)
+    assert len(fused.evidence) >= 9
+
+
+def test_hybrid_mode_answers_a_natural_language_question(mem) -> None:
+    result = RecallEngine(mem).recall("What did Caroline ask the adoption agency?",
+                                      sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-0"
+
+
+def test_question_marks_and_quotes_do_not_break_recall(mem) -> None:
+    result = RecallEngine(mem).recall('Who painted "a sunrise" at the lake??', limit=3,
+                                      sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-1"
+
+
+def test_more_than_five_results_come_back(mem) -> None:
+    result = RecallEngine(mem).recall("lake", limit=10, sources=["commits"],
+                                      include_sessions=False)
+    assert len(result.evidence) >= 8
+
+
+def test_exact_phrase_hit_still_ranks_first(mem) -> None:
+    result = RecallEngine(mem).recall("rate limiting configuration", limit=5,
+                                      sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-2"
+
+
+def test_new_commits_become_searchable_after_the_first_recall(mem) -> None:
+    engine = RecallEngine(mem)
+    engine.recall("lake", sources=["commits"], include_sessions=False)
+    _commit(mem, "doc-new", "Priya presented the quarterly zebra migration plan.")
+    result = engine.recall("zebra migration", sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-new"
+
+
+def test_dense_hits_without_shared_words_are_not_filtered_out(mem, monkeypatch) -> None:
+    class Synonyms(FakeModel):
+        def _vec(self, text: str) -> np.ndarray:
+            return super()._vec(text.replace("sunrise", "dawn"))
+
+    monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: Synonyms())
+    # "dawn" never appears in any commit; the dense side still maps it to "sunrise".
+    result = RecallEngine(mem, options=RecallOptions(commit_search="hybrid")).recall(
+        "dawn", limit=3, sources=["commits"], include_sessions=False)
+    assert "doc-1" in _titles(result)
+
+
+def test_engines_on_one_manager_share_the_index_and_embed_once(mem, monkeypatch) -> None:
+    model = FakeModel()
+    monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: model)
+    hybrid = RecallOptions(commit_search="hybrid")
+    RecallEngine(mem, options=hybrid).recall("lake", sources=["commits"], include_sessions=False)
+    first = model.embedded
+    RecallEngine(mem, options=hybrid).recall("adoption", sources=["commits"],
+                                             include_sessions=False)
+    assert first >= 12 and model.embedded == first
+
+
+def test_rerank_off_keeps_the_fused_order(mem) -> None:
+    plain = RecallEngine(mem, options=RecallOptions(rerank=False))
+    result = plain.recall("lake maintenance chores", limit=5, sources=["commits"],
+                          include_sessions=False)
+    scores = [ev.score for ev in result.evidence]
+    assert scores == sorted(scores, reverse=True)
+    assert all(ev.metadata.get("reranker") is None for ev in result.evidence)
+
+
+def test_unknown_commit_search_mode_is_rejected() -> None:
+    with pytest.raises(ValueError, match="commit_search"):
+        RecallOptions(commit_search="magic")
+
+
+def _file_commit(mem: MemoryManager, title: str, what: str, files: list[str]) -> None:
+    mem.commit(title=title, what=what, why="note", files_changed=files, next_step="",
+               admission_threshold=1.0, rejection_threshold=0.0)
+
+
+@pytest.fixture
+def linked(tmp_path) -> MemoryManager:
+    manager = MemoryManager(str(tmp_path))
+    _file_commit(manager, "design", "Chose the quokka scheduler for nightly jobs.",
+                 ["src/sched.py", "src/queue.py"])
+    _file_commit(manager, "followup", "Retry budget raised after the incident review.",
+                 ["src/sched.py", "src/queue.py"])
+    _file_commit(manager, "unrelated", "Updated the office coffee machine rota.", ["docs/rota.md"])
+    return manager
+
+
+def test_link_expansion_pulls_in_commits_linked_to_a_top_hit(linked) -> None:
+    ask = "quokka scheduler"
+    expanded = RecallEngine(linked, options=RecallOptions(link_expansion=True)).recall(
+        ask, limit=5, sources=["commits"], include_sessions=False)
+    titles = _titles(expanded)
+    # "followup" shares no word with the query; only its link to "design" can lift it
+    # above the unlinked commit (dense search, when installed, returns everything).
+    assert titles[0] == "design" and "followup" in titles
+    assert "unrelated" not in titles or titles.index("followup") < titles.index("unrelated")
+
+
+def test_link_expansion_ranks_linked_commits_below_direct_hits(linked) -> None:
+    result = RecallEngine(linked, options=RecallOptions(link_expansion=True)).recall(
+        "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
+    scores = {ev.title: ev.score for ev in result.evidence}
+    assert scores["design"] > scores["followup"]
+
+
+def test_scenes_are_connected_components_over_entity_and_semantic_links() -> None:
+    adjacency = {
+        "C1": [("C2", 0.9, "entity")], "C2": [("C1", 0.9, "entity"), ("C3", 0.5, "semantic")],
+        "C3": [("C2", 0.5, "semantic")],
+        "C4": [("C5", 0.9, "causal")], "C5": [("C4", 0.9, "causal")],
+        "C6": [("C7", 0.1, "entity")], "C7": [("C6", 0.1, "entity")],
+    }
+    scenes = commit_recall.build_scenes(adjacency, min_score=0.3)
+    assert scenes["C1"] == scenes["C3"] == frozenset({"C1", "C2", "C3"})
+    assert "C4" not in scenes and "C6" not in scenes
+
+
+def test_scene_expansion_adds_the_most_relevant_scene_mates_below_the_seed() -> None:
+    scenes = {c: frozenset({"C1", "C2", "C3", "C4"}) for c in ("C1", "C2", "C3", "C4")}
+    relevance = {"C1": 1.0, "C2": 0.2, "C3": 0.6, "C4": 0.1}
+    out = dict(commit_recall.expand_scenes([("C1", 1.0)], scenes, relevance, per_seed=2))
+    assert set(out) == {"C1", "C3", "C2"} and out["C1"] == 1.0
+    assert out["C3"] < 1.0 and out["C3"] > out["C2"]
+
+
+def test_scene_expansion_flag_runs_end_to_end(linked) -> None:
+    result = RecallEngine(linked, options=RecallOptions(scene_expansion=True)).recall(
+        "quokka scheduler", limit=5, sources=["commits"], include_sessions=False)
+    titles = _titles(result)
+    assert titles[0] == "design" and "followup" in titles
+
+
+def test_multiline_commit_text_is_searchable_beyond_its_first_line(tmp_path) -> None:
+    manager = MemoryManager(str(tmp_path))
+    _commit(manager, "doc-a", "[2023/05/20]\nuser: I made a playlist on Spotify\nassistant: Nice")
+    _commit(manager, "doc-b", "[2023/05/21]\nuser: Asked about tax forms\nassistant: Sure")
+    result = RecallEngine(manager, options=RecallOptions(commit_search="bm25")).recall(
+        "name of the Spotify playlist", limit=3, sources=["commits"], include_sessions=False)
+    assert _titles(result)[0] == "doc-a"
+    assert "Spotify" in result.evidence[0].snippet
+
+
+def test_triple_boost_lifts_commits_whose_triples_name_the_query_entities(tmp_path) -> None:
+    manager = MemoryManager(str(tmp_path))
+    _commit(manager, "plain", "Notes on billing and postgres tuning for the quarter.")
+    _commit(manager, "triple", "Migrated billing to postgres. Also tuning notes for the quarter.")
+    ask = "billing postgres tuning"
+    branch = manager.get_active_branch()
+    base = dict((c["title"], s) for c, s in commit_recall.ranked_commits(
+        manager, branch, ask, 5, RecallOptions(commit_search="bm25")))
+    boosted = dict((c["title"], s) for c, s in commit_recall.ranked_commits(
+        manager, branch, ask, 5, RecallOptions(commit_search="bm25", triple_boost=True)))
+    assert boosted["triple"] > base["triple"] and boosted["plain"] == base["plain"]
+
+
+def test_triple_boost_is_a_no_op_for_commits_without_triples(mem) -> None:
+    branch = mem.get_active_branch()
+    a = commit_recall.ranked_commits(mem, branch, "lake", 5, RecallOptions())
+    b = commit_recall.ranked_commits(mem, branch, "lake", 5, RecallOptions(triple_boost=True))
+    assert [(c["title"], s) for c, s in a] == [(c["title"], s) for c, s in b]
+
+
+def test_candidate_triples_extracts_pairs_and_file_triples() -> None:
+    from ccr.core.triples import candidate_triples
+    got = candidate_triples("C9", "t", "Migrated billing to postgres.", "", ["a.py"])
+    assert {(t.subject, t.predicate, t.object) for t in got} >= {
+        ("billing", "migrated_to", "postgres"), ("a.py", "modified_in", "C9")}
+
+
+def test_default_recall_is_bm25_only_and_never_touches_the_embedding_model(mem, monkeypatch) -> None:
+    def boom():
+        raise AssertionError("embedding model must not load for the default mode")
+
+    monkeypatch.setattr(commit_recall, "get_embedding_model", boom)
+    result = RecallEngine(mem).recall("adoption agency", sources=["commits"], include_sessions=False)
+    assert RecallOptions().commit_search == "bm25"
+    assert _titles(result)[0] == "doc-0"
+
+
+def test_hybrid_mode_is_still_available_on_request(mem, monkeypatch) -> None:
+    model = FakeModel()
+    monkeypatch.setattr(commit_recall, "get_embedding_model", lambda: model)
+    RecallEngine(mem, options=RecallOptions(commit_search="hybrid")).recall(
+        "lake", sources=["commits"], include_sessions=False)
+    assert model.embedded >= 12

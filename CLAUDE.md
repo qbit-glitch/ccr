@@ -32,6 +32,14 @@ MCP server giving Claude Code persistent memory (GCC), self-evolving playbooks (
 - **Search past sessions**: `session_search(query="...")` — full-text search all Q&A logs
 - **Export for training**: `session_export(format="jsonl")` — OpenAI fine-tuning format
 
+### Plan (escalation loop; pure logic, state in `.ccr/plan.json` + `plan_journal.jsonl`)
+- `plan_update` goal/tasks (+acceptance); `plan_log` pass/fail/note (+metric, tokens); `plan_view` brief|packet|stuck|budget|tree|journal
+- `plan_escalate` counts a closed-model session and returns the packet (cap hit -> `allowed=False`); same as shell `ccr plan escalate` (exit 3 on cap)
+- Harness (tmux): `ccr plan escalate` -> run closed model -> `ccr plan accept <file|->` (takes raw pane text)
+
+### Local agents (opencode + Ollama)
+- `python scripts/claude_to_opencode.py [--dry-run] [--enable NAME] [--skills user|all]` mirrors Claude Code's MCP servers, skill dirs, commands and agents into `~/.config/opencode/` (chmod 600; holds copies of API keys). `bit2me` and `zotero` are written disabled. Hooks/plugins' hook scripts are not portable.
+
 ### Research & Experiment Tools (v6)
 - **Log experiment**: `gcc_experiments(experiment_id=..., hypothesis_contains=..., metric_filter={...})` — query/filter experiment records stored in commits
 - **Log decision**: `gcc_discuss(topic=..., hypothesis=..., decision=..., rationale=...)` — persist reasoning behind design choices across sessions
@@ -63,9 +71,9 @@ tests/unit/         # ~1993 tests
 
 ## Key Patterns
 
-- **44 MCP tools** always active (gcc×26, ace×8, rlm×3, index×3, session×4)
+- **48 MCP tools** always active (gcc×26, ace×8, rlm×3, index×3, session×4, plan×4)
   (Note: broad `@mcp.tool` text searches also match comment/docstring mentions.
-  Actual registered tool-function count = 44.)
+  Actual registered tool-function count = 48.)
 - **A-MAC admission**: S(m) = 0.50*TypePrior + 0.35*Novelty + 0.15*Recency; three-way admit/merge/reject
 - **Cross-linking**: 4 link types (entity, causal, supersession, semantic); BFS traversal via `gcc_links`
 - **Two-tier playbook**: Global (~/.ccr/global.db) + project (.ccr/memory.db) via SQLite; `scope="global"|"project"` on ACE tools. WAL locking makes concurrent Claude Code sessions on different projects safe for global-scope writes.

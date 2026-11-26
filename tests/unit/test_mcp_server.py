@@ -1336,6 +1336,8 @@ class TestGCCCommitPatterns:
         )
         assert "C001" in result["message"]
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_gcc_commit_promotion_suggestion(self):
         """Promotion suggestion appears after 3 commits with same pattern."""
         pat = "Always validate input parameters before processing data"

@@ -404,6 +404,8 @@ class TestScratchpadSearch:
         results = sp.search("database cache", top_k=1)
         assert len(results) <= 1
 
+    @pytest.mark.usefixtures("no_semantic")
+
     def test_no_match_returns_empty_or_sorted(self, tmp_path):
         """Query with zero overlap → results still returned (score=0) or empty."""
         sp = self._make_scratchpad(tmp_path)

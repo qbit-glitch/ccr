@@ -27,7 +27,7 @@ dependencies = [
     "click>=8.1.0",
     "cryptography>=42.0.0",
     "pyyaml>=6.0",
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.0.0,<2",
 ]
 
 [project.urls]
@@ -50,6 +50,10 @@ semantic = [
 ]
 vector = [
     "sqlite-vec>=0.1.0",
+]
+bench = [
+    "pyarrow>=15",
+    "tiktoken>=0.7.0",
 ]
 watch = [
     "watchdog>=4.0.0",

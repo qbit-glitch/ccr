@@ -107,6 +107,17 @@ def _write_codex_transcript(path: str, turns: list[dict]) -> None:
 
 
 class TestExtractTextFromContent:
+    def test_strips_system_reminder_from_string(self):
+        text = "<system-reminder>\nnoise\n</system-reminder>real question"
+        assert _extract_text_from_content(text) == "real question"
+
+    def test_drops_block_that_is_only_injected_text(self):
+        content = [
+            {"type": "text", "text": "<system-reminder>noise</system-reminder>"},
+            {"type": "text", "text": "real question"},
+        ]
+        assert _extract_text_from_content(content) == "real question"
+
     def test_plain_string(self):
         assert _extract_text_from_content("hello world") == "hello world"
 
@@ -245,6 +256,34 @@ class TestParseTranscript:
         assert turns[0]["assistant_message"] == "Implemented."
         assert turns[1]["user_message"] == "Run tests"
         assert turns[1]["assistant_message"] == "Tests passed."
+
+    def test_harness_entries_do_not_replace_the_real_user_prompt(self, tmp_path):
+        """Shapes seen in a real Claude Code transcript: none of them is something the user said."""
+        tp = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "run the tests"}},
+            # ToolSearch result plus the harness's own text block
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                {"type": "text", "text": "Tool loaded."},
+            ]}},
+            # skill body injected as a user message
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": [
+                {"type": "text", "text": "Base directory for this skill: /x"},
+            ]}},
+            # request snapshot that also carries role=user
+            {"type": "api-request-blob", "message": {"role": "user", "content": [
+                {"type": "text", "text": "snapshot noise"},
+            ]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Done."},
+            ]}},
+        ]
+        tp.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+        assert _parse_transcript(str(tp)) == [
+            {"user_message": "run the tests", "assistant_message": "Done."}
+        ]
 
 
 # ---------------------------------------------------------------------------

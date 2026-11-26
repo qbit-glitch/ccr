@@ -87,6 +87,44 @@ def _clean_entity(text: str) -> str:
     return text.strip()
 
 
+def candidate_triples(
+    commit_id: str, title: str, what: str, why: str, files: list[str],
+) -> list[Triple]:
+    """Regex triples for one commit (no storage, no dedup)."""
+    now = datetime.now(timezone.utc).isoformat()
+    candidates: list[Triple] = []
+
+    # Extract from title + what + why
+    for text in [title, what, why]:
+        if not text:
+            continue
+        for pattern, predicate, confidence in _EXTRACTION_PATTERNS:
+            for match in re.finditer(pattern, text):
+                subject = _clean_entity(match.group(1))
+                obj = _clean_entity(match.group(2))
+                if subject and obj and len(subject) > 1 and len(obj) > 1:
+                    candidates.append(Triple(
+                        subject=subject,
+                        predicate=predicate,
+                        object=obj,
+                        source_commit=commit_id,
+                        confidence=confidence,
+                        timestamp=now,
+                    ))
+
+    # Extract file-level triples
+    for filepath in files:
+        candidates.append(Triple(
+            subject=filepath,
+            predicate="modified_in",
+            object=commit_id,
+            source_commit=commit_id,
+            confidence=1.0,
+            timestamp=now,
+        ))
+    return candidates
+
+
 class TripleStore:
     """Zero-LLM triple store with regex extraction and word Jaccard search."""
 
@@ -133,37 +171,7 @@ class TripleStore:
 
         Returns list of newly extracted triples.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        candidates: list[Triple] = []
-
-        # Extract from title + what + why
-        for text in [title, what, why]:
-            if not text:
-                continue
-            for pattern, predicate, confidence in _EXTRACTION_PATTERNS:
-                for match in re.finditer(pattern, text):
-                    subject = _clean_entity(match.group(1))
-                    obj = _clean_entity(match.group(2))
-                    if subject and obj and len(subject) > 1 and len(obj) > 1:
-                        candidates.append(Triple(
-                            subject=subject,
-                            predicate=predicate,
-                            object=obj,
-                            source_commit=commit_id,
-                            confidence=confidence,
-                            timestamp=now,
-                        ))
-
-        # Extract file-level triples
-        for filepath in files:
-            candidates.append(Triple(
-                subject=filepath,
-                predicate="modified_in",
-                object=commit_id,
-                source_commit=commit_id,
-                confidence=1.0,
-                timestamp=now,
-            ))
+        candidates = candidate_triples(commit_id, title, what, why, files)
 
         # Dedup + extend + save under a single lock to prevent race conditions
         new_triples: list[Triple] = []
